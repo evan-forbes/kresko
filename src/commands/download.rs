@@ -15,7 +15,7 @@ pub async fn run(nodes: &str, workers: usize, no_compress: bool, directory: &str
     let key = resolve_value(None, "KRESKO_SSH_KEY_PATH", &config.ssh_key_path);
     let key = shellexpand(&key);
 
-    let targets = select_instances(&config.validators, nodes);
+    let targets = select_instances(&config.miners, nodes);
 
     if targets.is_empty() {
         println!("No matching nodes found.");
@@ -83,4 +83,3 @@ pub async fn run(nodes: &str, workers: usize, no_compress: bool, directory: &str
     println!("Downloads complete. Data saved to {}", data_dir.display());
     Ok(())
 }
-

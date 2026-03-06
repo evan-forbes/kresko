@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::cloud;
-use crate::config::{Config, Provider, resolve_value};
+use crate::config::{Config, Provider};
 
 pub async fn run(all: bool, workers: usize, directory: &str) -> Result<()> {
     if workers == 0 {
@@ -9,19 +9,14 @@ pub async fn run(all: bool, workers: usize, directory: &str) -> Result<()> {
     }
 
     let dir = std::path::Path::new(directory);
-    let mut config = if all {
+    let config = if all {
         Config::load(dir).unwrap_or_default()
     } else {
         Config::load(dir)?
     };
 
-    config.do_token = resolve_value(None, "DIGITALOCEAN_TOKEN", &config.do_token);
-    config.gcp_project = resolve_value(None, "GOOGLE_CLOUD_PROJECT", &config.gcp_project);
-    config.gcp_key_json_path = resolve_value(
-        None,
-        "GOOGLE_CLOUD_KEY_JSON_PATH",
-        &config.gcp_key_json_path,
-    );
+    let do_token = std::env::var("DIGITALOCEAN_TOKEN").unwrap_or_default();
+    let gcp_project = std::env::var("GOOGLE_CLOUD_PROJECT").unwrap_or_default();
 
     if all {
         println!("Destroying ALL kresko instances...");
@@ -29,7 +24,7 @@ pub async fn run(all: bool, workers: usize, directory: &str) -> Result<()> {
         let mut any_provider = false;
         let mut errors = Vec::new();
 
-        if !config.do_token.is_empty() {
+        if !do_token.is_empty() {
             any_provider = true;
             let mut do_cfg = config.clone();
             do_cfg.provider = Provider::DigitalOcean;
@@ -43,7 +38,7 @@ pub async fn run(all: bool, workers: usize, directory: &str) -> Result<()> {
             }
         }
 
-        if !config.gcp_project.is_empty() {
+        if !gcp_project.is_empty() {
             any_provider = true;
             let mut gcp_cfg = config.clone();
             gcp_cfg.provider = Provider::GoogleCloud;

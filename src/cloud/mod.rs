@@ -32,7 +32,6 @@ impl CloudClient {
             CloudClient::GoogleCloud(c) => c.list().await,
         }
     }
-
 }
 
 /// Create the appropriate cloud client based on config.

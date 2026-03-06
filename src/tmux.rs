@@ -31,9 +31,17 @@ pub async fn run_script_in_tmux(
 
             async move {
                 let cmd = format!(
-                    "echo '{encoded}' | base64 -d > {remote_script_path} && \
+                    "if ! command -v tmux >/dev/null 2>&1; then \
+                         apt-get -o DPkg::Lock::Timeout=300 update -y && \
+                         apt-get -o DPkg::Lock::Timeout=300 install -y tmux; \
+                     fi && \
+                     echo '{encoded}' | base64 -d > {remote_script_path} && \
                      chmod +x {remote_script_path} && \
-                     tmux new-session -d -s {session} 'bash {remote_script_path} 2>&1 | tee -a {log_file}'"
+                     tmux new-session -d -s {session} \"bash -lc 'set -o pipefail; \
+                         bash {remote_script_path} 2>&1 | tee -a {log_file}; \
+                         script_exit=${{PIPESTATUS[0]}}; \
+                         echo \\\"=== {session} exited with code \\$script_exit ===\\\"; \
+                         exec bash -i'\""
                 );
                 let result = ssh::ssh_exec_timeout(&ip, &key, &cmd, timeout).await;
                 (name, result.map(|_| ()))

@@ -25,12 +25,12 @@ pub fn run(
     };
 
     let default_slug = match (provider, node_type) {
-        (Provider::DigitalOcean, NodeType::Validator) => DO_DEFAULT_VALIDATOR_SLUG,
-        (Provider::GoogleCloud, NodeType::Validator) => GCP_DEFAULT_MACHINE,
+        (Provider::DigitalOcean, NodeType::Miner) => DO_DEFAULT_MINER_SLUG,
+        (Provider::GoogleCloud, NodeType::Miner) => GCP_DEFAULT_MACHINE,
     };
 
     let existing_count = config
-        .validators
+        .miners
         .iter()
         .filter(|i| i.node_type == node_type)
         .count();
@@ -69,11 +69,11 @@ pub fn run(
             "Added {} ({}, {})",
             instance.name, provider, selected_region
         );
-        config.validators.push(instance);
+        config.miners.push(instance);
     }
 
     config.save(dir)?;
-    println!("Total validators: {}", config.validators.len());
+    println!("Total miners: {}", config.miners.len());
 
     Ok(())
 }

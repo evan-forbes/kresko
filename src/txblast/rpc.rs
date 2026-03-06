@@ -1,8 +1,28 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddressUtxo {
+    pub txid: String,
+    #[serde(rename = "outputIndex")]
+    pub output_index: u32,
+    pub script: String,
+    pub satoshis: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawTransactionVerbose {
+    pub vin: Vec<RawTransactionInput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawTransactionInput {
+    pub coinbase: Option<String>,
+}
 
 pub struct ZebraRpcClient {
     client: Client,
@@ -67,74 +87,24 @@ impl ZebraRpcClient {
             .context("unexpected sendrawtransaction response")
     }
 
-    pub async fn get_new_address(&self) -> Result<String> {
-        let result = self.call("getnewaddress", serde_json::json!([])).await?;
-        result
-            .as_str()
-            .map(|s| s.to_string())
-            .context("unexpected getnewaddress response")
-    }
-
-    pub async fn z_get_new_address(&self, addr_type: &str) -> Result<String> {
+    pub async fn get_address_utxos(&self, address: &str) -> Result<Vec<AddressUtxo>> {
         let result = self
-            .call("z_getnewaddress", serde_json::json!([addr_type]))
+            .call(
+                "getaddressutxos",
+                serde_json::json!([{
+                    "addresses": [address],
+                }]),
+            )
             .await?;
-        result
-            .as_str()
-            .map(|s| s.to_string())
-            .context("unexpected z_getnewaddress response")
+
+        serde_json::from_value(result).context("unexpected getaddressutxos response")
     }
 
-    pub async fn z_send_many(&self, from_address: &str, amounts: &[(&str, f64)]) -> Result<String> {
-        let outputs: Vec<Value> = amounts
-            .iter()
-            .map(|(addr, amt)| {
-                serde_json::json!({
-                    "address": addr,
-                    "amount": amt,
-                })
-            })
-            .collect();
-
+    pub async fn get_raw_transaction_verbose(&self, txid: &str) -> Result<RawTransactionVerbose> {
         let result = self
-            .call("z_sendmany", serde_json::json!([from_address, outputs]))
+            .call("getrawtransaction", serde_json::json!([txid, 1]))
             .await?;
-        result
-            .as_str()
-            .map(|s| s.to_string())
-            .context("unexpected z_sendmany response")
-    }
 
-    pub async fn z_get_operation_status(&self, op_ids: &[&str]) -> Result<Value> {
-        self.call("z_getoperationstatus", serde_json::json!([op_ids]))
-            .await
-    }
-
-    pub async fn list_unspent(&self) -> Result<Value> {
-        self.call("listunspent", serde_json::json!([])).await
-    }
-
-    pub async fn z_list_unspent(&self) -> Result<Value> {
-        self.call("z_listunspent", serde_json::json!([])).await
-    }
-
-    pub async fn create_raw_transaction(&self, inputs: Value, outputs: Value) -> Result<String> {
-        let result = self
-            .call("createrawtransaction", serde_json::json!([inputs, outputs]))
-            .await?;
-        result
-            .as_str()
-            .map(|s| s.to_string())
-            .context("unexpected createrawtransaction response")
-    }
-
-    pub async fn sign_raw_transaction(&self, hex_tx: &str) -> Result<String> {
-        let result = self
-            .call("signrawtransaction", serde_json::json!([hex_tx]))
-            .await?;
-        result["hex"]
-            .as_str()
-            .map(|s| s.to_string())
-            .context("unexpected signrawtransaction response")
+        serde_json::from_value(result).context("unexpected getrawtransaction response")
     }
 }

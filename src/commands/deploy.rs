@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use futures::future::join_all;
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::config::{Config, resolve_value, select_instances, shellexpand};
+use crate::config::{Config, S3Config, resolve_value, select_instances, shellexpand};
 use crate::ssh;
 use crate::tmux;
 
@@ -11,7 +12,7 @@ pub async fn run(
     ssh_key_path: Option<&str>,
     direct_payload_upload: bool,
     workers: usize,
-    ignore_failed_validators: bool,
+    ignore_failed_miners: bool,
     directory: &str,
 ) -> Result<()> {
     if workers == 0 {
@@ -55,21 +56,27 @@ pub async fn run(
         println!("Payload unchanged, reusing existing tarball.");
     }
 
-    let active_validators = select_instances(&config.validators, "all");
+    let mut active_miners: Vec<_> = select_instances(&config.miners, "all")
+        .into_iter()
+        .cloned()
+        .collect();
 
-    if active_validators.is_empty() {
-        anyhow::bail!("No validators with assigned IPs. Run 'kresko up' first.");
+    if active_miners.is_empty() {
+        anyhow::bail!("No miners with assigned IPs. Run 'kresko up' first.");
     }
 
     println!(
-        "Deploying to {} validators (direct={direct_payload_upload})...",
-        active_validators.len()
+        "Deploying to {} miners (direct={direct_payload_upload})...",
+        active_miners.len()
     );
+
+    let mut failed_miners = HashSet::new();
+    let mut failure_details = Vec::new();
 
     if direct_payload_upload {
         // Direct SCP upload to each node
-        let mut failed = Vec::new();
-        for chunk in active_validators.chunks(workers) {
+        let mut uploaded = HashSet::new();
+        for chunk in active_miners.chunks(workers) {
             let futs: Vec<_> = chunk
                 .iter()
                 .map(|inst| {
@@ -80,42 +87,46 @@ pub async fn run(
 
                     async move {
                         println!("  Uploading to {name} ({ip})...");
-                        ssh::scp_upload(&ip, &key, &tar, "/root/payload.tar.gz").await?;
-                        println!("  Uploaded to {name}");
-                        Ok::<_, anyhow::Error>(name)
+                        let result = ssh::scp_upload(&ip, &key, &tar, "/root/payload.tar.gz").await;
+                        (name, result)
                     }
                 })
                 .collect();
 
-            let results = join_all(futs).await;
-            for r in &results {
-                if let Err(e) = r {
-                    eprintln!("  Upload failed: {e}");
-                    failed.push(e.to_string());
+            for (name, result) in join_all(futs).await {
+                match result {
+                    Ok(()) => {
+                        println!("  Uploaded to {name}");
+                        uploaded.insert(name);
+                    }
+                    Err(e) => {
+                        eprintln!("  Upload failed for {name}: {e}");
+                        failed_miners.insert(name.clone());
+                        failure_details.push(format!("{name}: upload failed: {e}"));
+                    }
                 }
             }
         }
 
-        if !failed.is_empty() && !ignore_failed_validators {
-            anyhow::bail!("{} uploads failed", failed.len());
-        }
+        active_miners.retain(|inst| uploaded.contains(&inst.name));
     } else {
         // Upload to S3, then have nodes download
-        let s3_client = crate::s3::new_client(&config.s3).await?;
+        let s3_cfg = S3Config::from_env()?;
+        let s3_client = crate::s3::new_client(&s3_cfg).await?;
         let s3_key = format!("{}/payload.tar.gz", config.experiment);
 
-        crate::s3::upload_file(&s3_client, &config.s3.bucket_name, &s3_key, &tar_path).await?;
+        crate::s3::upload_file(&s3_client, &s3_cfg.bucket_name, &s3_key, &tar_path).await?;
         let download_url = crate::s3::presign_get_url(
             &s3_client,
-            &config.s3.bucket_name,
+            &s3_cfg.bucket_name,
             &s3_key,
             Duration::from_secs(3600),
         )
         .await?;
 
         // SSH into each node to download from S3
-        let mut failed = Vec::new();
-        for chunk in active_validators.chunks(workers) {
+        let mut downloaded = HashSet::new();
+        for chunk in active_miners.chunks(workers) {
             let futs: Vec<_> = chunk
                 .iter()
                 .map(|inst| {
@@ -126,61 +137,87 @@ pub async fn run(
 
                     async move {
                         println!("  {name}: downloading payload from S3...");
-                        ssh::ssh_exec(
+                        let result = ssh::ssh_exec(
                             &ip,
                             &key,
-                            &format!("curl -sL -o /root/payload.tar.gz '{url}'"),
+                            &format!(
+                                "if ! command -v curl >/dev/null 2>&1; then \
+                                     apt-get -o DPkg::Lock::Timeout=300 update -y && \
+                                     apt-get -o DPkg::Lock::Timeout=300 install -y curl; \
+                                 fi && \
+                                 curl -fsSL -o /root/payload.tar.gz '{url}'"
+                            ),
                         )
-                        .await?;
-                        println!("  {name}: downloaded");
-                        Ok::<_, anyhow::Error>(name)
+                        .await
+                        .map(|_| ());
+                        (name, result)
                     }
                 })
                 .collect();
 
-            let results = join_all(futs).await;
-            for r in &results {
-                if let Err(e) = r {
-                    eprintln!("  Download failed: {e}");
-                    failed.push(e.to_string());
+            for (name, result) in join_all(futs).await {
+                match result {
+                    Ok(()) => {
+                        println!("  {name}: downloaded");
+                        downloaded.insert(name);
+                    }
+                    Err(e) => {
+                        eprintln!("  Download failed for {name}: {e}");
+                        failed_miners.insert(name.clone());
+                        failure_details.push(format!("{name}: download failed: {e}"));
+                    }
                 }
             }
         }
 
-        if !failed.is_empty() && !ignore_failed_validators {
-            anyhow::bail!("{} downloads failed", failed.len());
-        }
+        active_miners.retain(|inst| downloaded.contains(&inst.name));
     }
 
     // Run node_init.sh via tmux on all nodes
-    println!("Starting nodes via tmux...");
-    let script = std::fs::read_to_string(dir.join("scripts/node_init.sh"))
-        .or_else(|_| std::fs::read_to_string(dir.join("payload/node_init.sh")))
-        .context("node_init.sh not found")?;
+    if active_miners.is_empty() {
+        eprintln!("No miners are eligible to start after payload distribution.");
+    } else {
+        println!("Starting nodes via tmux...");
+        let script = std::fs::read_to_string(dir.join("scripts/node_init.sh"))
+            .or_else(|_| std::fs::read_to_string(dir.join("payload/node_init.sh")))
+            .context("node_init.sh not found")?;
 
-    let owned_validators: Vec<_> = active_validators.into_iter().cloned().collect();
-    let results = tmux::run_script_in_tmux(
-        &owned_validators,
-        &key,
-        &script,
-        "app",
-        Duration::from_secs(600),
-    )
-    .await;
+        let results = tmux::run_script_in_tmux(
+            &active_miners,
+            &key,
+            &script,
+            "app",
+            Duration::from_secs(600),
+        )
+        .await;
 
-    let mut failed = 0;
-    for (name, result) in &results {
-        match result {
-            Ok(()) => println!("  {name}: started"),
-            Err(e) => {
-                eprintln!("  {name}: failed to start: {e}");
-                failed += 1;
+        for (name, result) in &results {
+            match result {
+                Ok(()) => println!("  {name}: started"),
+                Err(e) => {
+                    eprintln!("  {name}: failed to start: {e}");
+                    failed_miners.insert(name.clone());
+                    failure_details.push(format!("{name}: failed to start: {e}"));
+                }
             }
         }
     }
 
-    if failed > 0 && !ignore_failed_validators {
-        anyhow::bail!("{failed} nodes failed to start");
+    if !failure_details.is_empty() {
+        eprintln!(
+            "Deployment completed with failures on {} miner(s):",
+            failed_miners.len()
+        );
+        for detail in &failure_details {
+            eprintln!("  - {detail}");
+        }
+
+        if !ignore_failed_miners {
+            anyhow::bail!(
+                "deployment encountered errors on {} miner(s); rerun with --ignore-failed-miners to suppress failure exit",
+                failed_miners.len()
+            );
+        }
     }
 
     println!("Deployment complete.");
@@ -218,4 +255,3 @@ fn needs_rebuild(tar_path: &Path, payload_dir: &Path) -> bool {
         Err(_) => true,
     }
 }
-

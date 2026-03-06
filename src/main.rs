@@ -19,14 +19,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Generate .env template for a provider
-    InitEnv {
-        /// Cloud provider (digitalocean, googlecloud)
-        #[arg(long, default_value = "digitalocean")]
-        provider: String,
-    },
-
-    /// Initialize experiment directory structure and default configs
+    /// Initialize experiment directory structure, configs, and .env
     Init {
         /// Chain ID
         #[arg(short = 'c', long)]
@@ -51,8 +44,8 @@ enum Commands {
 
     /// Add nodes to the experiment config
     Add {
-        /// Node type (validator)
-        #[arg(short = 't', long, default_value = "validator")]
+        /// Node type (miner)
+        #[arg(short = 't', long, default_value = "miner")]
         node_type: String,
 
         /// Number of nodes to add
@@ -124,9 +117,9 @@ enum Commands {
         #[arg(long, default_value = "4")]
         workers: usize,
 
-        /// Continue even if some validators fail
+        /// Continue even if some miners fail
         #[arg(long)]
-        ignore_failed_validators: bool,
+        ignore_failed_miners: bool,
 
         /// Experiment directory
         #[arg(short = 'd', long, default_value = ".")]
@@ -142,6 +135,25 @@ enum Commands {
 
     /// List running kresko instances in the cloud
     List {
+        /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
+    /// Progress chain by generating blocks on miner RPC endpoints
+    Progress {
+        /// Block interval in seconds
+        #[arg(short = 't', long = "block-time", default_value = "10")]
+        block_time: u64,
+
+        /// Pick miners randomly each interval instead of rotating
+        #[arg(long)]
+        random: bool,
+
+        /// Number of miners to ping concurrently each interval
+        #[arg(short = 'c', long, default_value = "1")]
+        concurrent: usize,
+
         /// Experiment directory
         #[arg(short = 'd', long, default_value = ".")]
         directory: String,
@@ -187,6 +199,10 @@ enum Commands {
         /// Amount per transaction (in ZEC)
         #[arg(long, default_value = "0.001")]
         amount: f64,
+
+        /// Path to premine funded key JSON (optional, auto-detected on nodes)
+        #[arg(long)]
+        funded_key_path: Option<String>,
     },
 
     /// Kill tmux sessions on remote nodes
@@ -206,6 +222,9 @@ enum Commands {
 
     /// Download logs and data from remote nodes
     Download {
+        #[command(subcommand)]
+        target: Option<DownloadTarget>,
+
         /// Node name pattern (or "all")
         #[arg(short = 'n', long, default_value = "all")]
         nodes: String,
@@ -232,9 +251,9 @@ enum Commands {
 
     /// Stop services and clean up remote nodes
     Reset {
-        /// Comma-separated validator indices or "all"
+        /// Comma-separated miner indices or "all"
         #[arg(long, default_value = "all")]
-        validators: String,
+        miners: String,
 
         /// Number of parallel workers
         #[arg(long, default_value = "4")]
@@ -261,15 +280,50 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum DownloadTarget {
+    /// Download block height/time/size traces via node RPC and store JSONL locally
+    Heights {
+        /// Number of active nodes to download from
+        #[arg(short = 'n', long = "nodes", default_value_t = 1)]
+        node_count: usize,
+    },
+}
+
+impl Commands {
+    fn directory(&self) -> Option<&str> {
+        match self {
+            Commands::Init { .. } | Commands::TxblastLocal { .. } => None,
+            Commands::Add { directory, .. }
+            | Commands::Up { directory, .. }
+            | Commands::Genesis { directory, .. }
+            | Commands::Deploy { directory, .. }
+            | Commands::Status { directory }
+            | Commands::List { directory }
+            | Commands::Progress { directory, .. }
+            | Commands::Txblast { directory, .. }
+            | Commands::KillSession { directory, .. }
+            | Commands::Download { directory, .. }
+            | Commands::UploadData { directory }
+            | Commands::Reset { directory, .. }
+            | Commands::Down { directory, .. } => Some(directory),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = dotenvy::dotenv();
     let cli = Cli::parse();
 
+    // Load .env files with override so they always win over shell env vars.
+    // CWD .env first, then experiment directory .env on top (highest priority).
+    let _ = dotenvy::dotenv_override();
+    if let Some(dir) = cli.command.directory() {
+        let env_path = std::path::Path::new(dir).join(".env");
+        let _ = dotenvy::from_path_override(&env_path);
+    }
+
     match cli.command {
-        Commands::InitEnv { provider } => {
-            commands::init_env::run(&provider)?;
-        }
         Commands::Init {
             chain_id,
             experiment,
@@ -319,14 +373,14 @@ async fn main() -> Result<()> {
             ssh_key_path,
             direct_payload_upload,
             workers,
-            ignore_failed_validators,
+            ignore_failed_miners,
             directory,
         } => {
             commands::deploy::run(
                 ssh_key_path.as_deref(),
                 direct_payload_upload,
                 workers,
-                ignore_failed_validators,
+                ignore_failed_miners,
                 &directory,
             )
             .await?;
@@ -336,6 +390,14 @@ async fn main() -> Result<()> {
         }
         Commands::List { directory } => {
             commands::list::run(&directory).await?;
+        }
+        Commands::Progress {
+            block_time,
+            random,
+            concurrent,
+            directory,
+        } => {
+            commands::progress::run(block_time, random, concurrent, &directory).await?;
         }
         Commands::Txblast {
             instances,
@@ -352,9 +414,17 @@ async fn main() -> Result<()> {
             tx_type,
             rate,
             amount,
+            funded_key_path,
         } => {
             let tx_type: config::TxType = tx_type.parse()?;
-            txblast::run_local(&rpc_endpoint, tx_type, rate, amount).await?;
+            txblast::run_local(
+                &rpc_endpoint,
+                tx_type,
+                rate,
+                amount,
+                funded_key_path.as_deref(),
+            )
+            .await?;
         }
         Commands::KillSession {
             session,
@@ -364,22 +434,28 @@ async fn main() -> Result<()> {
             commands::kill_session::run(&session, timeout, &directory).await?;
         }
         Commands::Download {
+            target,
             nodes,
             workers,
             no_compress,
             directory,
-        } => {
-            commands::download::run(&nodes, workers, no_compress, &directory).await?;
-        }
+        } => match target {
+            Some(DownloadTarget::Heights { node_count }) => {
+                commands::download_heights::run(node_count, workers, &directory).await?;
+            }
+            None => {
+                commands::download::run(&nodes, workers, no_compress, &directory).await?;
+            }
+        },
         Commands::UploadData { directory } => {
             commands::upload_data::run(&directory).await?;
         }
         Commands::Reset {
-            validators,
+            miners,
             workers,
             directory,
         } => {
-            commands::reset::run(&validators, workers, &directory).await?;
+            commands::reset::run(&miners, workers, &directory).await?;
         }
         Commands::Down {
             all,

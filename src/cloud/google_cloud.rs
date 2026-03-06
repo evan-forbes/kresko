@@ -8,7 +8,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use crate::config::{
-    resolve_value, shellexpand, Config, Instance, GCP_DEFAULT_DISK_SIZE_GB, GCP_REGIONS,
+    Config, GCP_DEFAULT_DISK_SIZE_GB, GCP_REGIONS, Instance, require_env, resolve_value,
+    shellexpand,
 };
 
 const COMPUTE_API: &str = "https://compute.googleapis.com/compute/v1";
@@ -67,19 +68,9 @@ struct ServiceAccountKey {
 
 impl GoogleCloudClient {
     pub fn new(config: Config) -> Result<Self> {
-        let project = resolve_value(None, "GOOGLE_CLOUD_PROJECT", &config.gcp_project);
-        if project.is_empty() {
-            anyhow::bail!("GOOGLE_CLOUD_PROJECT not set");
-        }
+        let project = require_env("GOOGLE_CLOUD_PROJECT")?;
 
-        let key_path = shellexpand(&resolve_value(
-            None,
-            "GOOGLE_CLOUD_KEY_JSON_PATH",
-            &config.gcp_key_json_path,
-        ));
-        if key_path.is_empty() {
-            anyhow::bail!("GOOGLE_CLOUD_KEY_JSON_PATH not set");
-        }
+        let key_path = shellexpand(&require_env("GOOGLE_CLOUD_KEY_JSON_PATH")?);
 
         let ssh_pub_key_path = shellexpand(&resolve_value(
             None,
@@ -379,14 +370,14 @@ impl GoogleCloudClient {
 
         let pending: Vec<&Instance> = self
             .config
-            .validators
+            .miners
             .iter()
             .filter(|i| i.public_ip == "TBD")
             .collect();
 
         if pending.is_empty() {
             println!("All instances already have IPs assigned.");
-            return Ok(self.config.validators.clone());
+            return Ok(self.config.miners.clone());
         }
 
         println!("Creating {} GCP instances...", pending.len());
@@ -424,7 +415,7 @@ impl GoogleCloudClient {
             ips.append(&mut resolved_ips);
         }
 
-        let mut updated = self.config.validators.clone();
+        let mut updated = self.config.miners.clone();
         let mut ip_idx = 0;
         for inst in &mut updated {
             if inst.public_ip == "TBD" && ip_idx < ips.len() {
@@ -491,7 +482,10 @@ impl GoogleCloudClient {
             format!("labels.experiment%3D{}", self.config.experiment)
         };
         let found = self.list_instances_all_zones(&token, &filter).await;
-        let all_instances: Vec<_> = found.iter().map(|(i, z)| (i.name.clone(), z.clone())).collect();
+        let all_instances: Vec<_> = found
+            .iter()
+            .map(|(i, z)| (i.name.clone(), z.clone()))
+            .collect();
 
         if all_instances.is_empty() {
             if all {
@@ -562,6 +556,4 @@ impl GoogleCloudClient {
 
         Ok(())
     }
-
 }
-

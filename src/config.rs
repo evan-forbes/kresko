@@ -5,13 +5,13 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeType {
-    Validator,
+    Miner,
 }
 
 impl std::fmt::Display for NodeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeType::Validator => write!(f, "validator"),
+            NodeType::Miner => write!(f, "miner"),
         }
     }
 }
@@ -20,7 +20,7 @@ impl std::str::FromStr for NodeType {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
-            "validator" => Ok(NodeType::Validator),
+            "miner" => Ok(NodeType::Miner),
             other => anyhow::bail!("unknown node type: {other}"),
         }
     }
@@ -101,7 +101,7 @@ pub fn experiment_tag(experiment: &str) -> String {
     format!("kresko-{experiment}")
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct S3Config {
     pub region: String,
     pub access_key_id: String,
@@ -110,25 +110,71 @@ pub struct S3Config {
     pub endpoint: String,
 }
 
+impl S3Config {
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
+            region: std::env::var("AWS_DEFAULT_REGION").unwrap_or_else(|_| "us-east-1".into()),
+            access_key_id: require_env("AWS_ACCESS_KEY_ID")?,
+            secret_access_key: require_env("AWS_SECRET_ACCESS_KEY")?,
+            bucket_name: std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "kresko-data".into()),
+            endpoint: std::env::var("AWS_S3_ENDPOINT").unwrap_or_default(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
-    pub validators: Vec<Instance>,
+    pub miners: Vec<Instance>,
     pub chain_id: String,
     pub experiment: String,
     pub ssh_pub_key_path: String,
     pub ssh_key_name: String,
     pub ssh_key_path: String,
     pub provider: Provider,
+    pub local_genesis: Option<LocalGenesisConfig>,
+}
 
-    // DigitalOcean
-    pub do_token: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalGenesisConfig {
+    pub network_name: String,
+    pub network_magic: [u8; 4],
+    pub target_difficulty_limit: String,
+    pub disable_pow: bool,
+    pub genesis_hash: String,
+    pub genesis_hex: String,
+    pub slow_start_interval: u32,
+    pub pre_blossom_halving_interval: u32,
+    pub activation_heights: LocalGenesisActivationHeights,
+    pub premine_block_count: u32,
+    pub funded_keys: Vec<LocalGenesisFundedKey>,
+}
 
-    // Google Cloud
-    pub gcp_project: String,
-    pub gcp_key_json_path: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalGenesisFundedKey {
+    pub name: String,
+    pub secret_key_hex: String,
+    pub public_key_hex: String,
+    pub address: String,
+}
 
-    // S3
-    pub s3: S3Config,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalGenesisActivationHeights {
+    pub overwinter: u32,
+    pub sapling: u32,
+    pub blossom: u32,
+    pub heartwood: u32,
+    pub canopy: u32,
+    pub nu5: u32,
+    pub nu6: u32,
+    pub nu6_1: u32,
+}
+
+pub fn require_env(var: &str) -> Result<String> {
+    let val = std::env::var(var).unwrap_or_default();
+    if val.is_empty() {
+        anyhow::bail!("{var} is not set. Add it to your .env file.");
+    }
+    Ok(val)
 }
 
 impl Config {
@@ -146,7 +192,6 @@ impl Config {
             .with_context(|| format!("failed to write config to {}", path.display()))?;
         Ok(())
     }
-
 }
 
 /// Resolve a value with priority: flag > env > config
@@ -206,7 +251,7 @@ impl std::str::FromStr for TxType {
 /// Select active instances by pattern. Supports:
 /// - "all" or "*" to select all active instances
 /// - comma-separated indices: "0,2,5"
-/// - comma-separated wildcard name patterns: "validator-0-*,validator-1-*"
+/// - comma-separated wildcard name patterns: "miner-0-*,miner-1-*"
 pub fn select_instances<'a>(instances: &'a [Instance], pattern: &str) -> Vec<&'a Instance> {
     let active: Vec<_> = instances.iter().filter(|i| i.public_ip != "TBD").collect();
 
@@ -214,7 +259,11 @@ pub fn select_instances<'a>(instances: &'a [Instance], pattern: &str) -> Vec<&'a
         return active;
     }
 
-    let parts: Vec<&str> = pattern.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = pattern
+        .split(',')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
 
     // If all parts parse as numbers, treat as indices
     let indices: Vec<usize> = parts.iter().filter_map(|s| s.parse().ok()).collect();
@@ -264,7 +313,7 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 }
 
 // Default slugs/regions per provider
-pub const DO_DEFAULT_VALIDATOR_SLUG: &str = "c2-16vcpu-32gb";
+pub const DO_DEFAULT_MINER_SLUG: &str = "s-8vcpu-16gb";
 pub const DO_DEFAULT_IMAGE: &str = "ubuntu-22-04-x64";
 pub const DO_REGIONS: &[&str] = &[
     "nyc1", "nyc3", "tor1", "sfo2", "sfo3", "ams3", "sgp1", "lon1", "fra1", "syd1",

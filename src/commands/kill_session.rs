@@ -11,13 +11,13 @@ pub async fn run(session: &str, timeout: u64, directory: &str) -> Result<()> {
     let key = resolve_value(None, "KRESKO_SSH_KEY_PATH", &config.ssh_key_path);
     let key = shellexpand(&key);
 
-    let active: Vec<_> = select_instances(&config.validators, "all")
+    let active: Vec<_> = select_instances(&config.miners, "all")
         .into_iter()
         .cloned()
         .collect();
 
     if active.is_empty() {
-        println!("No active validators found.");
+        println!("No active miners found.");
         return Ok(());
     }
 
@@ -35,4 +35,3 @@ pub async fn run(session: &str, timeout: u64, directory: &str) -> Result<()> {
 
     Ok(())
 }
-

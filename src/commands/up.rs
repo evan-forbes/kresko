@@ -27,7 +27,7 @@ pub async fn run(
     let client = cloud::new_client(config.clone())?;
     let updated_instances = client.up(workers).await?;
 
-    config.validators = updated_instances;
+    config.miners = updated_instances;
     config.save(dir)?;
 
     println!("All instances are up. Config saved.");

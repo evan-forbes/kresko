@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::config::{Config, Provider, S3Config, resolve_value};
+use crate::config::{Config, Provider, resolve_value};
 use crate::zebra_config;
 
 pub fn run(
@@ -28,105 +28,125 @@ pub fn run(
     std::fs::write(dir.join("scripts/node_init.sh"), NODE_INIT_SH)?;
     std::fs::write(dir.join("scripts/vars.sh"), VARS_SH_TEMPLATE)?;
 
+    let ssh_key_name_val = resolve_value(
+        ssh_key_name.as_deref(),
+        "KRESKO_SSH_KEY_NAME",
+        &default_ssh_key_name(),
+    );
+    let ssh_pub_key_path_val = resolve_value(
+        ssh_pub_key_path.as_deref(),
+        "KRESKO_SSH_PUB_KEY_PATH",
+        "~/.ssh/id_rsa.pub",
+    );
+    let ssh_key_path_val = resolve_value(None, "KRESKO_SSH_KEY_PATH", "~/.ssh/id_rsa");
+
     // Create config
     let config = Config {
-        validators: Vec::new(),
+        miners: Vec::new(),
         chain_id: chain_id.to_string(),
         experiment: experiment.to_string(),
-        ssh_pub_key_path: resolve_value(
-            ssh_pub_key_path.as_deref(),
-            "KRESKO_SSH_PUB_KEY_PATH",
-            "~/.ssh/id_rsa.pub",
-        ),
-        ssh_key_name: resolve_value(
-            ssh_key_name.as_deref(),
-            "KRESKO_SSH_KEY_NAME",
-            &default_ssh_key_name(),
-        ),
-        ssh_key_path: resolve_value(None, "KRESKO_SSH_KEY_PATH", "~/.ssh/id_rsa"),
+        ssh_pub_key_path: ssh_pub_key_path_val.clone(),
+        ssh_key_name: ssh_key_name_val.clone(),
+        ssh_key_path: ssh_key_path_val.clone(),
         provider,
-        do_token: resolve_value(None, "DIGITALOCEAN_TOKEN", ""),
-        gcp_project: resolve_value(None, "GOOGLE_CLOUD_PROJECT", ""),
-        gcp_key_json_path: resolve_value(None, "GOOGLE_CLOUD_KEY_JSON_PATH", ""),
-        s3: S3Config {
-            region: resolve_value(None, "AWS_DEFAULT_REGION", "us-east-1"),
-            access_key_id: resolve_value(None, "AWS_ACCESS_KEY_ID", ""),
-            secret_access_key: resolve_value(None, "AWS_SECRET_ACCESS_KEY", ""),
-            bucket_name: resolve_value(None, "AWS_S3_BUCKET", "kresko-data"),
-            endpoint: resolve_value(None, "AWS_S3_ENDPOINT", ""),
-        },
+        local_genesis: None,
     };
 
     config.save(dir)?;
 
+    // Write .env with provider-specific template, pre-filling known values
+    write_env(
+        dir,
+        provider,
+        &ssh_key_name_val,
+        &ssh_pub_key_path_val,
+        &ssh_key_path_val,
+    )?;
+
     println!("Initialized experiment '{experiment}' for chain '{chain_id}'");
     println!("  Directory: {}", dir.display());
     println!("  Provider:  {provider}");
+    println!("  .env:      {}/.env (fill in credentials)", dir.display());
     println!();
     println!("Next steps:");
     println!("  1. cd {experiment}");
-    println!("  2. kresko add -t validator -c <N>");
-    println!("  3. kresko up");
+    println!("  2. Edit .env and fill in your credentials");
+    println!("  3. kresko add -t miner -c <N>");
+    println!("  4. kresko up");
 
     Ok(())
 }
 
-const NODE_INIT_SH: &str = r#"#!/bin/bash
-set -euo pipefail
+/// Read an env var, returning its value or a fallback default.
+fn env_or(var: &str, default: &str) -> String {
+    std::env::var(var).unwrap_or_else(|_| default.to_string())
+}
 
-ARCHIVE_NAME="payload.tar.gz"
-export DEBIAN_FRONTEND=noninteractive
+fn write_env(
+    dir: &std::path::Path,
+    provider: Provider,
+    ssh_key_name: &str,
+    ssh_pub_key_path: &str,
+    ssh_key_path: &str,
+) -> Result<()> {
+    let aws_access_key = env_or("AWS_ACCESS_KEY_ID", "");
+    let aws_secret_key = env_or("AWS_SECRET_ACCESS_KEY", "");
+    let aws_bucket = env_or("AWS_S3_BUCKET", "kresko-data");
 
-echo "=== Installing dependencies ==="
-apt-get update -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-apt-get install -y build-essential ufw curl jq chrony tmux btop nethogs
+    let env_content = match provider {
+        Provider::DigitalOcean => {
+            let do_token = env_or("DIGITALOCEAN_TOKEN", "");
+            let aws_region = env_or("AWS_DEFAULT_REGION", "nyc3");
+            let aws_endpoint = env_or("AWS_S3_ENDPOINT", "https://nyc3.digitaloceanspaces.com");
+            format!(
+                r#"# DigitalOcean Configuration
+DIGITALOCEAN_TOKEN={do_token}
 
-echo "=== Configuring firewall ==="
-ufw allow 18233/tcp   # P2P
-ufw allow 18232/tcp   # RPC
-ufw allow 18233/udp
-ufw allow 18232/udp
-ufw --force enable || true
+# SSH Configuration
+KRESKO_SSH_KEY_NAME={ssh_key_name}
+KRESKO_SSH_PUB_KEY_PATH={ssh_pub_key_path}
+KRESKO_SSH_KEY_PATH={ssh_key_path}
 
-echo "=== Configuring time sync ==="
-systemctl enable chrony
-systemctl start chrony
+# S3 Configuration (DigitalOcean Spaces or AWS S3)
+AWS_ACCESS_KEY_ID={aws_access_key}
+AWS_SECRET_ACCESS_KEY={aws_secret_key}
+AWS_DEFAULT_REGION={aws_region}
+AWS_S3_BUCKET={aws_bucket}
+AWS_S3_ENDPOINT={aws_endpoint}
+"#
+            )
+        }
+        Provider::GoogleCloud => {
+            let gcp_project = env_or("GOOGLE_CLOUD_PROJECT", "");
+            let gcp_key_path = env_or("GOOGLE_CLOUD_KEY_JSON_PATH", "");
+            let aws_region = env_or("AWS_DEFAULT_REGION", "us-east-1");
+            let aws_endpoint = env_or("AWS_S3_ENDPOINT", "");
+            format!(
+                r#"# Google Cloud Configuration
+GOOGLE_CLOUD_PROJECT={gcp_project}
+GOOGLE_CLOUD_KEY_JSON_PATH={gcp_key_path}
 
-echo "=== Configuring BBR congestion control ==="
-modprobe tcp_bbr || true
-sysctl -w net.core.default_qdisc=fq
-sysctl -w net.ipv4.tcp_congestion_control=bbr
-echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+# SSH Configuration
+KRESKO_SSH_KEY_NAME={ssh_key_name}
+KRESKO_SSH_PUB_KEY_PATH={ssh_pub_key_path}
+KRESKO_SSH_KEY_PATH={ssh_key_path}
 
-echo "=== Extracting payload ==="
-tar -xzf /root/$ARCHIVE_NAME -C /root/
-source /root/payload/vars.sh
+# S3 Configuration (GCS or AWS S3)
+AWS_ACCESS_KEY_ID={aws_access_key}
+AWS_SECRET_ACCESS_KEY={aws_secret_key}
+AWS_DEFAULT_REGION={aws_region}
+AWS_S3_BUCKET={aws_bucket}
+AWS_S3_ENDPOINT={aws_endpoint}
+"#
+            )
+        }
+    };
 
-cd $HOME
-hostname=$(hostname)
-parsed_hostname=$(echo $hostname | awk -F'-' '{print $1 "-" $2}')
+    std::fs::write(dir.join(".env"), env_content)?;
+    Ok(())
+}
 
-echo "=== Installing binaries ==="
-cp payload/build/zebrad /usr/local/bin/zebrad
-chmod +x /usr/local/bin/zebrad
-
-if [ -f payload/build/kresko ]; then
-    cp payload/build/kresko /usr/local/bin/kresko
-    chmod +x /usr/local/bin/kresko
-fi
-
-echo "=== Setting up zebra config ==="
-mkdir -p /root/.cache/zebra
-mkdir -p /root/.config
-cp payload/$parsed_hostname/zebrad.toml /root/.config/zebrad.toml
-
-echo "=== Node: $parsed_hostname ==="
-echo "=== Starting zebrad ==="
-
-LOG_FILE="/root/logs"
-zebrad -c /root/.config/zebrad.toml start 2>&1 | tee -a "$LOG_FILE"
-"#;
+const NODE_INIT_SH: &str = include_str!("../../scripts/node_init.sh");
 
 fn default_ssh_key_name() -> String {
     std::env::var("USER")

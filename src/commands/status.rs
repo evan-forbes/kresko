@@ -8,10 +8,10 @@ pub async fn run(directory: &str) -> Result<()> {
     let dir = std::path::Path::new(directory);
     let config = Config::load(dir)?;
 
-    let active = select_instances(&config.validators, "all");
+    let active = select_instances(&config.miners, "all");
 
     if active.is_empty() {
-        println!("No active validators found.");
+        println!("No active miners found.");
         return Ok(());
     }
 
@@ -38,10 +38,7 @@ pub async fn run(directory: &str) -> Result<()> {
                 match client.post(&url).json(&body).send().await {
                     Ok(resp) => match resp.json::<serde_json::Value>().await {
                         Ok(json) => {
-                            let height = json["result"]["blocks"]
-                                .as_u64()
-                                .unwrap_or(0)
-                                .to_string();
+                            let height = json["result"]["blocks"].as_u64().unwrap_or(0).to_string();
                             let progress = json["result"]["verificationprogress"]
                                 .as_f64()
                                 .unwrap_or(0.0);

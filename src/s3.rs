@@ -71,4 +71,3 @@ pub async fn presign_get_url(
 
     Ok(req.uri().to_string())
 }
-

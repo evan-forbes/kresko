@@ -11,13 +11,17 @@ pub async fn run(
     amount: f64,
     directory: &str,
 ) -> Result<()> {
+    if !matches!(tx_type, TxType::Transparent) {
+        anyhow::bail!("zebrad-compatible txblast currently supports only --tx-type transparent");
+    }
+
     let dir = std::path::Path::new(directory);
     let config = Config::load(dir)?;
 
     let key = resolve_value(None, "KRESKO_SSH_KEY_PATH", &config.ssh_key_path);
     let key = shellexpand(&key);
 
-    let targets = select_instances(&config.validators, instances);
+    let targets = select_instances(&config.miners, instances);
 
     if targets.is_empty() {
         println!("No matching instances found.");
@@ -58,4 +62,3 @@ kresko txblast-local \
 
     Ok(())
 }
-

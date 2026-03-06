@@ -2,10 +2,12 @@ use anyhow::{Context, Result};
 use futures::future::join_all;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crate::config::{experiment_tag, resolve_value, shellexpand, Config, Instance, DO_DEFAULT_IMAGE};
-
+use crate::config::{
+    Config, DO_DEFAULT_IMAGE, Instance, experiment_tag, require_env, resolve_value, shellexpand,
+};
 
 const DO_API: &str = "https://api.digitalocean.com/v2";
 const MAX_DROPLETS: usize = 100;
@@ -78,12 +80,19 @@ struct SshKey {
     public_key: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DoErrorBody {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    request_id: String,
+}
+
 impl DigitalOceanClient {
     pub fn new(config: Config) -> Result<Self> {
-        let token = resolve_value(None, "DIGITALOCEAN_TOKEN", &config.do_token);
-        if token.is_empty() {
-            anyhow::bail!("DIGITALOCEAN_TOKEN not set");
-        }
+        let token = require_env("DIGITALOCEAN_TOKEN")?;
 
         let http = Client::builder().timeout(Duration::from_secs(60)).build()?;
 
@@ -180,17 +189,38 @@ impl DigitalOceanClient {
             monitoring: true,
         };
 
-        let resp: DropletResponse = self
+        let response = self
             .http
             .post(format!("{DO_API}/droplets"))
             .bearer_auth(&self.token)
             .json(&req)
             .send()
-            .await?
-            .error_for_status()
-            .context("failed to create droplet")?
+            .await
+            .context("failed to call DigitalOcean create droplet API")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let detail = format_do_error_detail(&body);
+            anyhow::bail!(
+                "failed to create droplet '{}' (region='{}', size='{}', image='{}'): HTTP {}{}{}",
+                instance.name,
+                instance.region,
+                instance.slug,
+                DO_DEFAULT_IMAGE,
+                status.as_u16(),
+                status
+                    .canonical_reason()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default(),
+                detail
+            );
+        }
+
+        let resp: DropletResponse = response
             .json()
-            .await?;
+            .await
+            .context("failed to parse DigitalOcean create droplet response")?;
 
         println!(
             "Created droplet {} (id: {})",
@@ -281,18 +311,71 @@ impl DigitalOceanClient {
             anyhow::bail!("workers must be greater than 0");
         }
 
-        let ssh_key = self.lookup_ssh_key().await?;
+        let tag = experiment_tag(&self.config.experiment);
+        let existing = self.list_droplets_by_tag(&tag).await?;
+        let mut existing_by_name: HashMap<String, Vec<&Droplet>> = HashMap::new();
+        for droplet in &existing {
+            existing_by_name
+                .entry(droplet.name.clone())
+                .or_default()
+                .push(droplet);
+        }
 
-        let pending: Vec<&Instance> = self
-            .config
-            .validators
+        let mut updated = self.config.miners.clone();
+        let mut wait_targets: Vec<(String, u64)> = Vec::new();
+        let mut matched_existing: HashSet<String> = HashSet::new();
+
+        // Reconcile TBD instances with existing droplets first.
+        for inst in &mut updated {
+            if inst.public_ip != "TBD" {
+                continue;
+            }
+
+            let Some(matches) = existing_by_name.get(&inst.name) else {
+                continue;
+            };
+
+            if matches.len() > 1 {
+                let ids = matches
+                    .iter()
+                    .map(|d| d.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "multiple droplets match node '{}': ids [{}]. Run 'kresko down' to clean duplicates before 'kresko up'.",
+                    inst.name,
+                    ids
+                );
+            }
+
+            let droplet = matches[0];
+            matched_existing.insert(inst.name.clone());
+            let (public_ip, private_ip) = droplet_ips(droplet);
+            if !public_ip.is_empty() {
+                inst.public_ip = public_ip;
+                inst.private_ip = private_ip;
+                println!(
+                    "Reusing existing droplet {} (id: {}) -> {}",
+                    inst.name, droplet.id, inst.public_ip
+                );
+            } else {
+                println!(
+                    "Found existing droplet {} (id: {}) without IP yet; waiting...",
+                    inst.name, droplet.id
+                );
+                wait_targets.push((inst.name.clone(), droplet.id));
+            }
+        }
+
+        // Any instance still TBD after reconciliation needs a new droplet.
+        let pending: Vec<&Instance> = updated
             .iter()
-            .filter(|i| i.public_ip == "TBD")
+            .filter(|i| i.public_ip == "TBD" && !matched_existing.contains(&i.name))
             .collect();
 
-        if pending.is_empty() {
+        if pending.is_empty() && wait_targets.is_empty() {
             println!("All instances already have IPs assigned.");
-            return Ok(self.config.validators.clone());
+            return Ok(updated);
         }
 
         if pending.len() > MAX_DROPLETS {
@@ -303,43 +386,67 @@ impl DigitalOceanClient {
             );
         }
 
-        println!("Creating {} droplets...", pending.len());
+        if !pending.is_empty() {
+            let ssh_key = self.lookup_ssh_key().await?;
 
-        let mut droplet_ids = Vec::with_capacity(pending.len());
-        for chunk in pending.chunks(workers) {
-            let create_futs: Vec<_> = chunk
+            println!("Creating {} droplets...", pending.len());
+
+            let mut created_targets: Vec<(String, u64)> = Vec::with_capacity(pending.len());
+            for chunk in pending.chunks(workers) {
+                let create_futs: Vec<_> = chunk
+                    .iter()
+                    .map(|inst| {
+                        let ssh_key = ssh_key.clone();
+                        async move {
+                            let id = self.create_droplet(inst, ssh_key).await?;
+                            Ok::<_, anyhow::Error>((inst.name.clone(), id))
+                        }
+                    })
+                    .collect();
+
+                let mut chunk_targets: Vec<(String, u64)> = join_all(create_futs)
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()?;
+                created_targets.append(&mut chunk_targets);
+            }
+            wait_targets.extend(created_targets);
+        }
+
+        // Wait for IPs for droplets we just created, and existing droplets that
+        // matched by name but had no public IP yet.
+        println!("Waiting for IPs...");
+        let mut resolved: Vec<(String, String, String)> = Vec::with_capacity(wait_targets.len());
+        for chunk in wait_targets.chunks(workers) {
+            let ip_futs: Vec<_> = chunk
                 .iter()
-                .map(|inst| self.create_droplet(inst, ssh_key.clone()))
+                .map(|(name, id)| async move {
+                    let (public_ip, private_ip) = self.wait_for_ip(*id).await?;
+                    Ok::<_, anyhow::Error>((name.clone(), public_ip, private_ip))
+                })
                 .collect();
 
-            let mut ids: Vec<u64> = join_all(create_futs)
+            let mut chunk_resolved: Vec<(String, String, String)> = join_all(ip_futs)
                 .await
                 .into_iter()
                 .collect::<Result<Vec<_>>>()?;
-            droplet_ids.append(&mut ids);
+            resolved.append(&mut chunk_resolved);
         }
 
-        // Wait for all IPs
-        println!("Waiting for IPs...");
-        let mut ips = Vec::with_capacity(droplet_ids.len());
-        for chunk in droplet_ids.chunks(workers) {
-            let ip_futs: Vec<_> = chunk.iter().map(|id| self.wait_for_ip(*id)).collect();
-            let mut resolved_ips: Vec<(String, String)> = join_all(ip_futs)
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
-            ips.append(&mut resolved_ips);
+        let mut resolved_by_name: HashMap<String, (String, String)> = HashMap::new();
+        for (name, public_ip, private_ip) in resolved {
+            resolved_by_name.insert(name, (public_ip, private_ip));
         }
 
-        // Update instances with IPs
-        let mut updated = self.config.validators.clone();
-        let mut ip_idx = 0;
+        // Update instances with resolved IPs by node name.
         for inst in &mut updated {
-            if inst.public_ip == "TBD" && ip_idx < ips.len() {
-                inst.public_ip = ips[ip_idx].0.clone();
-                inst.private_ip = ips[ip_idx].1.clone();
+            if inst.public_ip == "TBD" {
+                let Some((public_ip, private_ip)) = resolved_by_name.get(&inst.name) else {
+                    continue;
+                };
+                inst.public_ip = public_ip.clone();
+                inst.private_ip = private_ip.clone();
                 println!("  {} -> {}", inst.name, inst.public_ip);
-                ip_idx += 1;
             }
         }
 
@@ -432,7 +539,36 @@ impl DigitalOceanClient {
 
         Ok(())
     }
+}
 
+fn format_do_error_detail(body: &str) -> String {
+    if body.is_empty() {
+        return String::new();
+    }
+
+    if let Ok(parsed) = serde_json::from_str::<DoErrorBody>(body) {
+        let mut parts = Vec::new();
+        if !parsed.id.is_empty() {
+            parts.push(format!("id={}", parsed.id));
+        }
+        if !parsed.message.is_empty() {
+            parts.push(format!("message={}", parsed.message));
+        }
+        if !parsed.request_id.is_empty() {
+            parts.push(format!("request_id={}", parsed.request_id));
+        }
+        if !parts.is_empty() {
+            return format!(" [{}]", parts.join(", "));
+        }
+    }
+
+    let trimmed = body.trim();
+    let excerpt = if trimmed.len() > 400 {
+        format!("{}...", &trimmed[..400])
+    } else {
+        trimmed.to_string()
+    };
+    format!(" [body={}]", excerpt)
 }
 
 fn normalize_ssh_public_key(raw: &str) -> Option<String> {
@@ -440,4 +576,19 @@ fn normalize_ssh_public_key(raw: &str) -> Option<String> {
     let key_type = parts.next()?;
     let key = parts.next()?;
     Some(format!("{key_type} {key}"))
+}
+
+fn droplet_ips(d: &Droplet) -> (String, String) {
+    let mut public_ip = String::new();
+    let mut private_ip = String::new();
+
+    for net in &d.networks.v4 {
+        match net.net_type.as_str() {
+            "public" => public_ip = net.ip_address.clone(),
+            "private" => private_ip = net.ip_address.clone(),
+            _ => {}
+        }
+    }
+
+    (public_ip, private_ip)
 }

@@ -6,7 +6,7 @@ use crate::config::{Config, resolve_value, select_instances, shellexpand};
 use crate::ssh;
 use crate::tmux;
 
-pub async fn run(validators: &str, workers: usize, directory: &str) -> Result<()> {
+pub async fn run(miners: &str, workers: usize, directory: &str) -> Result<()> {
     if workers == 0 {
         anyhow::bail!("workers must be greater than 0");
     }
@@ -17,14 +17,14 @@ pub async fn run(validators: &str, workers: usize, directory: &str) -> Result<()
     let key = resolve_value(None, "KRESKO_SSH_KEY_PATH", &config.ssh_key_path);
     let key = shellexpand(&key);
 
-    let targets = select_instances(&config.validators, validators);
+    let targets = select_instances(&config.miners, miners);
 
     if targets.is_empty() {
-        println!("No matching validators found.");
+        println!("No matching miners found.");
         return Ok(());
     }
 
-    println!("Resetting {} validators...", targets.len());
+    println!("Resetting {} miners...", targets.len());
 
     // Kill tmux sessions
     let owned_targets: Vec<_> = targets.iter().map(|&inst| inst.clone()).collect();
@@ -67,5 +67,3 @@ pub async fn run(validators: &str, workers: usize, directory: &str) -> Result<()
     println!("Reset complete.");
     Ok(())
 }
-
-

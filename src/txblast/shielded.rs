@@ -16,11 +16,7 @@ impl ShieldedAddr {
 }
 
 /// Send a shielded transaction using z_sendmany with a pre-allocated destination address.
-pub async fn send_tx(
-    client: &ZebraRpcClient,
-    addr: &ShieldedAddr,
-    amount: f64,
-) -> Result<String> {
+pub async fn send_tx(client: &ZebraRpcClient, addr: &ShieldedAddr, amount: f64) -> Result<String> {
     // Find a funded address from z_listunspent
     let unspent = client.z_list_unspent().await?;
     let unspent = unspent.as_array().context("z_listunspent not array")?;
