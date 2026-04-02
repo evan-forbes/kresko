@@ -3,6 +3,7 @@ use anyhow::Result;
 use crate::config::Instance;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct LocalTestnetParameters {
     pub network_name: String,
     pub network_magic: [u8; 4],
@@ -13,6 +14,7 @@ pub struct LocalTestnetParameters {
     pub slow_start_interval: u32,
     pub pre_blossom_halving_interval: u32,
     pub activation_height: u32,
+    pub target_spacing_secs: Option<u32>,
 }
 
 /// Default zebrad.toml template.
@@ -133,6 +135,12 @@ pub fn apply_local_testnet_parameters(config: &str, params: &LocalTestnetParamet
         params.target_difficulty_limit
     ));
     result.push_str(&format!("disable_pow = {}\n", params.disable_pow));
+    // target_spacing_secs is stored in config.json and passed through
+    // LocalTestnetGenesisOptions, but NOT emitted in the zebrad.toml yet.
+    // Zebra's network config uses deny_unknown_fields, so writing an
+    // unrecognized key here would cause zebrad to reject the config.
+    // Once zebra-chain adds target_spacing_secs to its testnet Parameters
+    // builder and the config parser accepts it, this can be emitted.
     result.push_str(&format!("genesis_hash = \"{}\"\n", params.genesis_hash));
     result.push_str(&format!(
         "slow_start_interval = {}\n",
@@ -322,6 +330,7 @@ mod tests {
             slow_start_interval: 0,
             pre_blossom_halving_interval: 144,
             activation_height: 1,
+            target_spacing_secs: None,
         };
 
         let generated = apply_local_testnet_parameters(DEFAULT_ZEBRAD_TOML, &params);

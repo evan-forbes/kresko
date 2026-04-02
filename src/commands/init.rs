@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::config::{Config, Provider, resolve_value};
+use crate::config::{Config, MiningMode, Provider, resolve_value};
 use crate::zebra_config;
 
 pub fn run(
@@ -9,6 +9,8 @@ pub fn run(
     provider: &str,
     ssh_pub_key_path: Option<String>,
     ssh_key_name: Option<String>,
+    mining_mode: MiningMode,
+    block_time_secs: Option<u32>,
 ) -> Result<()> {
     let provider: Provider = provider.parse()?;
     let dir = std::path::Path::new(experiment);
@@ -49,6 +51,8 @@ pub fn run(
         ssh_key_name: ssh_key_name_val.clone(),
         ssh_key_path: ssh_key_path_val.clone(),
         provider,
+        mining_mode,
+        block_time_secs,
         local_genesis: None,
     };
 

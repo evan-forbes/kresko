@@ -28,7 +28,7 @@ pub async fn run(miners: &str, workers: usize, directory: &str) -> Result<()> {
 
     // Kill tmux sessions
     let owned_targets: Vec<_> = targets.iter().map(|&inst| inst.clone()).collect();
-    for session in &["app", "txblast"] {
+    for session in &["app", "txblast", "mine"] {
         println!("  Killing {session} sessions...");
         tmux::stop_tmux_session(&owned_targets, &key, session, Duration::from_secs(30)).await;
     }

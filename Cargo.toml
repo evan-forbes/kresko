@@ -20,4 +20,5 @@ hex = "0.4"
 secp256k1 = "0.29"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
-zebra-chain = { path = "../zebra/zebra-chain" }
+chrono = { version = "0.4", default-features = false }
+zebra-chain = { path = "../zebra/zebra-chain", features = ["internal-miner"] }

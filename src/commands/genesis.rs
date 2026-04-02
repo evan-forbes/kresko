@@ -9,7 +9,7 @@ use zebra_chain::{
 };
 
 use crate::config::{
-    Config, LocalGenesisActivationHeights, LocalGenesisConfig, LocalGenesisFundedKey,
+    Config, LocalGenesisActivationHeights, LocalGenesisConfig, LocalGenesisFundedKey, MiningMode,
 };
 use crate::zebra_config::{self, LocalTestnetParameters};
 
@@ -35,8 +35,15 @@ pub fn run(
     options.network_name = local_network_name(&config.chain_id);
     options.latest_network_upgrade = NetworkUpgrade::Nu6_1;
 
+    if config.mining_mode == MiningMode::Pow {
+        options.disable_pow = false;
+    }
+    if let Some(secs) = config.block_time_secs {
+        options.target_spacing_secs = Some(secs);
+    }
+
     let generated = generate_local_testnet_with_funded_keys(miner_names.clone(), options)
-        .context("failed to generate local genesis chain artifact")?;
+        .map_err(|e| anyhow::anyhow!("failed to generate local genesis chain artifact: {e}"))?;
 
     let network_params = generated
         .network
@@ -56,7 +63,7 @@ pub fn run(
 
     let genesis_hex = generated
         .genesis_hex()
-        .context("failed to serialize generated genesis block")?;
+        .map_err(|e| anyhow::anyhow!("failed to serialize generated genesis block: {e}"))?;
     let funded_keys: Vec<LocalGenesisFundedKey> = generated
         .funded_keys
         .iter()
@@ -159,6 +166,7 @@ pub fn run(
         slow_start_interval: local_genesis.slow_start_interval,
         pre_blossom_halving_interval: local_genesis.pre_blossom_halving_interval,
         activation_height: local_genesis.activation_heights.overwinter,
+        target_spacing_secs: config.block_time_secs,
     };
 
     // Generate per-node configs
@@ -220,11 +228,30 @@ pub fn run(
         .with_context(|| format!("failed to copy zebrad from {}", zebrad_binary))?;
     println!("Copied zebrad binary from {zebrad_binary}");
 
-    if let Some(txblast_path) = txblast_binary {
-        let src = Path::new(txblast_path);
+    // Copy the kresko binary for remote use (txblast-local, mine).
+    // If --txblast-binary is given, use that path. Otherwise, in PoW mode,
+    // auto-detect the running kresko binary so `kresko mine` is available
+    // on deployed nodes without requiring the flag.
+    let kresko_binary_path: Option<std::path::PathBuf> = txblast_binary
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            if config.mining_mode == MiningMode::Pow {
+                std::env::current_exe().ok()
+            } else {
+                None
+            }
+        });
+    if let Some(src) = kresko_binary_path {
         if src.exists() {
-            std::fs::copy(src, bin_dir.join("kresko"))?;
-            println!("Copied txblast binary from {txblast_path}");
+            std::fs::copy(&src, bin_dir.join("kresko"))?;
+            println!("Copied kresko binary from {}", src.display());
+        } else if config.mining_mode == MiningMode::Pow {
+            eprintln!(
+                "Warning: kresko binary not found at {}; \
+                 `kresko mine` will not be available on deployed nodes. \
+                 Pass --txblast-binary explicitly.",
+                src.display()
+            );
         }
     }
 
@@ -232,6 +259,7 @@ pub fn run(
     let vars_content = format!(
         r#"#!/bin/bash
 export CHAIN_ID="{}"
+export KRESKO_MINING_MODE="{}"
 export AWS_ACCESS_KEY_ID="{}"
 export AWS_SECRET_ACCESS_KEY="{}"
 export AWS_DEFAULT_REGION="{}"
@@ -240,6 +268,7 @@ export AWS_S3_ENDPOINT="{}"
 export KRESKO_LOCAL_GENESIS_DIR="/root/payload/local_genesis"
 "#,
         config.chain_id,
+        config.mining_mode,
         std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default(),
         std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default(),
         std::env::var("AWS_DEFAULT_REGION").unwrap_or_else(|_| "us-east-1".into()),

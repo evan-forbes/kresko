@@ -2,17 +2,19 @@ use anyhow::Result;
 use futures::future::join_all;
 use rand::seq::SliceRandom;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::config::{Config, Instance, select_instances};
+use crate::config::{Config, Instance, MiningMode, select_instances};
 
 #[derive(Debug, Serialize)]
 struct ProgressLogEntry {
     ts_unix_ms: u128,
     tick: u64,
     mode: String,
+    mining_mode: String,
     miner: String,
     ip: String,
     ok: bool,
@@ -20,6 +22,13 @@ struct ProgressLogEntry {
     status_code: Option<u16>,
     block_hash: Option<String>,
     error: Option<String>,
+    // PoW observer fields (None in generate mode)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovered_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    propagation_delay_ms: Option<u128>,
 }
 
 pub async fn run(block_time: u64, random: bool, concurrent: usize, directory: &str) -> Result<()> {
@@ -42,6 +51,20 @@ pub async fn run(block_time: u64, random: bool, concurrent: usize, directory: &s
         return Ok(());
     }
 
+    match config.mining_mode {
+        MiningMode::Pow => run_observer(block_time, &miners, dir).await,
+        MiningMode::Generate => run_generate(block_time, random, concurrent, &miners, dir).await,
+    }
+}
+
+/// Generate mode: drive block production via the `generate` RPC (PoW disabled).
+async fn run_generate(
+    block_time: u64,
+    random: bool,
+    concurrent: usize,
+    miners: &[Instance],
+    dir: &std::path::Path,
+) -> Result<()> {
     let effective_concurrency = concurrent.min(miners.len());
     if effective_concurrency != concurrent {
         println!(
@@ -90,9 +113,9 @@ pub async fn run(block_time: u64, random: bool, concurrent: usize, directory: &s
                 tick = tick.saturating_add(1);
 
                 let selected = if random {
-                    pick_random_miners(&miners, effective_concurrency, &mut rng)
+                    pick_random_miners(miners, effective_concurrency, &mut rng)
                 } else {
-                    pick_round_robin_miners(&miners, effective_concurrency, &mut next_idx)
+                    pick_round_robin_miners(miners, effective_concurrency, &mut next_idx)
                 };
 
                 let futs: Vec<_> = selected
@@ -112,6 +135,154 @@ pub async fn run(block_time: u64, random: bool, concurrent: usize, directory: &s
     }
 
     Ok(())
+}
+
+/// Observer mode: poll nodes for block height changes (PoW enabled, blocks mined by nodes).
+async fn run_observer(
+    block_time: u64,
+    miners: &[Instance],
+    dir: &std::path::Path,
+) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    let log_path = dir.join("progress.log.jsonl");
+    let mut log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+
+    println!(
+        "Progress observer started (miners={}, poll_interval={}s, mining_mode=pow).",
+        miners.len(),
+        block_time,
+    );
+    println!("Logging results to {}", log_path.display());
+    println!("Press Ctrl-C to stop.");
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(block_time));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut tick: u64 = 0;
+    let mut last_heights: HashMap<String, u64> = HashMap::new();
+    // Track when we first saw each block height (for propagation delay).
+    let mut height_first_seen: HashMap<u64, (u128, String)> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("Stopping progress observer.");
+                break;
+            }
+            _ = ticker.tick() => {
+                tick = tick.saturating_add(1);
+
+                let futs: Vec<_> = miners
+                    .iter()
+                    .map(|miner| observe_node(&client, miner, tick))
+                    .collect();
+
+                let results = join_all(futs).await;
+                for (miner_name, mut entry, current_height) in results {
+                    let last = last_heights.get(&miner_name).copied().unwrap_or(0);
+                    if current_height > last || last == 0 {
+                        last_heights.insert(miner_name.clone(), current_height);
+
+                        if current_height > 0 {
+                            if let Some((first_ts, first_miner)) = height_first_seen.get(&current_height) {
+                                entry.discovered_by = Some(first_miner.clone());
+                                entry.propagation_delay_ms = Some(entry.ts_unix_ms.saturating_sub(*first_ts));
+                            } else {
+                                // This node is the first to report this height.
+                                height_first_seen.insert(current_height, (entry.ts_unix_ms, miner_name.clone()));
+                                entry.discovered_by = Some(miner_name);
+                                entry.propagation_delay_ms = Some(0);
+                            }
+                        }
+
+                        print_log_entry(&entry);
+                        let line = serde_json::to_string(&entry)?;
+                        writeln!(log_file, "{line}")?;
+                    }
+                }
+                log_file.flush()?;
+
+                // Prune old height entries to avoid unbounded growth.
+                if let Some(&max_h) = last_heights.values().max() {
+                    height_first_seen.retain(|h, _| *h + 100 >= max_h);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn observe_node(
+    client: &reqwest::Client,
+    miner: &Instance,
+    tick: u64,
+) -> (String, ProgressLogEntry, u64) {
+    let start = Instant::now();
+    let ts_unix_ms = now_unix_ms();
+    let url = format!("http://{}:18232", miner.public_ip);
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": tick,
+        "method": "getblockchaininfo",
+        "params": []
+    });
+
+    let mut entry = ProgressLogEntry {
+        ts_unix_ms,
+        tick,
+        mode: "observer".to_string(),
+        mining_mode: "pow".to_string(),
+        miner: miner.name.clone(),
+        ip: miner.public_ip.clone(),
+        ok: false,
+        latency_ms: 0,
+        status_code: None,
+        block_hash: None,
+        error: None,
+        height: None,
+        discovered_by: None,
+        propagation_delay_ms: None,
+    };
+
+    let mut height: u64 = 0;
+
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            entry.status_code = Some(status.as_u16());
+            match resp.json::<serde_json::Value>().await {
+                Ok(payload) => {
+                    if let Some(err) = payload.get("error").filter(|v| !v.is_null()) {
+                        entry.error = Some(format!("rpc error: {err}"));
+                    } else if let Some(result) = payload.get("result") {
+                        entry.ok = true;
+                        height = result["blocks"].as_u64().unwrap_or(0);
+                        entry.height = Some(height);
+                        entry.block_hash =
+                            result["bestblockhash"].as_str().map(String::from);
+                    } else {
+                        entry.error = Some("missing result in RPC response".to_string());
+                    }
+                }
+                Err(e) => {
+                    entry.error = Some(format!("failed to parse RPC JSON response: {e}"));
+                }
+            }
+        }
+        Err(e) => {
+            entry.error = Some(format!("request failed: {e}"));
+        }
+    }
+
+    entry.latency_ms = start.elapsed().as_millis();
+    (miner.name.clone(), entry, height)
 }
 
 fn pick_round_robin_miners<'a>(
@@ -159,6 +330,7 @@ async fn generate_block(
         ts_unix_ms,
         tick,
         mode: mode.to_string(),
+        mining_mode: "generate".to_string(),
         miner: miner.name.clone(),
         ip: miner.public_ip.clone(),
         ok: false,
@@ -166,6 +338,9 @@ async fn generate_block(
         status_code: None,
         block_hash: None,
         error: None,
+        height: None,
+        discovered_by: None,
+        propagation_delay_ms: None,
     };
 
     match client.post(&url).json(&body).send().await {

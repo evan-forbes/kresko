@@ -40,6 +40,14 @@ enum Commands {
         /// SSH key name in cloud provider
         #[arg(long)]
         ssh_key_name: Option<String>,
+
+        /// Mining mode: "generate" (default, PoW disabled) or "pow" (real PoW mining)
+        #[arg(long, default_value = "generate")]
+        mining_mode: String,
+
+        /// Target block time in seconds (default: 75, post-Blossom)
+        #[arg(long)]
+        block_time: Option<u32>,
     },
 
     /// Add nodes to the experiment config
@@ -128,6 +136,22 @@ enum Commands {
 
     /// Query node status (block heights, sync progress)
     Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
+    /// Health check: are all nodes reachable, advancing, and in sync?
+    /// Exits with code 1 if unhealthy.
+    Check {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
         /// Experiment directory
         #[arg(short = 'd', long, default_value = ".")]
         directory: String,
@@ -176,6 +200,24 @@ enum Commands {
         /// Amount per transaction (in ZEC)
         #[arg(long, default_value = "0.001")]
         amount: f64,
+
+        /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
+    /// Run PoW miner locally (intended to run on remote nodes)
+    Mine {
+        /// RPC endpoint
+        #[arg(long, default_value = "http://localhost:18232")]
+        rpc_endpoint: String,
+    },
+
+    /// Start PoW mining on remote nodes
+    StartMiners {
+        /// Comma-separated instance indices or "all"
+        #[arg(short = 'i', long, default_value = "all")]
+        instances: String,
 
         /// Experiment directory
         #[arg(short = 'd', long, default_value = ".")]
@@ -293,14 +335,16 @@ enum DownloadTarget {
 impl Commands {
     fn directory(&self) -> Option<&str> {
         match self {
-            Commands::Init { .. } | Commands::TxblastLocal { .. } => None,
+            Commands::Init { .. } | Commands::TxblastLocal { .. } | Commands::Mine { .. } => None,
             Commands::Add { directory, .. }
             | Commands::Up { directory, .. }
             | Commands::Genesis { directory, .. }
             | Commands::Deploy { directory, .. }
-            | Commands::Status { directory }
+            | Commands::Status { directory, .. }
+            | Commands::Check { directory, .. }
             | Commands::List { directory }
             | Commands::Progress { directory, .. }
+            | Commands::StartMiners { directory, .. }
             | Commands::Txblast { directory, .. }
             | Commands::KillSession { directory, .. }
             | Commands::Download { directory, .. }
@@ -330,13 +374,18 @@ async fn main() -> Result<()> {
             provider,
             ssh_pub_key_path,
             ssh_key_name,
+            mining_mode,
+            block_time,
         } => {
+            let mining_mode: config::MiningMode = mining_mode.parse()?;
             commands::init::run(
                 &chain_id,
                 &experiment,
                 &provider,
                 ssh_pub_key_path,
                 ssh_key_name,
+                mining_mode,
+                block_time,
             )?;
         }
         Commands::Add {
@@ -385,8 +434,11 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Commands::Status { directory } => {
-            commands::status::run(&directory).await?;
+        Commands::Status { json, directory } => {
+            commands::status::run(json, &directory).await?;
+        }
+        Commands::Check { json, directory } => {
+            commands::check::run(json, &directory).await?;
         }
         Commands::List { directory } => {
             commands::list::run(&directory).await?;
@@ -398,6 +450,15 @@ async fn main() -> Result<()> {
             directory,
         } => {
             commands::progress::run(block_time, random, concurrent, &directory).await?;
+        }
+        Commands::Mine { rpc_endpoint } => {
+            commands::mine::run(&rpc_endpoint).await?;
+        }
+        Commands::StartMiners {
+            instances,
+            directory,
+        } => {
+            commands::start_miners::run(&instances, &directory).await?;
         }
         Commands::Txblast {
             instances,

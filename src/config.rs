@@ -2,6 +2,34 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MiningMode {
+    #[default]
+    Generate,
+    Pow,
+}
+
+impl std::fmt::Display for MiningMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MiningMode::Generate => write!(f, "generate"),
+            MiningMode::Pow => write!(f, "pow"),
+        }
+    }
+}
+
+impl std::str::FromStr for MiningMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "generate" => Ok(MiningMode::Generate),
+            "pow" => Ok(MiningMode::Pow),
+            other => anyhow::bail!("unknown mining mode: {other}. Use generate or pow."),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeType {
@@ -131,6 +159,10 @@ pub struct Config {
     pub ssh_key_name: String,
     pub ssh_key_path: String,
     pub provider: Provider,
+    #[serde(default)]
+    pub mining_mode: MiningMode,
+    #[serde(default)]
+    pub block_time_secs: Option<u32>,
     pub local_genesis: Option<LocalGenesisConfig>,
 }
 
@@ -319,7 +351,7 @@ pub const DO_REGIONS: &[&str] = &[
     "nyc1", "nyc3", "tor1", "sfo2", "sfo3", "ams3", "sgp1", "lon1", "fra1", "syd1",
 ];
 
-pub const GCP_DEFAULT_MACHINE: &str = "c3d-highcpu-16";
+pub const GCP_DEFAULT_MACHINE: &str = "c3d-highcpu-8";
 pub const GCP_DEFAULT_DISK_SIZE_GB: u64 = 400;
 pub const GCP_REGIONS: &[&str] = &[
     "us-central1",

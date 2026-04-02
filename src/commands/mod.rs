@@ -1,4 +1,5 @@
 pub mod add;
+pub mod check;
 pub mod deploy;
 pub mod down;
 pub mod download;
@@ -7,8 +8,10 @@ pub mod genesis;
 pub mod init;
 pub mod kill_session;
 pub mod list;
+pub mod mine;
 pub mod progress;
 pub mod reset;
+pub mod start_miners;
 pub mod status;
 pub mod txblast;
 pub mod up;

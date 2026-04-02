@@ -355,6 +355,31 @@ if [ -f "$GENESIS_BLOCK_FILE" ] || [ -f "$PREMINE_BLOCKS_FILE" ]; then
 fi
 
 echo "=== Node: $parsed_hostname ==="
+
+# In PoW mode, schedule the miner to start after zebrad's RPC is ready.
+# The miner runs in a separate tmux session so it can be managed independently.
+if [ "${KRESKO_MINING_MODE:-generate}" = "pow" ] && command -v kresko >/dev/null 2>&1; then
+    echo "=== Scheduling PoW miner (will start after RPC is ready) ==="
+    cat > /root/kresko-mine-wait.sh <<'MINER_SCRIPT'
+#!/bin/bash
+# Wait for zebrad RPC to become available before starting the miner.
+for attempt in $(seq 1 120); do
+    rpc_response=$(curl -sS --max-time 2 \
+        -H "Content-Type: application/json" \
+        --data '{"jsonrpc":"2.0","id":"kresko","method":"getblockchaininfo","params":[]}' \
+        http://127.0.0.1:18232 2>&1 || true)
+    if printf '%s' "$rpc_response" | jq -e '.error == null and .result != null' >/dev/null 2>&1; then
+        echo "=== RPC ready, starting kresko mine ==="
+        exec kresko mine --rpc-endpoint http://localhost:18232
+    fi
+    sleep 2
+done
+echo "=== RPC not ready after 240s, miner not started ==="
+MINER_SCRIPT
+    chmod +x /root/kresko-mine-wait.sh
+    tmux new-session -d -s mine "bash -lc 'bash /root/kresko-mine-wait.sh 2>&1 | tee -a /root/kresko-mine.log; exec bash -i'"
+fi
+
 echo "=== Starting zebrad ==="
 
 LOG_FILE="/root/logs"

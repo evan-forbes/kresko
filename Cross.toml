@@ -1,0 +1,12 @@
+# Cross-compilation configuration for building Ubuntu-compatible kresko binaries.
+# Requires: cargo install cross --git https://github.com/cross-rs/cross
+# Usage:   cross build --release --target x86_64-unknown-linux-gnu
+#
+# Note: zebrad needs a custom image due to RocksDB/libclang/protobuf deps.
+# Use scripts/build-ubuntu.sh for a complete zebrad+kresko build instead.
+
+[target.x86_64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:main"
+pre-build = [
+    "apt-get update && apt-get install -y libclang-dev protobuf-compiler"
+]
