@@ -122,4 +122,14 @@ impl ZebraRpcClient {
         self.call("z_gettreestate", serde_json::json!([height.to_string()]))
             .await
     }
+
+    pub async fn getblock_raw(&self, height: u32) -> Result<Vec<u8>> {
+        let result = self
+            .call("getblock", serde_json::json!([height.to_string(), 0]))
+            .await?;
+        let hex_str = result
+            .as_str()
+            .context("unexpected getblock response: expected hex string")?;
+        hex::decode(hex_str).context("invalid hex in getblock response")
+    }
 }
