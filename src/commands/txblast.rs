@@ -11,10 +11,6 @@ pub async fn run(
     amount: f64,
     directory: &str,
 ) -> Result<()> {
-    if !matches!(tx_type, TxType::Transparent) {
-        anyhow::bail!("zebrad-compatible txblast currently supports only --tx-type transparent");
-    }
-
     let dir = std::path::Path::new(directory);
     let config = Config::load(dir)?;
 

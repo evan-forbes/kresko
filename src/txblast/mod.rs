@@ -1,4 +1,5 @@
 pub mod rpc;
+pub mod shielded;
 pub mod transparent;
 
 use anyhow::Result;
@@ -16,10 +17,6 @@ pub async fn run_local(
     println!(
         "Starting txblast (endpoint={rpc_endpoint}, type={tx_type}, rate={rate}/s, amount={amount})"
     );
-
-    if !matches!(tx_type, TxType::Transparent) {
-        anyhow::bail!("zebrad-compatible txblast currently supports only --tx-type transparent");
-    }
 
     let client = rpc::ZebraRpcClient::new(rpc_endpoint);
 
@@ -39,5 +36,19 @@ pub async fn run_local(
         key_path.display()
     );
 
-    transparent::run(&client, &funded_key, rate, amount).await
+    match tx_type {
+        TxType::Transparent => transparent::run(&client, &funded_key, rate, amount).await,
+        TxType::Shielded => shielded::run(&client, &funded_key, rate, amount).await,
+        TxType::Both => {
+            let client2 = rpc::ZebraRpcClient::new(rpc_endpoint);
+            let key2 = funded_key.clone();
+            let t_rate = std::cmp::max(rate / 2, 1);
+            let s_rate = std::cmp::max(rate / 2, 1);
+            tokio::try_join!(
+                transparent::run(&client, &funded_key, t_rate, amount),
+                shielded::run(&client2, &key2, s_rate, amount),
+            )?;
+            Ok(())
+        }
+    }
 }

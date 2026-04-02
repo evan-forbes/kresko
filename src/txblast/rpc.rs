@@ -107,4 +107,19 @@ impl ZebraRpcClient {
 
         serde_json::from_value(result).context("unexpected getrawtransaction response")
     }
+
+    pub async fn get_block_count(&self) -> Result<u32> {
+        let result = self
+            .call("getblockcount", serde_json::json!([]))
+            .await?;
+        result
+            .as_u64()
+            .map(|n| n as u32)
+            .context("unexpected getblockcount response")
+    }
+
+    pub async fn z_get_treestate(&self, height: u32) -> Result<Value> {
+        self.call("z_gettreestate", serde_json::json!([height.to_string()]))
+            .await
+    }
 }

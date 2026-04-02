@@ -26,7 +26,7 @@ const MAX_UNCONFIRMED_ANCESTOR_DEPTH: u32 = 20;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
-pub struct FundedKey {
+pub(crate) struct FundedKey {
     pub name: String,
     pub address: transparent::Address,
     pub secret_key: SecretKey,
@@ -34,18 +34,18 @@ pub struct FundedKey {
 }
 
 #[derive(Clone)]
-struct SpendableUtxo {
-    outpoint: transparent::OutPoint,
-    output: transparent::Output,
-    lineage_depth: u32,
+pub(crate) struct SpendableUtxo {
+    pub(crate) outpoint: transparent::OutPoint,
+    pub(crate) output: transparent::Output,
+    pub(crate) lineage_depth: u32,
 }
 
 #[derive(Default)]
-struct RefreshStats {
-    coinbase_utxos: usize,
+pub(crate) struct RefreshStats {
+    pub(crate) coinbase_utxos: usize,
 }
 
-pub fn load_funded_key(explicit_path: Option<&str>) -> Result<(FundedKey, PathBuf)> {
+pub(crate) fn load_funded_key(explicit_path: Option<&str>) -> Result<(FundedKey, PathBuf)> {
     let path = resolve_funded_key_path(explicit_path)?;
     let data = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read funded key file {}", path.display()))?;
@@ -228,7 +228,7 @@ pub async fn run(client: &ZebraRpcClient, key: &FundedKey, rate: u64, amount: f6
     }
 }
 
-fn take_spendable_utxo(
+pub(crate) fn take_spendable_utxo(
     utxos: &mut VecDeque<SpendableUtxo>,
     min_required: u64,
     max_depth: u32,
@@ -245,7 +245,7 @@ fn take_spendable_utxo(
     None
 }
 
-async fn refresh_chain_utxos(
+pub(crate) async fn refresh_chain_utxos(
     client: &ZebraRpcClient,
     key: &FundedKey,
     utxos: &mut VecDeque<SpendableUtxo>,
@@ -420,7 +420,7 @@ fn push_small_data(script: &mut Vec<u8>, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn amount_to_zatoshis(amount: f64) -> Result<u64> {
+pub(crate) fn amount_to_zatoshis(amount: f64) -> Result<u64> {
     if !amount.is_finite() || amount <= 0.0 {
         anyhow::bail!("amount must be a positive finite number of ZEC");
     }
