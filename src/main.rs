@@ -360,9 +360,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Load .env files with override so they always win over shell env vars.
-    // CWD .env first, then experiment directory .env on top (highest priority).
+    // Priority (lowest → highest): CWD, ancestor of experiment dir, experiment dir.
     let _ = dotenvy::dotenv_override();
     if let Some(dir) = cli.command.directory() {
+        // Walk up from the experiment directory's parent looking for a shared .env.
+        // This lets users place credentials in a parent directory shared across experiments.
+        if let Some(parent) = std::path::Path::new(dir).canonicalize().ok() {
+            let mut ancestor = parent.parent().map(|p| p.to_path_buf());
+            while let Some(dir) = ancestor {
+                let env_path = dir.join(".env");
+                if env_path.is_file() {
+                    let _ = dotenvy::from_path_override(&env_path);
+                    break;
+                }
+                ancestor = dir.parent().map(|p| p.to_path_buf());
+            }
+        }
+        // Experiment directory .env wins over everything.
         let env_path = std::path::Path::new(dir).join(".env");
         let _ = dotenvy::from_path_override(&env_path);
     }
