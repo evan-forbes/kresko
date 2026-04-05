@@ -38,12 +38,8 @@ pub async fn run(rpc_endpoint: &str) -> Result<()> {
         .build()?;
 
     let info = rpc_call(&client, rpc_endpoint, "getblockchaininfo", &[]).await?;
-    let chain = info["result"]["chain"]
-        .as_str()
-        .unwrap_or("unknown");
-    let height = info["result"]["blocks"]
-        .as_u64()
-        .unwrap_or(0);
+    let chain = info["result"]["chain"].as_str().unwrap_or("unknown");
+    let height = info["result"]["blocks"].as_u64().unwrap_or(0);
     println!("Connected: chain={chain}, height={height}");
 
     let mut log_file = OpenOptions::new()
@@ -176,7 +172,9 @@ pub async fn run(rpc_endpoint: &str) -> Result<()> {
 
                         if accepted {
                             blocks_submitted += 1;
-                            println!("Block submitted at height {template_height}: hash={block_hash}");
+                            println!(
+                                "Block submitted at height {template_height}: hash={block_hash}"
+                            );
                         } else {
                             blocks_rejected += 1;
                             eprintln!(
@@ -226,7 +224,10 @@ pub async fn run(rpc_endpoint: &str) -> Result<()> {
             }
             Err(SolverCancelled) => {
                 stale_cancellations += 1;
-                println!("Template changed after {:.1}s, restarting solver...", solve_time.as_secs_f64());
+                println!(
+                    "Template changed after {:.1}s, restarting solver...",
+                    solve_time.as_secs_f64()
+                );
 
                 log_entry(
                     &mut log_file,
@@ -373,9 +374,7 @@ async fn rpc_call(
 /// This reimplements the logic from `zebra_rpc::proposal_block_from_template` using
 /// only `zebra-chain` types, avoiding the heavy `zebra-rpc` dependency tree.
 fn block_from_template(template: &serde_json::Value) -> Result<Block> {
-    let version = template["version"]
-        .as_u64()
-        .context("missing version")? as u32;
+    let version = template["version"].as_u64().context("missing version")? as u32;
 
     let prev_hash_hex = template["previousblockhash"]
         .as_str()
@@ -388,8 +387,7 @@ fn block_from_template(template: &serde_json::Value) -> Result<Block> {
     let merkle_root_hex = default_roots["merkleroot"]
         .as_str()
         .context("missing defaultroots.merkleroot")?;
-    let merkle_root_bytes =
-        hex_to_32_bytes(merkle_root_hex).context("invalid merkleroot hex")?;
+    let merkle_root_bytes = hex_to_32_bytes(merkle_root_hex).context("invalid merkleroot hex")?;
     let merkle_root = block::merkle::Root(merkle_root_bytes);
 
     // All kresko experiments activate NU6.1 at height 1, so we always use
@@ -400,27 +398,24 @@ fn block_from_template(template: &serde_json::Value) -> Result<Block> {
     let commitment_bytes =
         hex_to_32_bytes(commitment_hex).context("invalid blockcommitmentshash hex")?;
 
-    let bits_hex = template["bits"]
-        .as_str()
-        .context("missing bits")?;
+    let bits_hex = template["bits"].as_str().context("missing bits")?;
     let difficulty_threshold = CompactDifficulty::from_hex(bits_hex)
         .map_err(|e| anyhow::anyhow!("invalid bits hex: {e}"))?;
 
-    let cur_time = template["curtime"]
-        .as_u64()
-        .context("missing curtime")? as i64;
-    let time = chrono::DateTime::from_timestamp(cur_time, 0)
-        .context("invalid curtime timestamp")?;
+    let cur_time = template["curtime"].as_u64().context("missing curtime")? as i64;
+    let time =
+        chrono::DateTime::from_timestamp(cur_time, 0).context("invalid curtime timestamp")?;
 
     // Parse transactions
     let coinbase_hex = template["coinbasetxn"]["data"]
         .as_str()
         .context("missing coinbasetxn.data")?;
     let coinbase_bytes = hex::decode(coinbase_hex).context("invalid coinbase hex")?;
-    let mut transactions: Vec<Arc<zebra_chain::transaction::Transaction>> =
-        vec![coinbase_bytes
+    let mut transactions: Vec<Arc<zebra_chain::transaction::Transaction>> = vec![
+        coinbase_bytes
             .zcash_deserialize_into()
-            .context("failed to deserialize coinbase transaction")?];
+            .context("failed to deserialize coinbase transaction")?,
+    ];
 
     if let Some(tx_templates) = template["transactions"].as_array() {
         for tx_template in tx_templates {
@@ -457,8 +452,8 @@ fn block_from_template(template: &serde_json::Value) -> Result<Block> {
 /// The RPC returns hashes in display order (big-endian / reversed), so we
 /// reverse the bytes to get the serialized order that zebra-chain stores.
 fn hex_to_32_bytes(hex_str: &str) -> Result<[u8; 32]> {
-    let mut bytes = <[u8; 32]>::from_hex(hex_str)
-        .map_err(|e| anyhow::anyhow!("hex decode error: {e}"))?;
+    let mut bytes =
+        <[u8; 32]>::from_hex(hex_str).map_err(|e| anyhow::anyhow!("hex decode error: {e}"))?;
     bytes.reverse();
     Ok(bytes)
 }

@@ -53,6 +53,13 @@ echo "=== Extracting payload ==="
 tar -xzf /root/$ARCHIVE_NAME -C /root/
 source /root/payload/vars.sh
 
+# Zebra's config parser reads all ZEBRA_* env vars and rejects unknown ones.
+# Save tracing env vars and unset them so config parsing succeeds.
+# They'll be re-exported just before launching zebrad.
+_SAVED_P2P_TRACE_DIR="${ZEBRA_P2P_TRACE_DIR:-}"
+_SAVED_P2P_TRACE_FILE="${ZEBRA_P2P_TRACE_FILE:-}"
+unset ZEBRA_P2P_TRACE_DIR ZEBRA_P2P_TRACE_FILE
+
 cd $HOME
 hostname=$(hostname)
 parsed_hostname=$(echo $hostname | awk -F'-' '{print $1 "-" $2}')
@@ -61,10 +68,8 @@ echo "=== Installing binaries ==="
 cp payload/build/zebrad /usr/local/bin/zebrad
 chmod +x /usr/local/bin/zebrad
 
-if [ -f payload/build/kresko ]; then
-    cp payload/build/kresko /usr/local/bin/kresko
-    chmod +x /usr/local/bin/kresko
-fi
+cp payload/build/kresko /usr/local/bin/kresko
+chmod +x /usr/local/bin/kresko
 
 echo "=== Setting up zebra config ==="
 mkdir -p /root/.cache/zebra
@@ -77,14 +82,42 @@ fi
 # Remove this optional key to keep old and new zebrad versions compatible.
 sed -i -E '/^[[:space:]]*genesis_block_path[[:space:]]*=.*$/d' /root/.config/zebrad.toml
 
+BOOTSTRAP_CONFIG="/root/.config/zebrad.bootstrap.toml"
+prepare_bootstrap_config() {
+    awk '
+        $0 ~ /^\[network\]$/ {
+            in_network = 1
+            print
+            next
+        }
+        $0 ~ /^\[/ && $0 !~ /^\[network\]$/ {
+            in_network = 0
+        }
+        in_network && $0 ~ /^[[:space:]]*listen_addr[[:space:]]*=/ {
+            print "listen_addr = \"127.0.0.1:0\""
+            next
+        }
+        in_network && $0 ~ /^[[:space:]]*initial_testnet_peers[[:space:]]*=/ {
+            print "initial_testnet_peers = []"
+            next
+        }
+        { print }
+    ' /root/.config/zebrad.toml > "$BOOTSTRAP_CONFIG"
+    mkdir -p /root/.cache/zebra/network
+    rm -f /root/.cache/zebra/network/*.peers
+}
+
+prepare_bootstrap_config
+
 current_miner_address=$(awk -F= '/^[[:space:]]*miner_address[[:space:]]*=/{gsub(/["[:space:]]/, "", $2); print tolower($2); exit}' /root/.config/zebrad.toml)
 if [ -z "$current_miner_address" ] || [ "$current_miner_address" = "auto" ] || [ "$current_miner_address" = "__auto__" ] || [ "$current_miner_address" = "__auto_miner_address__" ]; then
     bootstrap_miner_address="t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v"
     echo "=== Auto-generating miner address via zebrad RPC ==="
     sed -i -E "s|^[[:space:]]*miner_address[[:space:]]*=.*$|miner_address = \"$bootstrap_miner_address\"|" /root/.config/zebrad.toml
+    prepare_bootstrap_config
 
     BOOTSTRAP_LOG="/root/logs.bootstrap"
-    zebrad -c /root/.config/zebrad.toml start >"$BOOTSTRAP_LOG" 2>&1 &
+    zebrad -c "$BOOTSTRAP_CONFIG" start >"$BOOTSTRAP_LOG" 2>&1 &
     bootstrap_pid=$!
 
     generated_miner_address=""
@@ -148,8 +181,10 @@ GENESIS_BLOCK_FILE="/root/payload/local_genesis/genesis.hex"
 PREMINE_BLOCKS_FILE="/root/payload/local_genesis/premine_blocks.hex"
 if [ -f "$GENESIS_BLOCK_FILE" ] || [ -f "$PREMINE_BLOCKS_FILE" ]; then
     echo "=== Seeding local chain state from payload artifacts ==="
+    echo "=== Seeding in isolated bootstrap mode (P2P disabled until final startup) ==="
+    prepare_bootstrap_config
     BOOTSTRAP_LOG="/root/logs.bootstrap"
-    zebrad -c /root/.config/zebrad.toml start >"$BOOTSTRAP_LOG" 2>&1 &
+    zebrad -c "$BOOTSTRAP_CONFIG" start >"$BOOTSTRAP_LOG" 2>&1 &
     bootstrap_pid=$!
 
     rpc_ready=0
@@ -234,7 +269,7 @@ if [ -f "$GENESIS_BLOCK_FILE" ] || [ -f "$PREMINE_BLOCKS_FILE" ]; then
     total_blocks=0
     if [ -f "$PREMINE_BLOCKS_FILE" ]; then
         total_blocks=$(grep -cve '^[[:space:]]*$' "$PREMINE_BLOCKS_FILE")
-        echo "=== Premine blocks queued: $total_blocks ==="
+        echo "=== Seed blocks queued: $total_blocks ==="
     fi
     submitted=0
     if [ -f "$PREMINE_BLOCKS_FILE" ]; then
@@ -250,7 +285,7 @@ if [ -f "$GENESIS_BLOCK_FILE" ] || [ -f "$PREMINE_BLOCKS_FILE" ]; then
                     --data "{\"jsonrpc\":\"2.0\",\"id\":\"kresko\",\"method\":\"submitblock\",\"params\":[\"$block_hex\"]}" \
                     http://127.0.0.1:18232 2>&1 || true)
                 if ! rpc_has_no_error "$submit_response"; then
-                    echo "=== submitblock RPC error while loading premine blocks ===" >&2
+                    echo "=== submitblock RPC error while loading seed blocks ===" >&2
                     echo "$submit_response" >&2
                     if kill -0 "$bootstrap_pid" 2>/dev/null; then
                         kill -INT "$bootstrap_pid" 2>/dev/null || true
@@ -268,12 +303,12 @@ if [ -f "$GENESIS_BLOCK_FILE" ] || [ -f "$PREMINE_BLOCKS_FILE" ]; then
                 fi
 
                 if [ "$submit_result" = "rejected" ] && [ "$retry" -lt 10 ]; then
-                    echo "=== submitblock returned 'rejected' for premine block $((submitted+1)), retry $retry/10 ===" >&2
+                    echo "=== submitblock returned 'rejected' for seed block $((submitted+1)), retry $retry/10 ===" >&2
                     sleep 2
                     continue
                 fi
 
-                echo "=== submitblock rejected premine block: $submit_result ===" >&2
+                echo "=== submitblock rejected seed block: $submit_result ===" >&2
                 if kill -0 "$bootstrap_pid" 2>/dev/null; then
                     kill -INT "$bootstrap_pid" 2>/dev/null || true
                     sleep 2
@@ -286,13 +321,13 @@ if [ -f "$GENESIS_BLOCK_FILE" ] || [ -f "$PREMINE_BLOCKS_FILE" ]; then
             submitted=$((submitted + 1))
             if [ "$total_blocks" -gt 0 ]; then
                 if [ "$submitted" -eq 1 ] || [ $((submitted % 10)) -eq 0 ] || [ "$submitted" -eq "$total_blocks" ]; then
-                    echo "=== Premine load progress: $submitted/$total_blocks blocks ==="
+                    echo "=== Seed load progress: $submitted/$total_blocks blocks ==="
                 fi
             elif [ "$submitted" -eq 1 ] || [ $((submitted % 10)) -eq 0 ]; then
-                echo "=== Premine load progress: $submitted blocks ==="
+                echo "=== Seed load progress: $submitted blocks ==="
             fi
         done < "$PREMINE_BLOCKS_FILE"
-        echo "=== Loaded $submitted premine blocks ==="
+        echo "=== Loaded $submitted seed blocks ==="
     fi
 
     expected_tip_height="$total_blocks"
@@ -354,6 +389,8 @@ if [ -f "$GENESIS_BLOCK_FILE" ] || [ -f "$PREMINE_BLOCKS_FILE" ]; then
     wait "$bootstrap_pid" 2>/dev/null || true
 fi
 
+rm -f "$BOOTSTRAP_CONFIG"
+
 echo "=== Node: $parsed_hostname ==="
 
 # In PoW mode, schedule the miner to start after zebrad's RPC is ready.
@@ -381,6 +418,15 @@ MINER_SCRIPT
 fi
 
 echo "=== Starting zebrad ==="
+
+# Re-export tracing env vars now that config parsing is done.
+# zebra's p2p_tracing module reads these directly via std::env::var().
+if [ -n "$_SAVED_P2P_TRACE_DIR" ]; then
+    export ZEBRA_P2P_TRACE_DIR="$_SAVED_P2P_TRACE_DIR"
+fi
+if [ -n "$_SAVED_P2P_TRACE_FILE" ]; then
+    export ZEBRA_P2P_TRACE_FILE="$_SAVED_P2P_TRACE_FILE"
+fi
 
 LOG_FILE="/root/logs"
 zebrad -c /root/.config/zebrad.toml start 2>&1 | tee -a "$LOG_FILE"

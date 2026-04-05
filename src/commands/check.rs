@@ -70,11 +70,7 @@ pub async fn check(directory: &str) -> Result<CheckReport> {
     }
 
     // Check for unreachable nodes
-    let unreachable: Vec<_> = status
-        .nodes
-        .iter()
-        .filter(|n| n.height.is_none())
-        .collect();
+    let unreachable: Vec<_> = status.nodes.iter().filter(|n| n.height.is_none()).collect();
     for node in &unreachable {
         issues.push(format!("{} ({}): {}", node.name, node.ip, node.status));
     }

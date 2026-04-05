@@ -163,22 +163,64 @@ pub struct Config {
     pub mining_mode: MiningMode,
     #[serde(default)]
     pub block_time_secs: Option<u32>,
+    #[serde(default)]
+    pub orchard_txblast: OrchardTxblastConfig,
     pub local_genesis: Option<LocalGenesisConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchardTxblastConfig {
+    pub lanes_per_miner: usize,
+    pub lane_value_zats: u64,
+    pub fanout_source_value_zats: u64,
+    pub fanout_outputs: usize,
+}
+
+impl Default for OrchardTxblastConfig {
+    fn default() -> Self {
+        Self {
+            lanes_per_miner: 384,
+            lane_value_zats: 100_000,
+            fanout_source_value_zats: 500_000,
+            fanout_outputs: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalGenesisConfig {
+    #[serde(default)]
+    pub bootstrap_mode: LocalGenesisBootstrapMode,
+    #[serde(default)]
+    pub bootstrap_artifact_id: Option<String>,
     pub network_name: String,
     pub network_magic: [u8; 4],
     pub target_difficulty_limit: String,
     pub disable_pow: bool,
     pub genesis_hash: String,
+    #[serde(default)]
+    pub seeded_tip_hash: Option<String>,
     pub genesis_hex: String,
     pub slow_start_interval: u32,
     pub pre_blossom_halving_interval: u32,
     pub activation_heights: LocalGenesisActivationHeights,
+    #[serde(default)]
+    pub maturity_padding_block_count: u32,
+    #[serde(default)]
     pub premine_block_count: u32,
+    #[serde(default)]
+    pub seeded_block_count: u32,
+    #[serde(default)]
+    pub bootstrap_treasury_key: Option<LocalGenesisFundedKey>,
     pub funded_keys: Vec<LocalGenesisFundedKey>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalGenesisBootstrapMode {
+    #[default]
+    Generated,
+    Cached,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -138,11 +138,7 @@ async fn run_generate(
 }
 
 /// Observer mode: poll nodes for block height changes (PoW enabled, blocks mined by nodes).
-async fn run_observer(
-    block_time: u64,
-    miners: &[Instance],
-    dir: &std::path::Path,
-) -> Result<()> {
+async fn run_observer(block_time: u64, miners: &[Instance], dir: &std::path::Path) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
@@ -265,8 +261,7 @@ async fn observe_node(
                         entry.ok = true;
                         height = result["blocks"].as_u64().unwrap_or(0);
                         entry.height = Some(height);
-                        entry.block_hash =
-                            result["bestblockhash"].as_str().map(String::from);
+                        entry.block_hash = result["bestblockhash"].as_str().map(String::from);
                     } else {
                         entry.error = Some("missing result in RPC response".to_string());
                     }

@@ -12,6 +12,8 @@ pub struct AddressUtxo {
     pub output_index: u32,
     pub script: String,
     pub satoshis: u64,
+    #[serde(default)]
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,9 +111,7 @@ impl ZebraRpcClient {
     }
 
     pub async fn get_block_count(&self) -> Result<u32> {
-        let result = self
-            .call("getblockcount", serde_json::json!([]))
-            .await?;
+        let result = self.call("getblockcount", serde_json::json!([])).await?;
         result
             .as_u64()
             .map(|n| n as u32)

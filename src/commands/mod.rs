@@ -4,6 +4,7 @@ pub mod deploy;
 pub mod down;
 pub mod download;
 pub mod download_heights;
+pub mod fund_runtime_keys;
 pub mod genesis;
 pub mod init;
 pub mod kill_session;

@@ -45,9 +45,6 @@ NU5 = 1
 NU6 = 1
 "NU6.1" = 1
 
-[sync]
-sync_restart_delay = "2s"
-
 [state]
 cache_dir = "/root/.cache/zebra"
 
@@ -165,7 +162,6 @@ pub fn apply_local_testnet_parameters(config: &str, params: &LocalTestnetParamet
     result.push_str(&format!("Canopy = {}\n", params.activation_height));
     result.push_str(&format!("NU5 = {}\n", params.activation_height));
     result.push_str(&format!("NU6 = {}\n", params.activation_height));
-    result.push_str(&format!("\"NU6.1\" = {}\n", params.activation_height));
 
     result
 }
@@ -342,6 +338,6 @@ mod tests {
         );
         assert!(generated.contains("pre_nu6_funding_streams = { recipients = [] }"));
         assert!(generated.contains("post_nu6_funding_streams = { recipients = [] }"));
-        assert!(generated.contains("\"NU6.1\" = 1"));
+        assert!(generated.contains("NU6 = 1"));
     }
 }

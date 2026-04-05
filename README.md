@@ -76,7 +76,12 @@ cd exp-nyc-sfo
 ../target/release/kresko up --workers 8
 
 # 5) Build payload (point to your local zebrad binary)
-../target/release/kresko genesis --zebrad-binary /path/to/zebrad
+../target/release/kresko genesis \
+  --zebrad-binary /path/to/zebrad \
+  --orchard-lanes-per-miner 384 \
+  --orchard-lane-value-zats 100000 \
+  --orchard-fanout-source-value-zats 500000 \
+  --orchard-fanout-outputs 4
 
 # 6) Deploy and start remote nodes (tmux session: app)
 ../target/release/kresko deploy --workers 8
@@ -103,7 +108,7 @@ Generated later:
 
 - `payload/local_genesis/*` (genesis artifacts, checkpoints, funded keys)
 - `payload/<node>/zebrad.toml` (per-node peer config + local testnet params)
-- `payload/build/zebrad` and optional `payload/build/kresko` (txblast-local runner)
+- `payload/build/zebrad` and `payload/build/kresko` (single remote runner for `txblast-local` and `mine`)
 - `payload.tar.gz` (cached payload archive)
 - `progress.log.jsonl` (from `kresko progress`)
 
@@ -128,6 +133,9 @@ kresko kill-session --session txblast
 # Download logs from all nodes into ./data/
 kresko download --nodes all --workers 8
 
+# Download only peer_message structured traces
+kresko download traces --nodes all --workers 8 --tables peer_message
+
 # Download block height/time/size traces
 kresko download heights --nodes 3 --workers 4
 ```
@@ -144,9 +152,10 @@ kresko download heights --nodes 3 --workers 4
 - `deploy`: distribute payload and start nodes (`--direct-payload-upload` skips S3 payload hop)
 - `status`: query node RPC status/height/sync
 - `progress`: continuously call `generate` on miners
-- `txblast`: start remote tx blast (`transparent` currently supported with zebrad-compatible mode)
+- `txblast`: start remote tx blast (`transparent`, `shielded`, or `both`; shielded mode supports Orchard lane and fanout controls)
 - `txblast-local`: local tx blast runner intended for remote execution
 - `download`: fetch logs from nodes
+- `download traces`: fetch selected structured trace tables from nodes
 - `download heights`: collect per-block traces via RPC into JSONL
 - `upload-data`: upload collected `data/` to S3 prefix `<experiment>/data/`
 - `reset`: stop sessions and clean remote node state
@@ -159,6 +168,7 @@ kresko download heights --nodes 3 --workers 4
 - `down --all` is intentionally destructive. Use carefully.
 - Provider credentials are loaded from `.env` (current directory first, then experiment directory).
 - `workers` values must be greater than `0`.
+- Shielded txblast now uses the local-genesis premine UTXO to create an initial Orchard lane inventory, then replenishes width with fanout when ready lanes fall below the configured watermark.
 
 ## License
 

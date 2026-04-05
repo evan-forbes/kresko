@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::config::{Config, MiningMode, Provider, resolve_value};
+use crate::config::{Config, MiningMode, OrchardTxblastConfig, Provider, resolve_value};
 use crate::zebra_config;
 
 pub fn run(
@@ -53,6 +53,7 @@ pub fn run(
         provider,
         mining_mode,
         block_time_secs,
+        orchard_txblast: OrchardTxblastConfig::default(),
         local_genesis: None,
     };
 

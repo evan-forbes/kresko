@@ -1,3 +1,4 @@
+mod bootstrap;
 mod cloud;
 mod commands;
 mod config;
@@ -98,13 +99,37 @@ enum Commands {
         #[arg(long)]
         zebrad_binary: String,
 
-        /// Path to txblast binary (optional, defaults to kresko binary)
-        #[arg(long)]
-        txblast_binary: Option<String>,
+        /// Path to kresko binary to ship to remote nodes (defaults to current executable)
+        #[arg(long, alias = "txblast-binary")]
+        kresko_binary: Option<String>,
 
         /// Build directory name
         #[arg(long, default_value = "build")]
         build_dir: String,
+
+        /// Extra empty local-genesis blocks to seed after funding blocks so premine outputs mature
+        #[arg(long, default_value_t = 125)]
+        maturity_padding_blocks: u32,
+
+        /// Bootstrap mode: auto (cached for PoW, generated otherwise), generated, or cached
+        #[arg(long, default_value = "auto")]
+        bootstrap_mode: String,
+
+        /// Initial Orchard lanes to create per miner during shielded txblast warmup
+        #[arg(long, default_value_t = 384)]
+        orchard_lanes_per_miner: usize,
+
+        /// Target value of each initial Orchard lane note, in zatoshis
+        #[arg(long, default_value_t = 100_000)]
+        orchard_lane_value_zats: u64,
+
+        /// Preferred minimum value for reservoir notes used by fanout, in zatoshis
+        #[arg(long, default_value_t = 500_000)]
+        orchard_fanout_source_value_zats: u64,
+
+        /// Number of child lane notes created by each fanout transaction
+        #[arg(long, default_value_t = 4)]
+        orchard_fanout_outputs: usize,
 
         /// Experiment directory
         #[arg(short = 'd', long, default_value = ".")]
@@ -201,6 +226,41 @@ enum Commands {
         #[arg(long, default_value = "0.001")]
         amount: f64,
 
+        /// Maximum Orchard transactions allowed in flight per node
+        #[arg(long)]
+        orchard_max_in_flight: Option<usize>,
+
+        /// Target number of ready Orchard lanes to maintain
+        #[arg(long)]
+        orchard_target_ready_lanes: Option<usize>,
+
+        /// Trigger fanout when ready Orchard lanes fall below this watermark
+        #[arg(long)]
+        orchard_lane_low_watermark: Option<usize>,
+
+        /// Maximum Orchard fanout transactions allowed in flight per node
+        #[arg(long)]
+        orchard_fanout_max_in_flight: Option<usize>,
+
+        /// Orchard progress log interval in seconds
+        #[arg(long)]
+        orchard_progress_interval_secs: Option<u64>,
+
+        /// Enable txblast JSONL tracing on remote nodes
+        #[arg(long)]
+        trace_enable: bool,
+
+        /// Trace directory for txblast JSONL files on remote nodes
+        #[arg(long)]
+        trace_dir: Option<String>,
+
+        /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
+    /// Distribute cached treasury funds into per-node runtime funded keys
+    FundRuntimeKeys {
         /// Experiment directory
         #[arg(short = 'd', long, default_value = ".")]
         directory: String,
@@ -242,9 +302,72 @@ enum Commands {
         #[arg(long, default_value = "0.001")]
         amount: f64,
 
+        /// Initial Orchard lanes to create from matured transparent premine funds
+        #[arg(long)]
+        orchard_lanes_per_miner: Option<usize>,
+
+        /// Target value of each initial Orchard lane note, in zatoshis
+        #[arg(long)]
+        orchard_lane_value_zats: Option<u64>,
+
+        /// Preferred minimum value for reservoir notes used by fanout, in zatoshis
+        #[arg(long)]
+        orchard_fanout_source_value_zats: Option<u64>,
+
+        /// Number of child lane notes created by each fanout transaction
+        #[arg(long)]
+        orchard_fanout_outputs: Option<usize>,
+
+        /// Maximum Orchard transactions allowed in flight
+        #[arg(long)]
+        orchard_max_in_flight: Option<usize>,
+
+        /// Target number of ready Orchard lanes to maintain
+        #[arg(long)]
+        orchard_target_ready_lanes: Option<usize>,
+
+        /// Trigger fanout when ready Orchard lanes fall below this watermark
+        #[arg(long)]
+        orchard_lane_low_watermark: Option<usize>,
+
+        /// Maximum Orchard fanout transactions allowed in flight
+        #[arg(long)]
+        orchard_fanout_max_in_flight: Option<usize>,
+
+        /// Orchard progress log interval in seconds
+        #[arg(long)]
+        orchard_progress_interval_secs: Option<u64>,
+
+        /// Enable txblast JSONL tracing
+        #[arg(long)]
+        trace_enable: bool,
+
+        /// Trace directory for txblast JSONL files
+        #[arg(long)]
+        trace_dir: Option<String>,
+
         /// Path to premine funded key JSON (optional, auto-detected on nodes)
         #[arg(long)]
         funded_key_path: Option<String>,
+    },
+
+    /// Fund runtime keys locally from the cached bootstrap treasury (intended to run on remote nodes)
+    FundRuntimeKeysLocal {
+        /// RPC endpoint
+        #[arg(long, default_value = "http://localhost:18232")]
+        rpc_endpoint: String,
+
+        /// Directory containing local genesis bootstrap artifacts on the remote node
+        #[arg(long, default_value = "/root/payload/local_genesis")]
+        local_genesis_dir: String,
+
+        /// Minimum confirmed balance to place on each runtime funded key
+        #[arg(long)]
+        minimum_recipient_zats: u64,
+
+        /// Timeout while waiting for the funding transaction to confirm
+        #[arg(long, default_value_t = 600)]
+        confirm_timeout_secs: u64,
     },
 
     /// Kill tmux sessions on remote nodes
@@ -330,12 +453,21 @@ enum DownloadTarget {
         #[arg(short = 'n', long = "nodes", default_value_t = 1)]
         node_count: usize,
     },
+    /// Download selected structured trace JSONL tables from remote nodes
+    Traces {
+        /// Comma-separated trace tables: all, peer_message, trace_dropped, txblast_event, txblast_registry, txblast_note, txblast_trace_dropped
+        #[arg(long, default_value = "all")]
+        tables: String,
+    },
 }
 
 impl Commands {
     fn directory(&self) -> Option<&str> {
         match self {
-            Commands::Init { .. } | Commands::TxblastLocal { .. } | Commands::Mine { .. } => None,
+            Commands::Init { .. }
+            | Commands::TxblastLocal { .. }
+            | Commands::FundRuntimeKeysLocal { .. }
+            | Commands::Mine { .. } => None,
             Commands::Add { directory, .. }
             | Commands::Up { directory, .. }
             | Commands::Genesis { directory, .. }
@@ -345,6 +477,7 @@ impl Commands {
             | Commands::List { directory }
             | Commands::Progress { directory, .. }
             | Commands::StartMiners { directory, .. }
+            | Commands::FundRuntimeKeys { directory }
             | Commands::Txblast { directory, .. }
             | Commands::KillSession { directory, .. }
             | Commands::Download { directory, .. }
@@ -421,14 +554,26 @@ async fn main() -> Result<()> {
         }
         Commands::Genesis {
             zebrad_binary,
-            txblast_binary,
+            kresko_binary,
             build_dir,
+            maturity_padding_blocks,
+            bootstrap_mode,
+            orchard_lanes_per_miner,
+            orchard_lane_value_zats,
+            orchard_fanout_source_value_zats,
+            orchard_fanout_outputs,
             directory,
         } => {
             commands::genesis::run(
                 &zebrad_binary,
-                txblast_binary.as_deref(),
+                kresko_binary.as_deref(),
                 &build_dir,
+                maturity_padding_blocks,
+                &bootstrap_mode,
+                orchard_lanes_per_miner,
+                orchard_lane_value_zats,
+                orchard_fanout_source_value_zats,
+                orchard_fanout_outputs,
                 &directory,
             )?;
         }
@@ -474,21 +619,56 @@ async fn main() -> Result<()> {
         } => {
             commands::start_miners::run(&instances, &directory).await?;
         }
+        Commands::FundRuntimeKeys { directory } => {
+            commands::fund_runtime_keys::run(&directory).await?;
+        }
         Commands::Txblast {
             instances,
             tx_type,
             rate,
             amount,
+            orchard_max_in_flight,
+            orchard_target_ready_lanes,
+            orchard_lane_low_watermark,
+            orchard_fanout_max_in_flight,
+            orchard_progress_interval_secs,
+            trace_enable,
+            trace_dir,
             directory,
         } => {
             let tx_type: config::TxType = tx_type.parse()?;
-            commands::txblast::run(&instances, tx_type, rate, amount, &directory).await?;
+            commands::txblast::run(
+                &instances,
+                tx_type,
+                rate,
+                amount,
+                orchard_max_in_flight,
+                orchard_target_ready_lanes,
+                orchard_lane_low_watermark,
+                orchard_fanout_max_in_flight,
+                orchard_progress_interval_secs,
+                trace_enable,
+                trace_dir.as_deref(),
+                &directory,
+            )
+            .await?;
         }
         Commands::TxblastLocal {
             rpc_endpoint,
             tx_type,
             rate,
             amount,
+            orchard_lanes_per_miner,
+            orchard_lane_value_zats,
+            orchard_fanout_source_value_zats,
+            orchard_fanout_outputs,
+            orchard_max_in_flight,
+            orchard_target_ready_lanes,
+            orchard_lane_low_watermark,
+            orchard_fanout_max_in_flight,
+            orchard_progress_interval_secs,
+            trace_enable,
+            trace_dir,
             funded_key_path,
         } => {
             let tx_type: config::TxType = tx_type.parse()?;
@@ -497,7 +677,32 @@ async fn main() -> Result<()> {
                 tx_type,
                 rate,
                 amount,
+                orchard_lanes_per_miner,
+                orchard_lane_value_zats,
+                orchard_fanout_source_value_zats,
+                orchard_fanout_outputs,
+                orchard_max_in_flight,
+                orchard_target_ready_lanes,
+                orchard_lane_low_watermark,
+                orchard_fanout_max_in_flight,
+                orchard_progress_interval_secs,
+                trace_enable,
+                trace_dir.as_deref(),
                 funded_key_path.as_deref(),
+            )
+            .await?;
+        }
+        Commands::FundRuntimeKeysLocal {
+            rpc_endpoint,
+            local_genesis_dir,
+            minimum_recipient_zats,
+            confirm_timeout_secs,
+        } => {
+            commands::fund_runtime_keys::run_local(
+                &rpc_endpoint,
+                &local_genesis_dir,
+                minimum_recipient_zats,
+                confirm_timeout_secs,
             )
             .await?;
         }
@@ -518,8 +723,11 @@ async fn main() -> Result<()> {
             Some(DownloadTarget::Heights { node_count }) => {
                 commands::download_heights::run(node_count, workers, &directory).await?;
             }
+            Some(DownloadTarget::Traces { tables }) => {
+                commands::download::run_traces(&nodes, workers, &tables, &directory).await?;
+            }
             None => {
-                commands::download::run(&nodes, workers, no_compress, &directory).await?;
+                commands::download::run_logs(&nodes, workers, no_compress, &directory).await?;
             }
         },
         Commands::UploadData { directory } => {

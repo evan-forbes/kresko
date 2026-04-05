@@ -21,7 +21,7 @@ use crate::config::LocalGenesisFundedKey;
 
 use super::rpc::{AddressUtxo, ZebraRpcClient};
 
-const BASE_FEE_ZATS: u64 = 10_000;
+pub(crate) const BASE_FEE_ZATS: u64 = 10_000;
 const MAX_UNCONFIRMED_ANCESTOR_DEPTH: u32 = 20;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -160,7 +160,7 @@ pub async fn run(client: &ZebraRpcClient, key: &FundedKey, rate: u64, amount: f6
         }
 
         anyhow::bail!(
-            "no spendable transparent UTXOs found for {}. make sure premine blocks were loaded",
+            "no spendable transparent UTXOs found for {}. make sure local genesis seed blocks were loaded",
             key.address
         );
     }
@@ -294,7 +294,10 @@ async fn is_coinbase_transaction(
     Ok(is_coinbase)
 }
 
-fn rpc_utxo_to_spendable(utxo: AddressUtxo, txid: Hash) -> Result<Option<SpendableUtxo>> {
+pub(crate) fn rpc_utxo_to_spendable(
+    utxo: AddressUtxo,
+    txid: Hash,
+) -> Result<Option<SpendableUtxo>> {
     let script_bytes = hex::decode(&utxo.script)
         .with_context(|| format!("invalid script hex in getaddressutxos: {}", utxo.script))?;
 
@@ -353,8 +356,21 @@ async fn build_sign_and_send(
         anyhow::bail!("all outputs are dust")
     }
 
+    build_sign_and_send_outputs(client, key, utxo, outputs).await
+}
+
+pub(crate) async fn build_sign_and_send_outputs(
+    client: &ZebraRpcClient,
+    key: &FundedKey,
+    utxo: &SpendableUtxo,
+    outputs: Vec<transparent::Output>,
+) -> Result<(zebra_chain::transaction::Hash, Vec<transparent::Output>)> {
+    if outputs.is_empty() || outputs.iter().all(transparent::Output::is_dust) {
+        anyhow::bail!("all outputs are dust")
+    }
+
     let mut tx = Transaction::V5 {
-        network_upgrade: NetworkUpgrade::Nu6_1,
+        network_upgrade: NetworkUpgrade::Nu6,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(0),
         inputs: vec![transparent::Input::PrevOut {
@@ -368,7 +384,7 @@ async fn build_sign_and_send(
     };
 
     let sighash = tx.sighash(
-        NetworkUpgrade::Nu6_1,
+        NetworkUpgrade::Nu6,
         HashType::ALL,
         Arc::new(vec![utxo.output.clone()]),
         Some((0, utxo.output.lock_script.as_raw_bytes().to_vec())),
