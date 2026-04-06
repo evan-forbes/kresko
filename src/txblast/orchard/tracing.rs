@@ -109,6 +109,8 @@ struct RegistryRecord {
     max_in_flight: usize,
     target_ready_lanes: usize,
     lane_low_watermark: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -247,6 +249,7 @@ impl OrchardTxblastTracer {
         pending: PendingTxCounts,
         submit_credit: f64,
         cfg: &OrchardBlastRuntimeConfig,
+        reason: Option<&str>,
     ) {
         let snapshot = registry.snapshot();
         let treasury_snapshot = treasury.snapshot();
@@ -275,6 +278,7 @@ impl OrchardTxblastTracer {
             max_in_flight: cfg.max_in_flight,
             target_ready_lanes: cfg.target_ready_lanes,
             lane_low_watermark: cfg.lane_low_watermark,
+            reason: reason.map(ToOwned::to_owned),
         };
 
         self.emit_json(TXBLAST_REGISTRY_TABLE, TXBLAST_REGISTRY_FILE, &record);

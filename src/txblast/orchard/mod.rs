@@ -8,13 +8,15 @@ pub(crate) mod types;
 
 pub(crate) use builder::{
     ORCHARD_SPEND_FEE, OrchardKeys, build_and_send_lane_advance_tx,
-    build_and_send_reservoir_expand_tx, build_and_send_shielding_tx,
-    build_and_send_treasury_reseed_tx, derive_orchard_keys, min_lane_value, min_reservoir_value,
-    min_treasury_reseed_value, plan_shielding_outputs,
+    build_and_send_orchard_to_transparent_tx, build_and_send_reservoir_expand_tx,
+    build_and_send_shielding_tx, build_and_send_treasury_reseed_tx, decode_txblast_note_role,
+    derive_orchard_keys, min_bootstrap_shield_value, min_lane_value, min_reservoir_value,
+    min_treasury_reseed_value, orchard_to_transparent_fee, plan_shielding_outputs, shielding_fee,
 };
 pub(crate) use planner::{pending_counts, plan_next_work};
 pub(crate) use scanner::{
-    OrchardTree, latest_checkpoint_anchor, latest_witness, scan_block_range, wait_for_block_advance,
+    BlockRef, OrchardChainCursor, OrchardNullifierIndex, OrchardTree, detect_reorg_reason,
+    latest_checkpoint_anchor, latest_witness, poll_best_tip, scan_block_range, wait_for_tip_change,
 };
 pub(crate) use state::{LaneRegistry, TreasuryInventory};
 pub(crate) use tracing::OrchardTxblastTracer;

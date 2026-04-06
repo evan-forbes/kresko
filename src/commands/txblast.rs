@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::time::Duration;
 
+use crate::commands::fund_runtime_keys;
 use crate::config::{Config, TxType, resolve_value, select_instances, shellexpand};
 use crate::tmux;
 use crate::txblast::OrchardBlastRuntimeConfig;
@@ -45,19 +46,29 @@ pub async fn run(
         targets.len()
     );
 
-    let tail_args = if trace_enable || trace_dir.is_some() {
-        let trace_dir = trace_dir.unwrap_or("/root/.cache/kresko/txblast-traces");
-        format!(
-            "    --orchard-progress-interval-secs {} \\\n    --trace-enable \\\n    --trace-dir {}\n",
-            orchard_runtime.progress_interval.as_secs(),
-            shell_single_quote(trace_dir)
-        )
-    } else {
-        format!(
-            "    --orchard-progress-interval-secs {}\n",
-            orchard_runtime.progress_interval.as_secs()
-        )
+    let expected_runtime_funding_txid = match tx_type {
+        TxType::Shielded | TxType::Both => {
+            fund_runtime_keys::expected_funding_txid(directory).await?
+        }
+        TxType::Transparent => None,
     };
+
+    let mut tail_lines = vec![format!(
+        "    --orchard-progress-interval-secs {}",
+        orchard_runtime.progress_interval.as_secs()
+    )];
+    if trace_enable || trace_dir.is_some() {
+        let trace_dir = trace_dir.unwrap_or("/root/.cache/kresko/txblast-traces");
+        tail_lines.push("    --trace-enable".to_owned());
+        tail_lines.push(format!("    --trace-dir {}", shell_single_quote(trace_dir)));
+    }
+    if let Some(txid) = expected_runtime_funding_txid.as_deref() {
+        tail_lines.push(format!(
+            "    --expected-runtime-funding-txid {}",
+            shell_single_quote(txid)
+        ));
+    }
+    let tail_args = tail_lines.join(" \\\n");
 
     let script = format!(
         r#"#!/bin/bash

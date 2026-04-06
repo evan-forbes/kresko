@@ -53,8 +53,8 @@ impl OrchardBlastRuntimeConfig {
         if premine.lane_value_zats == 0 {
             anyhow::bail!("orchard lane value must be greater than 0");
         }
-        if premine.fanout_outputs < 2 {
-            anyhow::bail!("orchard fanout outputs must be at least 2");
+        if premine.fanout_outputs == 0 {
+            anyhow::bail!("orchard fanout outputs must be greater than 0");
         }
 
         let target_ready_lanes = target_ready_lanes.unwrap_or(premine.lanes_per_miner);
@@ -114,6 +114,7 @@ pub async fn run_local(
     trace_enable: bool,
     trace_dir: Option<&str>,
     funded_key_path: Option<&str>,
+    expected_runtime_funding_txid: Option<&str>,
 ) -> Result<()> {
     let orchard_premine = OrchardTxblastConfig {
         lanes_per_miner: orchard_lanes_per_miner
@@ -167,6 +168,7 @@ pub async fn run_local(
                 amount,
                 &orchard_runtime,
                 &trace_config,
+                expected_runtime_funding_txid,
             )
             .await
         }
@@ -184,6 +186,7 @@ pub async fn run_local(
                     amount,
                     &orchard_runtime,
                     &trace_config,
+                    expected_runtime_funding_txid,
                 ),
             )?;
             Ok(())

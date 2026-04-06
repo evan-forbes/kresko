@@ -25,27 +25,10 @@ pub(crate) fn pending_counts(pending_txs: &HashMap<String, PendingTx>) -> Pendin
 
 pub(crate) fn plan_next_work(
     registry: &mut LaneRegistry,
-    treasury: &mut TreasuryInventory,
-    pending_txs: &HashMap<String, PendingTx>,
-    cfg: &OrchardBlastRuntimeConfig,
+    _treasury: &mut TreasuryInventory,
+    _pending_txs: &HashMap<String, PendingTx>,
+    _cfg: &OrchardBlastRuntimeConfig,
 ) -> Option<ScheduledWork> {
-    let pending = pending_counts(pending_txs);
-
-    if registry.ready_lane_count() < cfg.lane_low_watermark
-        && registry.reservoir_count() > 0
-        && pending.expansion < cfg.fanout_max_in_flight
-    {
-        return registry
-            .take_reservoir()
-            .map(ScheduledWork::ReservoirExpand);
-    }
-
-    if treasury.backlog_count() > 0 && pending.treasury_reseed == 0 {
-        return treasury
-            .take_ready_utxo()
-            .map(ScheduledWork::TreasuryReseed);
-    }
-
     registry.take_ready_lane().map(ScheduledWork::LaneAdvance)
 }
 
@@ -59,7 +42,7 @@ mod tests {
         OrchardBlastRuntimeConfig::from_parts(
             OrchardTxblastConfig {
                 lanes_per_miner: 8,
-                lane_value_zats: 100_000,
+                lane_value_zats: 30_000,
                 fanout_source_value_zats: 500_000,
                 fanout_outputs: 4,
             },
@@ -84,21 +67,21 @@ mod tests {
     }
 
     #[test]
-    fn planner_prefers_treasury_when_no_reservoirs_exist() {
+    fn planner_ignores_treasury_reseed_in_lane_only_mode() {
         let cfg = test_cfg();
         let mut registry = LaneRegistry::default();
         let mut treasury_inventory = TreasuryInventory::default();
         treasury_inventory.refresh_discovered(vec![treasury("a:0", 1_000_000)]);
 
-        match plan_next_work(
-            &mut registry,
-            &mut treasury_inventory,
-            &HashMap::new(),
-            &cfg,
-        ) {
-            Some(ScheduledWork::TreasuryReseed(utxo)) => assert_eq!(utxo.outpoint_id, "a:0"),
-            other => panic!("expected treasury reseed, got {other:?}"),
-        }
+        assert!(
+            plan_next_work(
+                &mut registry,
+                &mut treasury_inventory,
+                &HashMap::new(),
+                &cfg,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -108,8 +91,8 @@ mod tests {
                 "a".to_owned(),
                 PendingTx {
                     recovered_notes: vec![],
-                    num_actions: 1,
                     kind: PendingTxKind::ReservoirExpand,
+                    spent_note_id: None,
                     spent_transparent_outpoint: None,
                 },
             ),
@@ -117,8 +100,8 @@ mod tests {
                 "b".to_owned(),
                 PendingTx {
                     recovered_notes: vec![],
-                    num_actions: 0,
                     kind: PendingTxKind::TreasuryReseed,
+                    spent_note_id: None,
                     spent_transparent_outpoint: Some("b:0".to_owned()),
                 },
             ),

@@ -19,6 +19,10 @@ pub struct AddressUtxo {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawTransactionVerbose {
     pub vin: Vec<RawTransactionInput>,
+    #[serde(default)]
+    pub blockhash: Option<String>,
+    #[serde(default)]
+    pub confirmations: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,12 +114,41 @@ impl ZebraRpcClient {
         serde_json::from_value(result).context("unexpected getrawtransaction response")
     }
 
+    pub async fn try_get_raw_transaction_verbose(
+        &self,
+        txid: &str,
+    ) -> Result<Option<RawTransactionVerbose>> {
+        match self.get_raw_transaction_verbose(txid).await {
+            Ok(tx) => Ok(Some(tx)),
+            Err(error) if is_missing_transaction_error(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn get_block_count(&self) -> Result<u32> {
         let result = self.call("getblockcount", serde_json::json!([])).await?;
         result
             .as_u64()
             .map(|n| n as u32)
             .context("unexpected getblockcount response")
+    }
+
+    pub async fn get_best_block_hash(&self) -> Result<String> {
+        let result = self.call("getbestblockhash", serde_json::json!([])).await?;
+        result
+            .as_str()
+            .map(ToOwned::to_owned)
+            .context("unexpected getbestblockhash response")
+    }
+
+    pub async fn get_block_hash(&self, height: u32) -> Result<String> {
+        let result = self
+            .call("getblockhash", serde_json::json!([height]))
+            .await?;
+        result
+            .as_str()
+            .map(ToOwned::to_owned)
+            .context("unexpected getblockhash response")
     }
 
     pub async fn z_get_treestate(&self, height: u32) -> Result<Value> {
@@ -132,4 +165,11 @@ impl ZebraRpcClient {
             .context("unexpected getblock response: expected hex string")?;
         hex::decode(hex_str).context("invalid hex in getblock response")
     }
+}
+
+fn is_missing_transaction_error(error: &anyhow::Error) -> bool {
+    let error = error.to_string().to_ascii_lowercase();
+    error.contains("no such mempool or blockchain transaction")
+        || error.contains("transaction not found")
+        || error.contains("not found")
 }

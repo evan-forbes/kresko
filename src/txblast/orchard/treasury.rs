@@ -11,6 +11,10 @@ pub(crate) const COINBASE_MATURITY: u32 = 100;
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TreasuryRefresh {
     pub(crate) earliest_maturity_height: Option<u32>,
+    pub(crate) funding_tx_visible: bool,
+    pub(crate) funding_tx_confirmed: bool,
+    pub(crate) spendable_funding_utxo_count: usize,
+    pub(crate) spendable_funding_balance_zats: u64,
 }
 
 pub(crate) async fn refresh_treasury_inventory(
@@ -18,12 +22,29 @@ pub(crate) async fn refresh_treasury_inventory(
     address: &str,
     current_height: u32,
     min_value: u64,
+    expected_funding_txid: Option<&str>,
     inventory: &mut TreasuryInventory,
     coinbase_cache: &mut HashMap<String, bool>,
 ) -> Result<TreasuryRefresh> {
     let utxos = client.get_address_utxos(address).await?;
     let mut earliest_maturity_height = None;
     let mut discovered = Vec::new();
+    let funding_tx = if let Some(txid) = expected_funding_txid {
+        client.try_get_raw_transaction_verbose(txid).await?
+    } else {
+        None
+    };
+    let funding_tx_visible = funding_tx.is_some();
+    let funding_tx_confirmed = funding_tx
+        .as_ref()
+        .and_then(|tx| tx.confirmations)
+        .is_some_and(|value| value > 0)
+        && funding_tx
+            .as_ref()
+            .and_then(|tx| tx.blockhash.as_ref())
+            .is_some();
+    let mut spendable_funding_utxo_count = 0usize;
+    let mut spendable_funding_balance_zats = 0u64;
 
     for utxo in utxos {
         let is_coinbase = is_coinbase_transaction(client, &utxo.txid, coinbase_cache).await?;
@@ -37,6 +58,12 @@ pub(crate) async fn refresh_treasury_inventory(
             }
         }
 
+        if expected_funding_txid.is_some_and(|txid| !is_coinbase && utxo.txid == txid) {
+            spendable_funding_utxo_count += 1;
+            spendable_funding_balance_zats =
+                spendable_funding_balance_zats.saturating_add(utxo.satoshis);
+        }
+
         if utxo.satoshis < min_value {
             continue;
         }
@@ -48,6 +75,10 @@ pub(crate) async fn refresh_treasury_inventory(
 
     Ok(TreasuryRefresh {
         earliest_maturity_height,
+        funding_tx_visible,
+        funding_tx_confirmed,
+        spendable_funding_utxo_count,
+        spendable_funding_balance_zats,
     })
 }
 

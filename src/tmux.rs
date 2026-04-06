@@ -35,10 +35,11 @@ pub async fn run_script_in_tmux(
                          apt-get -o DPkg::Lock::Timeout=300 update -y && \
                          apt-get -o DPkg::Lock::Timeout=300 install -y tmux; \
                      fi && \
+                     rm -f {log_file} && \
                      echo '{encoded}' | base64 -d > {remote_script_path} && \
                      chmod +x {remote_script_path} && \
                      tmux new-session -d -s {session} \"bash -lc 'set -o pipefail; \
-                         bash {remote_script_path} 2>&1 | tee -a {log_file}; \
+                         bash {remote_script_path} 2>&1 | tee {log_file}; \
                          script_exit=${{PIPESTATUS[0]}}; \
                          echo \\\"=== {session} exited with code \\$script_exit ===\\\"; \
                          exec bash -i'\""

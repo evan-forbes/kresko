@@ -27,6 +27,7 @@ zebra-chain = { path = "../zebra/zebra-chain", features = ["internal-miner"] }
 zebra-jsonl-trace = { path = "../zebra/zebra-jsonl-trace", version = "0.1.0" }
 zcash_primitives = { version = "0.26", features = ["transparent-inputs"] }
 zcash_protocol = "0.7"
+zcash_address = "0.10"
 zcash_transparent = "0.6"
 orchard = "0.11"
 sapling-crypto = "0.5"

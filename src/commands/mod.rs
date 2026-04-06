@@ -15,5 +15,6 @@ pub mod reset;
 pub mod start_miners;
 pub mod status;
 pub mod txblast;
+pub mod txblast_status;
 pub mod up;
 pub mod upload_data;

@@ -28,6 +28,7 @@ pub(crate) struct PlannedOutput {
 pub(crate) enum RuntimePhase {
     BootstrapScan,
     BootstrapShield,
+    Recovering,
     SteadyState,
 }
 
@@ -36,6 +37,7 @@ impl RuntimePhase {
         match self {
             Self::BootstrapScan => "bootstrap_scan",
             Self::BootstrapShield => "bootstrap_shield",
+            Self::Recovering => "recovering",
             Self::SteadyState => "steady_state",
         }
     }
@@ -117,8 +119,8 @@ impl PendingTxKind {
 #[derive(Clone, Debug)]
 pub(crate) struct PendingTx {
     pub(crate) recovered_notes: Vec<RecoveredNote>,
-    pub(crate) num_actions: usize,
     pub(crate) kind: PendingTxKind,
+    pub(crate) spent_note_id: Option<String>,
     pub(crate) spent_transparent_outpoint: Option<String>,
 }
 
@@ -140,6 +142,7 @@ pub(crate) struct TreasuryUtxo {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) enum ScheduledWork {
     LaneAdvance(TrackedNote),
     ReservoirExpand(TrackedNote),

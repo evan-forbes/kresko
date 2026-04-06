@@ -37,6 +37,10 @@ impl LaneRegistry {
         self.reservoir_notes.len()
     }
 
+    pub(crate) fn spendable_note_count(&self) -> usize {
+        self.ready_lane_count() + self.reservoir_count()
+    }
+
     pub(crate) fn drained_notes(&self) -> u64 {
         self.drained_notes
     }
@@ -49,6 +53,12 @@ impl LaneRegistry {
             lane_total_value: self.ready_lanes.iter().map(TrackedNote::value).sum(),
             reservoir_total_value: self.reservoir_notes.iter().map(TrackedNote::value).sum(),
         }
+    }
+
+    pub(crate) fn reset_for_rebuild(&mut self) {
+        self.next_lane_id = 0;
+        self.ready_lanes.clear();
+        self.reservoir_notes.clear();
     }
 
     pub(crate) fn activate_recovered_note(
@@ -90,24 +100,39 @@ impl LaneRegistry {
     }
 
     pub(crate) fn promote_reservoir_to_lane(&mut self, mut tracked: TrackedNote) -> TrackedNote {
-        let lane_id = self.next_lane_id;
-        self.next_lane_id += 1;
-        tracked.role = NoteRole::Lane;
-        tracked.lane_id = Some(lane_id);
+        self.assign_lane_metadata(&mut tracked);
         self.ready_lanes.push(tracked.clone());
         tracked
     }
 
     pub(crate) fn take_ready_lane(&mut self) -> Option<TrackedNote> {
-        pop_highest_value(&mut self.ready_lanes)
+        if let Some(tracked) = pop_highest_value(&mut self.ready_lanes) {
+            return Some(tracked);
+        }
+
+        let mut tracked = pop_highest_value(&mut self.reservoir_notes)?;
+        self.assign_lane_metadata(&mut tracked);
+        Some(tracked)
     }
 
     pub(crate) fn take_reservoir(&mut self) -> Option<TrackedNote> {
         pop_highest_value(&mut self.reservoir_notes)
     }
 
+    pub(crate) fn remove_note(&mut self, note_id: &str) -> Option<TrackedNote> {
+        remove_note_by_id(&mut self.ready_lanes, note_id)
+            .or_else(|| remove_note_by_id(&mut self.reservoir_notes, note_id))
+    }
+
     pub(crate) fn drain_note(&mut self) {
         self.drained_notes += 1;
+    }
+
+    fn assign_lane_metadata(&mut self, tracked: &mut TrackedNote) {
+        let lane_id = self.next_lane_id;
+        self.next_lane_id += 1;
+        tracked.role = NoteRole::Lane;
+        tracked.lane_id = Some(lane_id);
     }
 }
 
@@ -116,6 +141,13 @@ fn pop_highest_value(notes: &mut Vec<TrackedNote>) -> Option<TrackedNote> {
         .iter()
         .enumerate()
         .max_by_key(|(_, tracked)| tracked.value())?;
+    Some(notes.swap_remove(idx))
+}
+
+fn remove_note_by_id(notes: &mut Vec<TrackedNote>, note_id: &str) -> Option<TrackedNote> {
+    let idx = notes
+        .iter()
+        .position(|tracked| tracked.note_id == note_id)?;
     Some(notes.swap_remove(idx))
 }
 

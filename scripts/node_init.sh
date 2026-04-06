@@ -72,6 +72,8 @@ cp payload/build/kresko /usr/local/bin/kresko
 chmod +x /usr/local/bin/kresko
 
 echo "=== Setting up zebra config ==="
+echo "=== Resetting zebra state cache ==="
+rm -rf /root/.cache/zebra
 mkdir -p /root/.cache/zebra
 mkdir -p /root/.config
 cp payload/$parsed_hostname/zebrad.toml /root/.config/zebrad.toml

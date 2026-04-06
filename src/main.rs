@@ -259,6 +259,29 @@ enum Commands {
         directory: String,
     },
 
+    /// Query txblast Orchard readiness across remote nodes
+    TxblastStatus {
+        /// Comma-separated instance indices or "all"
+        #[arg(short = 'i', long, default_value = "all")]
+        instances: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Trace directory containing txblast JSONL files on remote nodes
+        #[arg(long, default_value = "/root/traces")]
+        trace_dir: String,
+
+        /// Consider non-ready status stale after this many seconds
+        #[arg(long, default_value_t = 120)]
+        stall_secs: i64,
+
+        /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
     /// Distribute cached treasury funds into per-node runtime funded keys
     FundRuntimeKeys {
         /// Experiment directory
@@ -349,6 +372,10 @@ enum Commands {
         /// Path to premine funded key JSON (optional, auto-detected on nodes)
         #[arg(long)]
         funded_key_path: Option<String>,
+
+        /// Expected runtime funding transaction id for shielded bootstrap diagnostics
+        #[arg(long)]
+        expected_runtime_funding_txid: Option<String>,
     },
 
     /// Fund runtime keys locally from the cached bootstrap treasury (intended to run on remote nodes)
@@ -368,6 +395,33 @@ enum Commands {
         /// Timeout while waiting for the funding transaction to confirm
         #[arg(long, default_value_t = 600)]
         confirm_timeout_secs: u64,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Verify local runtime funding visibility without submitting funding transactions
+        #[arg(long)]
+        verify_only: bool,
+
+        /// Expected transparent runtime funding transaction id
+        #[arg(long)]
+        expected_funding_txid: Option<String>,
+    },
+
+    /// Query txblast Orchard readiness from local trace files (intended to run on remote nodes)
+    TxblastStatusLocal {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Trace directory containing txblast JSONL files
+        #[arg(long, default_value = "/root/traces")]
+        trace_dir: String,
+
+        /// Consider non-ready status stale after this many seconds
+        #[arg(long, default_value_t = 120)]
+        stall_secs: i64,
     },
 
     /// Kill tmux sessions on remote nodes
@@ -467,6 +521,7 @@ impl Commands {
             Commands::Init { .. }
             | Commands::TxblastLocal { .. }
             | Commands::FundRuntimeKeysLocal { .. }
+            | Commands::TxblastStatusLocal { .. }
             | Commands::Mine { .. } => None,
             Commands::Add { directory, .. }
             | Commands::Up { directory, .. }
@@ -479,6 +534,7 @@ impl Commands {
             | Commands::StartMiners { directory, .. }
             | Commands::FundRuntimeKeys { directory }
             | Commands::Txblast { directory, .. }
+            | Commands::TxblastStatus { directory, .. }
             | Commands::KillSession { directory, .. }
             | Commands::Download { directory, .. }
             | Commands::UploadData { directory }
@@ -653,6 +709,16 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Commands::TxblastStatus {
+            instances,
+            json,
+            trace_dir,
+            stall_secs,
+            directory,
+        } => {
+            commands::txblast_status::run(&instances, json, &trace_dir, stall_secs, &directory)
+                .await?;
+        }
         Commands::TxblastLocal {
             rpc_endpoint,
             tx_type,
@@ -670,6 +736,7 @@ async fn main() -> Result<()> {
             trace_enable,
             trace_dir,
             funded_key_path,
+            expected_runtime_funding_txid,
         } => {
             let tx_type: config::TxType = tx_type.parse()?;
             txblast::run_local(
@@ -689,6 +756,7 @@ async fn main() -> Result<()> {
                 trace_enable,
                 trace_dir.as_deref(),
                 funded_key_path.as_deref(),
+                expected_runtime_funding_txid.as_deref(),
             )
             .await?;
         }
@@ -697,14 +765,27 @@ async fn main() -> Result<()> {
             local_genesis_dir,
             minimum_recipient_zats,
             confirm_timeout_secs,
+            json,
+            verify_only,
+            expected_funding_txid,
         } => {
             commands::fund_runtime_keys::run_local(
                 &rpc_endpoint,
                 &local_genesis_dir,
                 minimum_recipient_zats,
                 confirm_timeout_secs,
+                json,
+                verify_only,
+                expected_funding_txid.as_deref(),
             )
             .await?;
+        }
+        Commands::TxblastStatusLocal {
+            json,
+            trace_dir,
+            stall_secs,
+        } => {
+            commands::txblast_status::run_local(json, &trace_dir, stall_secs)?;
         }
         Commands::KillSession {
             session,

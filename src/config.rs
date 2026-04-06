@@ -179,8 +179,8 @@ pub struct OrchardTxblastConfig {
 impl Default for OrchardTxblastConfig {
     fn default() -> Self {
         Self {
-            lanes_per_miner: 384,
-            lane_value_zats: 100_000,
+            lanes_per_miner: 200,
+            lane_value_zats: 30_000,
             fanout_source_value_zats: 500_000,
             fanout_outputs: 4,
         }

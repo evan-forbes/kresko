@@ -4,23 +4,27 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use super::orchard::{
-    LaneRegistry, OrchardKeys, OrchardTree, OrchardTxblastTracer, PendingTx, PendingTxKind,
-    RuntimePhase, ScheduledWork, TreasuryInventory, build_and_send_lane_advance_tx,
-    build_and_send_reservoir_expand_tx, build_and_send_shielding_tx,
-    build_and_send_treasury_reseed_tx, derive_orchard_keys, latest_checkpoint_anchor,
-    latest_witness, min_lane_value, min_reservoir_value, min_treasury_reseed_value, pending_counts,
-    plan_next_work, plan_shielding_outputs, refresh_treasury_inventory, scan_block_range,
-    wait_for_block_advance,
+    LaneRegistry, OrchardChainCursor, OrchardKeys, OrchardNullifierIndex, OrchardTree,
+    OrchardTxblastTracer, PendingTx, PendingTxKind, RuntimePhase, ScheduledWork, TreasuryInventory,
+    build_and_send_lane_advance_tx, build_and_send_reservoir_expand_tx,
+    build_and_send_shielding_tx, build_and_send_treasury_reseed_tx, derive_orchard_keys,
+    detect_reorg_reason, latest_checkpoint_anchor, latest_witness, min_bootstrap_shield_value,
+    min_lane_value, min_reservoir_value, pending_counts, plan_next_work, plan_shielding_outputs,
+    poll_best_tip, refresh_treasury_inventory, scan_block_range, wait_for_tip_change,
 };
 use super::rpc::ZebraRpcClient;
 use super::transparent::FundedKey;
 use super::{OrchardBlastRuntimeConfig, TxblastTraceConfig};
 
-const BLOCK_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const LOOP_IDLE_SLEEP: Duration = Duration::from_millis(100);
+const TARGET_HEIGHT_OFFSET_BLOCKS: u32 = 100;
 
 fn is_unknown_orchard_anchor(error: &str) -> bool {
     error.contains("unknown Orchard anchor")
+}
+
+fn is_witness_rebuild_error(error: &str) -> bool {
+    error.contains("witness_at_checkpoint_id") || error.contains("no witness for position")
 }
 
 async fn fetch_orchard_anchor(client: &ZebraRpcClient) -> Result<orchard::Anchor> {
@@ -79,11 +83,112 @@ fn transition_phase(
     });
 }
 
+async fn rescan_orchard_state_from_chain(
+    client: &ZebraRpcClient,
+    keys: &OrchardKeys,
+    orchard_cfg: &OrchardBlastRuntimeConfig,
+    tracer: &OrchardTxblastTracer,
+    tree: &mut OrchardTree,
+    next_position: &mut u64,
+    nullifier_index: &mut OrchardNullifierIndex,
+    cursor: &mut OrchardChainCursor,
+    registry: &mut LaneRegistry,
+    treasury: &mut TreasuryInventory,
+    pending_txs: &mut HashMap<String, PendingTx>,
+    submit_credit: f64,
+    reason: &'static str,
+    error: Option<String>,
+) -> Result<()> {
+    let rebuild_height = cursor.last_scanned_height();
+    transition_phase(
+        tracer,
+        RuntimePhase::Recovering,
+        rebuild_height,
+        "phase_enter",
+        registry,
+        treasury,
+        pending_txs,
+    );
+    tracer.trace_event(super::orchard::tracing::EventContext {
+        height: Some(rebuild_height),
+        phase: RuntimePhase::Recovering,
+        event: "chain_rebuild_started",
+        tx_kind: None,
+        txid: None,
+        lane_id: None,
+        note_id: None,
+        note_role: None,
+        note_value: None,
+        pending: pending_counts(pending_txs),
+        registry: registry.snapshot(),
+        treasury: treasury.snapshot(),
+        reason: Some(reason),
+        error,
+    });
+    tracer.trace_registry(
+        Some(rebuild_height),
+        RuntimePhase::Recovering,
+        "rebuild_start",
+        registry,
+        treasury,
+        pending_counts(pending_txs),
+        submit_credit,
+        orchard_cfg,
+        Some(reason),
+    );
+
+    *tree = OrchardTree::new(shardtree::store::memory::MemoryShardStore::empty(), 100);
+    *next_position = 0;
+    nullifier_index.clear();
+    registry.reset_for_rebuild();
+    cursor.reset_for_rebuild();
+
+    let best_tip = poll_best_tip(client).await?;
+    cursor.record_best_tip(best_tip.clone());
+    if best_tip.height > 0 {
+        scan_block_range(
+            client,
+            keys,
+            tree,
+            next_position,
+            nullifier_index,
+            1,
+            best_tip.height,
+            pending_txs,
+            registry,
+            treasury,
+            cursor,
+            tracer,
+            orchard_cfg,
+            RuntimePhase::Recovering,
+            submit_credit,
+        )
+        .await?;
+    } else {
+        cursor.record_last_scanned(best_tip);
+    }
+
+    tracer.trace_registry(
+        Some(cursor.last_scanned_height()),
+        RuntimePhase::Recovering,
+        "rebuild_complete",
+        registry,
+        treasury,
+        pending_counts(pending_txs),
+        submit_credit,
+        orchard_cfg,
+        Some(reason),
+    );
+
+    Ok(())
+}
+
 async fn refresh_and_trace_treasury(
     client: &ZebraRpcClient,
     key: &FundedKey,
     current_height: u32,
     orchard_cfg: &OrchardBlastRuntimeConfig,
+    expected_runtime_funding_txid: Option<&str>,
     treasury: &mut TreasuryInventory,
     coinbase_cache: &mut HashMap<String, bool>,
     tracer: &OrchardTxblastTracer,
@@ -91,16 +196,24 @@ async fn refresh_and_trace_treasury(
     registry: &LaneRegistry,
     pending_txs: &HashMap<String, PendingTx>,
     submit_credit: f64,
-) -> Result<Option<u32>> {
+) -> Result<super::orchard::treasury::TreasuryRefresh> {
     let refresh = refresh_treasury_inventory(
         client,
         &key.address.to_string(),
         current_height,
-        min_treasury_reseed_value(orchard_cfg),
+        min_bootstrap_shield_value(orchard_cfg),
+        expected_runtime_funding_txid,
         treasury,
         coinbase_cache,
     )
     .await?;
+    let reason = bootstrap_wait_reason(
+        registry,
+        treasury,
+        &refresh,
+        min_bootstrap_shield_value(orchard_cfg),
+        expected_runtime_funding_txid,
+    );
 
     tracer.trace_registry(
         Some(current_height),
@@ -111,9 +224,181 @@ async fn refresh_and_trace_treasury(
         pending_counts(pending_txs),
         submit_credit,
         orchard_cfg,
+        reason,
     );
 
-    Ok(refresh.earliest_maturity_height)
+    Ok(refresh)
+}
+
+async fn reconcile_pending_txs(
+    client: &ZebraRpcClient,
+    tracer: &OrchardTxblastTracer,
+    registry: &LaneRegistry,
+    treasury: &TreasuryInventory,
+    pending_txs: &mut HashMap<String, PendingTx>,
+    height: u32,
+) -> Result<Option<&'static str>> {
+    let txids = pending_txs.keys().cloned().collect::<Vec<_>>();
+    let mut evicted_any = false;
+
+    for txid in txids {
+        if client
+            .try_get_raw_transaction_verbose(&txid)
+            .await?
+            .is_some()
+        {
+            continue;
+        }
+
+        let Some(pending) = pending_txs.remove(&txid) else {
+            continue;
+        };
+        evicted_any = true;
+        tracer.trace_event(super::orchard::tracing::EventContext {
+            height: Some(height),
+            phase: RuntimePhase::Recovering,
+            event: "pending_tx_evicted",
+            tx_kind: Some(pending.kind),
+            txid: Some(&txid),
+            lane_id: None,
+            note_id: pending.spent_note_id.as_deref(),
+            note_role: None,
+            note_value: None,
+            pending: pending_counts(pending_txs),
+            registry: registry.snapshot(),
+            treasury: treasury.snapshot(),
+            reason: Some("rebuilding_after_pending_eviction"),
+            error: None,
+        });
+    }
+
+    Ok(evicted_any.then_some("rebuilding_after_pending_eviction"))
+}
+
+async fn sync_orchard_chain_state(
+    client: &ZebraRpcClient,
+    keys: &OrchardKeys,
+    orchard_cfg: &OrchardBlastRuntimeConfig,
+    tracer: &OrchardTxblastTracer,
+    tree: &mut OrchardTree,
+    next_position: &mut u64,
+    nullifier_index: &mut OrchardNullifierIndex,
+    cursor: &mut OrchardChainCursor,
+    registry: &mut LaneRegistry,
+    treasury: &mut TreasuryInventory,
+    pending_txs: &mut HashMap<String, PendingTx>,
+    submit_credit: f64,
+    phase: RuntimePhase,
+) -> Result<()> {
+    let best_tip = poll_best_tip(client).await?;
+    cursor.record_best_tip(best_tip.clone());
+
+    if let Some(reason) = detect_reorg_reason(client, cursor).await? {
+        return rescan_orchard_state_from_chain(
+            client,
+            keys,
+            orchard_cfg,
+            tracer,
+            tree,
+            next_position,
+            nullifier_index,
+            cursor,
+            registry,
+            treasury,
+            pending_txs,
+            submit_credit,
+            reason,
+            None,
+        )
+        .await;
+    }
+
+    if let Some(reason) = reconcile_pending_txs(
+        client,
+        tracer,
+        registry,
+        treasury,
+        pending_txs,
+        cursor.last_scanned_height(),
+    )
+    .await?
+    {
+        return rescan_orchard_state_from_chain(
+            client,
+            keys,
+            orchard_cfg,
+            tracer,
+            tree,
+            next_position,
+            nullifier_index,
+            cursor,
+            registry,
+            treasury,
+            pending_txs,
+            submit_credit,
+            reason,
+            None,
+        )
+        .await;
+    }
+
+    let start_height = cursor.last_scanned_height().saturating_add(1);
+    if best_tip.height >= start_height {
+        scan_block_range(
+            client,
+            keys,
+            tree,
+            next_position,
+            nullifier_index,
+            start_height,
+            best_tip.height,
+            pending_txs,
+            registry,
+            treasury,
+            cursor,
+            tracer,
+            orchard_cfg,
+            phase,
+            submit_credit,
+        )
+        .await?;
+    } else if cursor.last_scanned().is_none() {
+        cursor.record_last_scanned(best_tip);
+    }
+
+    Ok(())
+}
+
+fn bootstrap_wait_reason<'a>(
+    registry: &LaneRegistry,
+    treasury: &TreasuryInventory,
+    refresh: &super::orchard::treasury::TreasuryRefresh,
+    minimum_runtime_funding_zats: u64,
+    expected_runtime_funding_txid: Option<&'a str>,
+) -> Option<&'static str> {
+    if registry.spendable_note_count() > 0 || treasury.backlog_count() > 0 {
+        return None;
+    }
+
+    if expected_runtime_funding_txid.is_some() {
+        if !refresh.funding_tx_visible {
+            return Some("awaiting_runtime_funding_visibility");
+        }
+        if !refresh.funding_tx_confirmed {
+            return Some("runtime_funding_seen_but_unconfirmed");
+        }
+        if refresh.spendable_funding_utxo_count == 0
+            || refresh.spendable_funding_balance_zats < minimum_runtime_funding_zats
+        {
+            return Some("runtime_funding_seen_but_below_minimum");
+        }
+    }
+
+    if refresh.earliest_maturity_height.is_some() {
+        Some("waiting_for_coinbase_maturity")
+    } else {
+        Some("awaiting_transparent_runtime_funds")
+    }
 }
 
 async fn run_bootstrap(
@@ -121,11 +406,12 @@ async fn run_bootstrap(
     key: &FundedKey,
     keys: &OrchardKeys,
     orchard_cfg: &OrchardBlastRuntimeConfig,
+    expected_runtime_funding_txid: Option<&str>,
     tracer: &OrchardTxblastTracer,
     tree: &mut OrchardTree,
     next_position: &mut u64,
-    last_scanned_height: &mut u32,
-    latest_checkpoint: &mut Option<u32>,
+    nullifier_index: &mut OrchardNullifierIndex,
+    cursor: &mut OrchardChainCursor,
     registry: &mut LaneRegistry,
     treasury: &mut TreasuryInventory,
     pending_txs: &mut HashMap<String, PendingTx>,
@@ -135,7 +421,7 @@ async fn run_bootstrap(
     transition_phase(
         tracer,
         phase,
-        *last_scanned_height,
+        cursor.last_scanned_height(),
         "phase_enter",
         registry,
         treasury,
@@ -143,11 +429,12 @@ async fn run_bootstrap(
     );
 
     loop {
-        let earliest_maturity = refresh_and_trace_treasury(
+        let refresh = refresh_and_trace_treasury(
             client,
             key,
-            *last_scanned_height,
+            cursor.last_scanned_height(),
             orchard_cfg,
+            expected_runtime_funding_txid,
             treasury,
             coinbase_cache,
             tracer,
@@ -158,52 +445,56 @@ async fn run_bootstrap(
         )
         .await?;
 
-        if registry.ready_lane_count() > 0
-            || registry.reservoir_count() > 0
-            || treasury.backlog_count() > 0
-        {
+        if registry.spendable_note_count() > 0 || treasury.backlog_count() > 0 {
             break;
         }
 
-        let Some(earliest_maturity) = earliest_maturity else {
-            anyhow::bail!(
-                "no transparent treasury UTXOs or Orchard notes found for {}. make sure local genesis seed blocks were loaded",
-                key.address,
+        let wait_reason = bootstrap_wait_reason(
+            registry,
+            treasury,
+            &refresh,
+            min_bootstrap_shield_value(orchard_cfg),
+            expected_runtime_funding_txid,
+        )
+        .unwrap_or("awaiting_transparent_runtime_funds");
+
+        if wait_reason == "waiting_for_coinbase_maturity" {
+            let earliest_maturity = refresh
+                .earliest_maturity_height
+                .expect("coinbase maturity reason should include a maturity height");
+            println!(
+                "[shielded] waiting for coinbase maturity (need height {earliest_maturity}, currently {})",
+                cursor.last_scanned_height()
             );
-        };
-
-        println!(
-            "[shielded] waiting for coinbase maturity (need height {earliest_maturity}, currently {})",
-            *last_scanned_height
-        );
-        while *last_scanned_height < earliest_maturity {
-            let current = client.get_block_count().await?;
-            if current > *last_scanned_height {
-                scan_block_range(
-                    client,
-                    tree,
-                    next_position,
-                    *last_scanned_height + 1,
-                    current,
-                    pending_txs,
-                    registry,
-                    treasury,
-                    latest_checkpoint,
-                    tracer,
-                    orchard_cfg,
-                    phase,
-                    0.0,
-                )
-                .await?;
-                *last_scanned_height = current;
-                continue;
-            }
-
-            tokio::time::sleep(BLOCK_POLL_INTERVAL).await;
+        } else {
+            println!("[shielded] waiting for bootstrap funding state: {wait_reason}");
         }
+
+        let tip_before_wait = cursor
+            .best_tip()
+            .cloned()
+            .unwrap_or(poll_best_tip(client).await?);
+        cursor.record_best_tip(tip_before_wait.clone());
+        let _ = wait_for_tip_change(client, &tip_before_wait).await?;
+        sync_orchard_chain_state(
+            client,
+            keys,
+            orchard_cfg,
+            tracer,
+            tree,
+            next_position,
+            nullifier_index,
+            cursor,
+            registry,
+            treasury,
+            pending_txs,
+            0.0,
+            phase,
+        )
+        .await?;
     }
 
-    if registry.ready_lane_count() >= orchard_cfg.target_ready_lanes
+    if registry.spendable_note_count() >= orchard_cfg.target_ready_lanes
         || treasury.backlog_count() == 0
     {
         return Ok(());
@@ -213,7 +504,7 @@ async fn run_bootstrap(
     transition_phase(
         tracer,
         phase,
-        *last_scanned_height,
+        cursor.last_scanned_height(),
         "phase_enter",
         registry,
         treasury,
@@ -225,7 +516,7 @@ async fn run_bootstrap(
         orchard_cfg.target_ready_lanes,
     );
 
-    while registry.ready_lane_count() < orchard_cfg.target_ready_lanes
+    while registry.spendable_note_count() < orchard_cfg.target_ready_lanes
         && treasury.backlog_count() > 0
     {
         let utxo = treasury
@@ -233,12 +524,15 @@ async fn run_bootstrap(
             .expect("bootstrap loop should only run with treasury backlog");
         let remaining_lane_target = orchard_cfg
             .target_ready_lanes
-            .saturating_sub(registry.ready_lane_count());
+            .saturating_sub(registry.spendable_note_count());
         let planned_outputs =
             plan_shielding_outputs(utxo.satoshis, remaining_lane_target, orchard_cfg)?;
 
         let anchor = fetch_orchard_anchor(client).await?;
-        let target_height = client.get_block_count().await? + 10;
+        let target_height = client
+            .get_block_count()
+            .await?
+            .saturating_add(TARGET_HEIGHT_OFFSET_BLOCKS);
         let (txid, pending) = build_and_send_shielding_tx(
             client,
             key,
@@ -254,7 +548,7 @@ async fn run_bootstrap(
         )
         .await?;
         tracer.trace_event(super::orchard::tracing::EventContext {
-            height: Some(*last_scanned_height),
+            height: Some(cursor.last_scanned_height()),
             phase,
             event: "tx_submitted",
             tx_kind: Some(PendingTxKind::WarmupShielding),
@@ -275,7 +569,7 @@ async fn run_bootstrap(
         });
         for recovered in &pending.recovered_notes {
             tracer.trace_recovered_note(
-                Some(*last_scanned_height),
+                Some(cursor.last_scanned_height()),
                 "note_submitted",
                 recovered,
                 Some(&txid),
@@ -284,51 +578,60 @@ async fn run_bootstrap(
         }
         pending_txs.insert(txid.clone(), pending);
 
-        let new_height = wait_for_block_advance(client, *last_scanned_height).await?;
-        scan_block_range(
+        let tip_before_wait = cursor
+            .best_tip()
+            .cloned()
+            .unwrap_or(poll_best_tip(client).await?);
+        cursor.record_best_tip(tip_before_wait.clone());
+        let _ = wait_for_tip_change(client, &tip_before_wait).await?;
+        sync_orchard_chain_state(
             client,
+            keys,
+            orchard_cfg,
+            tracer,
             tree,
             next_position,
-            *last_scanned_height + 1,
-            new_height,
-            pending_txs,
+            nullifier_index,
+            cursor,
             registry,
             treasury,
-            latest_checkpoint,
-            tracer,
-            orchard_cfg,
-            phase,
+            pending_txs,
             0.0,
+            phase,
         )
         .await?;
-        *last_scanned_height = new_height;
 
         while pending_txs.contains_key(&txid) {
-            let h = wait_for_block_advance(client, *last_scanned_height).await?;
-            scan_block_range(
+            let tip_before_wait = cursor
+                .best_tip()
+                .cloned()
+                .unwrap_or(poll_best_tip(client).await?);
+            cursor.record_best_tip(tip_before_wait.clone());
+            let _ = wait_for_tip_change(client, &tip_before_wait).await?;
+            sync_orchard_chain_state(
                 client,
+                keys,
+                orchard_cfg,
+                tracer,
                 tree,
                 next_position,
-                *last_scanned_height + 1,
-                h,
-                pending_txs,
+                nullifier_index,
+                cursor,
                 registry,
                 treasury,
-                latest_checkpoint,
-                tracer,
-                orchard_cfg,
-                phase,
+                pending_txs,
                 0.0,
+                phase,
             )
             .await?;
-            *last_scanned_height = h;
         }
 
         refresh_and_trace_treasury(
             client,
             key,
-            *last_scanned_height,
+            cursor.last_scanned_height(),
             orchard_cfg,
+            expected_runtime_funding_txid,
             treasury,
             coinbase_cache,
             tracer,
@@ -350,6 +653,7 @@ pub async fn run(
     _amount: f64,
     orchard_cfg: &OrchardBlastRuntimeConfig,
     trace_config: &TxblastTraceConfig,
+    expected_runtime_funding_txid: Option<&str>,
 ) -> Result<()> {
     if rate == 0 {
         anyhow::bail!("--rate must be greater than 0");
@@ -372,36 +676,53 @@ pub async fn run(
 
     let mut tree: OrchardTree =
         OrchardTree::new(shardtree::store::memory::MemoryShardStore::empty(), 100);
+    let mut nullifier_index = OrchardNullifierIndex::default();
+    let mut cursor = OrchardChainCursor::default();
     let mut registry = LaneRegistry::default();
     let mut treasury = TreasuryInventory::default();
     let mut pending_txs: HashMap<String, PendingTx> = HashMap::new();
     let mut next_position: u64 = 0;
-    let mut latest_checkpoint: Option<u32> = None;
     let mut coinbase_cache = HashMap::new();
 
-    let current_height = client.get_block_count().await?;
-    let anchor = fetch_orchard_anchor(client).await?;
+    let best_tip = poll_best_tip(client).await?;
+    cursor.record_best_tip(best_tip.clone());
     transition_phase(
         &tracer,
         RuntimePhase::BootstrapScan,
-        current_height,
+        best_tip.height,
         "runtime_start",
         &registry,
         &treasury,
         &pending_txs,
     );
-    if anchor != orchard::Anchor::empty_tree() && current_height > 0 {
-        println!("[shielded] scanning blocks 1..{current_height} for existing Orchard commitments");
+    tracer.trace_registry(
+        Some(best_tip.height),
+        RuntimePhase::BootstrapScan,
+        "runtime_startup",
+        &registry,
+        &treasury,
+        pending_counts(&pending_txs),
+        0.0,
+        orchard_cfg,
+        Some("starting_up"),
+    );
+    if best_tip.height > 0 {
+        println!(
+            "[shielded] scanning blocks 1..{} for existing Orchard commitments",
+            best_tip.height
+        );
         scan_block_range(
             client,
+            &keys,
             &mut tree,
             &mut next_position,
+            &mut nullifier_index,
             1,
-            current_height,
+            best_tip.height,
             &mut pending_txs,
             &mut registry,
             &mut treasury,
-            &mut latest_checkpoint,
+            &mut cursor,
             &tracer,
             orchard_cfg,
             RuntimePhase::BootstrapScan,
@@ -410,21 +731,23 @@ pub async fn run(
         .await?;
         println!(
             "[shielded] scanned {} blocks, tree has {} commitments",
-            current_height, next_position,
+            best_tip.height, next_position,
         );
+    } else {
+        cursor.record_last_scanned(best_tip);
     }
 
-    let mut last_scanned_height = current_height;
     run_bootstrap(
         client,
         key,
         &keys,
         orchard_cfg,
+        expected_runtime_funding_txid,
         &tracer,
         &mut tree,
         &mut next_position,
-        &mut last_scanned_height,
-        &mut latest_checkpoint,
+        &mut nullifier_index,
+        &mut cursor,
         &mut registry,
         &mut treasury,
         &mut pending_txs,
@@ -432,7 +755,7 @@ pub async fn run(
     )
     .await?;
 
-    if registry.ready_lane_count() == 0 && registry.reservoir_count() == 0 {
+    if registry.spendable_note_count() == 0 {
         anyhow::bail!("no spendable Orchard notes after bootstrap. shielding may have failed.");
     }
 
@@ -447,14 +770,14 @@ pub async fn run(
     transition_phase(
         &tracer,
         RuntimePhase::SteadyState,
-        last_scanned_height,
+        cursor.last_scanned_height(),
         "phase_enter",
         &registry,
         &treasury,
         &pending_txs,
     );
     tracer.trace_registry(
-        Some(last_scanned_height),
+        Some(cursor.last_scanned_height()),
         RuntimePhase::SteadyState,
         "steady_state_start",
         &registry,
@@ -462,6 +785,7 @@ pub async fn run(
         pending_counts(&pending_txs),
         0.0,
         orchard_cfg,
+        None,
     );
 
     let mut tx_count: u64 = 0;
@@ -469,43 +793,42 @@ pub async fn run(
     let mut submit_credit = 0.0f64;
     let mut last_refill = Instant::now();
     let mut last_progress = Instant::now();
+    let mut last_treasury_refresh_height = None;
 
     loop {
-        let current = client
-            .get_block_count()
-            .await
-            .unwrap_or(last_scanned_height);
-        if current > last_scanned_height {
-            if let Err(e) = scan_block_range(
-                client,
-                &mut tree,
-                &mut next_position,
-                last_scanned_height + 1,
-                current,
-                &mut pending_txs,
-                &mut registry,
-                &mut treasury,
-                &mut latest_checkpoint,
-                &tracer,
-                orchard_cfg,
-                RuntimePhase::SteadyState,
-                submit_credit,
-            )
-            .await
-            {
-                eprintln!(
-                    "[shielded][warn] block scan at {}..{} failed: {e}",
-                    last_scanned_height + 1,
-                    current,
-                );
-            }
-            last_scanned_height = current;
+        if let Err(error) = sync_orchard_chain_state(
+            client,
+            &keys,
+            orchard_cfg,
+            &tracer,
+            &mut tree,
+            &mut next_position,
+            &mut nullifier_index,
+            &mut cursor,
+            &mut registry,
+            &mut treasury,
+            &mut pending_txs,
+            submit_credit,
+            RuntimePhase::SteadyState,
+        )
+        .await
+        {
+            eprintln!(
+                "[shielded][warn] Orchard chain sync failed at height {}: {error}",
+                cursor.last_scanned_height()
+            );
+            tokio::time::sleep(LOOP_IDLE_SLEEP).await;
+            continue;
+        }
 
+        let current = cursor.last_scanned_height();
+        if last_treasury_refresh_height != Some(current) {
             if let Err(e) = refresh_and_trace_treasury(
                 client,
                 key,
                 current,
                 orchard_cfg,
+                expected_runtime_funding_txid,
                 &mut treasury,
                 &mut coinbase_cache,
                 &tracer,
@@ -517,6 +840,8 @@ pub async fn run(
             .await
             {
                 eprintln!("[shielded][warn] treasury refresh failed at height {current}: {e}");
+            } else {
+                last_treasury_refresh_height = Some(current);
             }
         }
 
@@ -527,11 +852,36 @@ pub async fn run(
 
         let mut submitted_any = false;
         while submit_credit >= 1.0 && pending_txs.len() < orchard_cfg.max_in_flight {
-            let Some(checkpoint_height) = latest_checkpoint else {
+            let Some(checkpoint) = cursor.latest_checkpoint().cloned() else {
                 break;
             };
-            let anchor = latest_checkpoint_anchor(&tree, checkpoint_height)?;
-            let target_height = current + 10;
+
+            match client.get_block_hash(checkpoint.height).await {
+                Ok(hash) if hash == checkpoint.hash => {}
+                Ok(_) | Err(_) => {
+                    rescan_orchard_state_from_chain(
+                        client,
+                        &keys,
+                        orchard_cfg,
+                        &tracer,
+                        &mut tree,
+                        &mut next_position,
+                        &mut nullifier_index,
+                        &mut cursor,
+                        &mut registry,
+                        &mut treasury,
+                        &mut pending_txs,
+                        submit_credit,
+                        "rebuilding_after_checkpoint_mismatch",
+                        None,
+                    )
+                    .await?;
+                    break;
+                }
+            }
+
+            let anchor = latest_checkpoint_anchor(&tree, &checkpoint)?;
+            let target_height = current.saturating_add(TARGET_HEIGHT_OFFSET_BLOCKS);
             let Some(work) =
                 plan_next_work(&mut registry, &mut treasury, &pending_txs, orchard_cfg)
             else {
@@ -570,8 +920,19 @@ pub async fn run(
                         None,
                         Some("reservoir_expand"),
                     );
+                    tracer.trace_registry(
+                        Some(current),
+                        RuntimePhase::SteadyState,
+                        "build_start",
+                        &registry,
+                        &treasury,
+                        pending_counts(&pending_txs),
+                        submit_credit,
+                        orchard_cfg,
+                        Some("proving_reservoir_expand"),
+                    );
 
-                    let merkle_path = match latest_witness(&tree, &tracked, checkpoint_height) {
+                    let merkle_path = match latest_witness(&tree, &tracked, &checkpoint) {
                         Ok(path) => path,
                         Err(e) => {
                             let error = e.to_string();
@@ -592,14 +953,34 @@ pub async fn run(
                                 reason: Some("reservoir_expand"),
                                 error: Some(error.clone()),
                             });
-                            registry.requeue(tracked.clone());
-                            tracer.trace_tracked_note(
-                                Some(current),
-                                "note_requeued",
-                                &tracked,
-                                None,
-                                Some("witness_error"),
-                            );
+                            if is_witness_rebuild_error(&error) {
+                                rescan_orchard_state_from_chain(
+                                    client,
+                                    &keys,
+                                    orchard_cfg,
+                                    &tracer,
+                                    &mut tree,
+                                    &mut next_position,
+                                    &mut nullifier_index,
+                                    &mut cursor,
+                                    &mut registry,
+                                    &mut treasury,
+                                    &mut pending_txs,
+                                    submit_credit,
+                                    "rebuilding_after_witness_error",
+                                    Some(error),
+                                )
+                                .await?;
+                            } else {
+                                registry.requeue(tracked.clone());
+                                tracer.trace_tracked_note(
+                                    Some(current),
+                                    "note_requeued",
+                                    &tracked,
+                                    None,
+                                    Some("witness_error"),
+                                );
+                            }
                             break;
                         }
                     };
@@ -679,19 +1060,24 @@ pub async fn run(
                                 error: Some(error.clone()),
                             });
                             if is_unknown_orchard_anchor(&error) {
-                                eprintln!(
-                                    "[shielded][warn] dropping reservoir note {} after anchor mismatch",
-                                    tracked.note_id
-                                );
-                                registry.drain_note();
-                                tracer.trace_tracked_note(
-                                    Some(current),
-                                    "note_drained",
-                                    &tracked,
-                                    None,
-                                    Some("unknown_orchard_anchor"),
-                                );
-                                continue;
+                                rescan_orchard_state_from_chain(
+                                    client,
+                                    &keys,
+                                    orchard_cfg,
+                                    &tracer,
+                                    &mut tree,
+                                    &mut next_position,
+                                    &mut nullifier_index,
+                                    &mut cursor,
+                                    &mut registry,
+                                    &mut treasury,
+                                    &mut pending_txs,
+                                    submit_credit,
+                                    "rebuilding_after_anchor_rejection",
+                                    Some(error),
+                                )
+                                .await?;
+                                break;
                             }
                             registry.requeue(tracked.clone());
                             tracer.trace_tracked_note(
@@ -722,6 +1108,17 @@ pub async fn run(
                         reason: Some("treasury_reseed"),
                         error: None,
                     });
+                    tracer.trace_registry(
+                        Some(current),
+                        RuntimePhase::SteadyState,
+                        "build_start",
+                        &registry,
+                        &treasury,
+                        pending_counts(&pending_txs),
+                        submit_credit,
+                        orchard_cfg,
+                        Some("proving_treasury_reseed"),
+                    );
 
                     match build_and_send_treasury_reseed_tx(
                         client,
@@ -790,6 +1187,27 @@ pub async fn run(
                                 reason: Some("treasury_reseed"),
                                 error: Some(error.clone()),
                             });
+                            if is_unknown_orchard_anchor(&error) {
+                                treasury.requeue(utxo);
+                                rescan_orchard_state_from_chain(
+                                    client,
+                                    &keys,
+                                    orchard_cfg,
+                                    &tracer,
+                                    &mut tree,
+                                    &mut next_position,
+                                    &mut nullifier_index,
+                                    &mut cursor,
+                                    &mut registry,
+                                    &mut treasury,
+                                    &mut pending_txs,
+                                    submit_credit,
+                                    "rebuilding_after_anchor_rejection",
+                                    Some(error),
+                                )
+                                .await?;
+                                break;
+                            }
                             treasury.requeue(utxo);
                             break;
                         }
@@ -815,8 +1233,19 @@ pub async fn run(
                         None,
                         Some("lane_advance"),
                     );
+                    tracer.trace_registry(
+                        Some(current),
+                        RuntimePhase::SteadyState,
+                        "build_start",
+                        &registry,
+                        &treasury,
+                        pending_counts(&pending_txs),
+                        submit_credit,
+                        orchard_cfg,
+                        Some("proving_lane_advance"),
+                    );
 
-                    let merkle_path = match latest_witness(&tree, &tracked, checkpoint_height) {
+                    let merkle_path = match latest_witness(&tree, &tracked, &checkpoint) {
                         Ok(path) => path,
                         Err(e) => {
                             let error = e.to_string();
@@ -835,16 +1264,36 @@ pub async fn run(
                                 registry: registry.snapshot(),
                                 treasury: treasury.snapshot(),
                                 reason: Some("lane_advance"),
-                                error: Some(error),
+                                error: Some(error.clone()),
                             });
-                            registry.requeue(tracked.clone());
-                            tracer.trace_tracked_note(
-                                Some(current),
-                                "note_requeued",
-                                &tracked,
-                                None,
-                                Some("witness_error"),
-                            );
+                            if is_witness_rebuild_error(&error) {
+                                rescan_orchard_state_from_chain(
+                                    client,
+                                    &keys,
+                                    orchard_cfg,
+                                    &tracer,
+                                    &mut tree,
+                                    &mut next_position,
+                                    &mut nullifier_index,
+                                    &mut cursor,
+                                    &mut registry,
+                                    &mut treasury,
+                                    &mut pending_txs,
+                                    submit_credit,
+                                    "rebuilding_after_witness_error",
+                                    Some(error),
+                                )
+                                .await?;
+                            } else {
+                                registry.requeue(tracked.clone());
+                                tracer.trace_tracked_note(
+                                    Some(current),
+                                    "note_requeued",
+                                    &tracked,
+                                    None,
+                                    Some("witness_error"),
+                                );
+                            }
                             break;
                         }
                     };
@@ -922,23 +1371,27 @@ pub async fn run(
                                 registry: registry.snapshot(),
                                 treasury: treasury.snapshot(),
                                 reason: Some("lane_advance"),
-                                error: Some(error),
+                                error: Some(error.clone()),
                             });
                             if is_unknown_orchard_anchor(&error) {
-                                eprintln!(
-                                    "[shielded][warn] dropping lane {:?} note {} after anchor mismatch",
-                                    tracked.lane_id,
-                                    tracked.note_id
-                                );
-                                registry.drain_note();
-                                tracer.trace_tracked_note(
-                                    Some(current),
-                                    "note_drained",
-                                    &tracked,
-                                    None,
-                                    Some("unknown_orchard_anchor"),
-                                );
-                                continue;
+                                rescan_orchard_state_from_chain(
+                                    client,
+                                    &keys,
+                                    orchard_cfg,
+                                    &tracer,
+                                    &mut tree,
+                                    &mut next_position,
+                                    &mut nullifier_index,
+                                    &mut cursor,
+                                    &mut registry,
+                                    &mut treasury,
+                                    &mut pending_txs,
+                                    submit_credit,
+                                    "rebuilding_after_anchor_rejection",
+                                    Some(error),
+                                )
+                                .await?;
+                                break;
                             }
                             registry.requeue(tracked.clone());
                             tracer.trace_tracked_note(
@@ -977,6 +1430,7 @@ pub async fn run(
                 pending_counts(&pending_txs),
                 submit_credit,
                 orchard_cfg,
+                None,
             );
             last_progress = Instant::now();
         }
