@@ -18,7 +18,9 @@ use crate::txblast::OrchardBlastRuntimeConfig;
 use crate::txblast::rpc::ZebraRpcClient;
 use crate::txblast::transparent::FundedKey;
 
-use super::{NoteRole, PendingTx, PendingTxKind, PlannedOutput, RecoveredNote, TrackedNote};
+use super::{
+    NoteRole, PendingRpcStatus, PendingTx, PendingTxKind, PlannedOutput, RecoveredNote, TrackedNote,
+};
 
 pub(crate) const MIN_NOTE_VALUE: u64 = 30_000;
 pub(crate) const ORCHARD_SPEND_FEE: u64 = 10_000;
@@ -46,6 +48,20 @@ pub(crate) fn shielding_fee(output_count: usize) -> u64 {
 
 pub(crate) fn orchard_to_transparent_fee(output_count: usize) -> u64 {
     zip317_fee(0, output_count, orchard_bundle_actions(1, 0))
+}
+
+pub(crate) struct SubmittedTx {
+    pub(crate) txid: String,
+    pub(crate) pending: PendingTx,
+    pub(crate) build_duration_ms: u64,
+    pub(crate) rpc_submit_duration_ms: u64,
+}
+
+/// A transaction that has been built (proved) but not yet submitted to the network.
+pub(crate) struct BuiltTx {
+    pub(crate) tx_hex: String,
+    pub(crate) recovered_notes: Vec<RecoveredNote>,
+    pub(crate) build_duration_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +139,7 @@ impl sapling_crypto::prover::OutputProver for NoSaplingOutputProver {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct OrchardKeys {
     #[allow(dead_code)]
     sk: SpendingKey,
@@ -338,9 +355,10 @@ pub(crate) async fn build_and_send_shielding_tx(
     input_value: u64,
     outputs: &[PlannedOutput],
     anchor: orchard::Anchor,
+    submitted_height: u32,
     target_height: u32,
     kind: PendingTxKind,
-) -> Result<(String, PendingTx)> {
+) -> Result<SubmittedTx> {
     let expected_fee = shielding_fee(outputs.len());
     let output_total: u64 = outputs.iter().map(|output| output.value).sum();
     if input_value != output_total + expected_fee {
@@ -392,7 +410,7 @@ pub(crate) async fn build_and_send_shielding_tx(
             &fee_rule,
         )
         .map_err(|e| anyhow::anyhow!("transaction build failed: {e}"))?;
-    let proving_ms = start.elapsed().as_millis();
+    let proving_ms = duration_ms_u64(start.elapsed().as_millis());
 
     let tx = result.transaction();
     let roles: Vec<NoteRole> = outputs.iter().map(|output| output.role).collect();
@@ -400,7 +418,10 @@ pub(crate) async fn build_and_send_shielding_tx(
     let mut tx_bytes = Vec::new();
     tx.write(&mut tx_bytes)
         .map_err(|e| anyhow::anyhow!("failed to serialize transaction: {e}"))?;
+    let submit_start = Instant::now();
     let txid = client.send_raw_transaction(&hex::encode(&tx_bytes)).await?;
+    let rpc_submit_duration_ms = duration_ms_u64(submit_start.elapsed().as_millis());
+    let submitted_at = Instant::now();
     let parent_note_id = Some(format!("{utxo_txid}:{utxo_output_index}"));
     let recovered_notes = recovered_notes
         .into_iter()
@@ -411,15 +432,23 @@ pub(crate) async fn build_and_send_shielding_tx(
         eprintln!("[shielded] Orchard proving took {proving_ms}ms");
     }
 
-    Ok((
+    Ok(SubmittedTx {
         txid,
-        PendingTx {
+        pending: PendingTx {
             recovered_notes,
             kind,
             spent_note_id: None,
+            spent_lane_id: None,
+            spent_note_role: None,
+            spent_note_value: None,
             spent_transparent_outpoint: Some(format!("{utxo_txid}:{utxo_output_index}")),
+            submitted_at,
+            submitted_height,
+            last_rpc_status: PendingRpcStatus::Unknown,
         },
-    ))
+        build_duration_ms: proving_ms,
+        rpc_submit_duration_ms,
+    })
 }
 
 pub(crate) async fn build_and_send_orchard_to_transparent_tx(
@@ -482,14 +511,15 @@ pub(crate) async fn build_and_send_orchard_to_transparent_tx(
     client.send_raw_transaction(&hex::encode(&tx_bytes)).await
 }
 
-pub(crate) async fn build_and_send_lane_advance_tx(
-    client: &ZebraRpcClient,
+/// Build (prove) a lane advance transaction without submitting it.
+/// This is a synchronous, CPU-bound operation suitable for `spawn_blocking`.
+pub(crate) fn build_lane_advance_tx(
     keys: &OrchardKeys,
     tracked: &TrackedNote,
     merkle_path: orchard::tree::MerklePath,
     anchor: orchard::Anchor,
     target_height: u32,
-) -> Result<(String, PendingTx)> {
+) -> Result<BuiltTx> {
     let fee = zip317_fee(0, 0, orchard_bundle_actions(1, 1));
     let note_value = tracked.value();
     if note_value <= fee {
@@ -529,13 +559,82 @@ pub(crate) async fn build_and_send_lane_advance_tx(
             &fee_rule,
         )
         .map_err(|e| anyhow::anyhow!("Orchard lane build failed: {e}"))?;
-    let proving_ms = start.elapsed().as_millis();
+    let build_duration_ms = duration_ms_u64(start.elapsed().as_millis());
 
     let tx = result.transaction();
     let recovered_notes = recover_notes_from_tx(tx, &keys.ovk, &[NoteRole::Lane]);
     let mut tx_bytes = Vec::new();
     tx.write(&mut tx_bytes)?;
+
+    if build_duration_ms > 1000 {
+        eprintln!("[shielded] Orchard proving took {build_duration_ms}ms");
+    }
+
+    Ok(BuiltTx {
+        tx_hex: hex::encode(&tx_bytes),
+        recovered_notes,
+        build_duration_ms,
+    })
+}
+
+pub(crate) async fn build_and_send_lane_advance_tx(
+    client: &ZebraRpcClient,
+    keys: &OrchardKeys,
+    tracked: &TrackedNote,
+    merkle_path: orchard::tree::MerklePath,
+    anchor: orchard::Anchor,
+    submitted_height: u32,
+    target_height: u32,
+) -> Result<SubmittedTx> {
+    let fee = zip317_fee(0, 0, orchard_bundle_actions(1, 1));
+    let note_value = tracked.value();
+    if note_value <= fee {
+        anyhow::bail!("note value {} is not enough to pay fee {}", note_value, fee);
+    }
+
+    let build_config = BuildConfig::Standard {
+        sapling_anchor: None,
+        orchard_anchor: Some(anchor),
+    };
+    let height = BlockHeight::from_u32(target_height);
+    let mut builder = Builder::new(KreskoTestnet, height, build_config);
+
+    builder
+        .add_orchard_spend::<zip317::FeeError>(keys.fvk.clone(), tracked.note, merkle_path)
+        .map_err(|e| anyhow::anyhow!("add_orchard_spend: {e}"))?;
+    builder
+        .add_orchard_output::<zip317::FeeError>(
+            Some(keys.ovk.clone()),
+            keys.address,
+            note_value - fee,
+            memo_for_role(NoteRole::Lane),
+        )
+        .map_err(|e| anyhow::anyhow!("add_orchard_output: {e}"))?;
+
+    let signing_set = TransparentSigningSet::new();
+    let fee_rule = zip317::FeeRule::standard();
+    let start = Instant::now();
+    let result = builder
+        .build(
+            &signing_set,
+            &[],
+            &[keys.sak.clone()],
+            rand_core_06::OsRng,
+            &NoSaplingSpendProver,
+            &NoSaplingOutputProver,
+            &fee_rule,
+        )
+        .map_err(|e| anyhow::anyhow!("Orchard lane build failed: {e}"))?;
+    let proving_ms = duration_ms_u64(start.elapsed().as_millis());
+
+    let tx = result.transaction();
+    let recovered_notes = recover_notes_from_tx(tx, &keys.ovk, &[NoteRole::Lane]);
+    let mut tx_bytes = Vec::new();
+    tx.write(&mut tx_bytes)?;
+    let submit_start = Instant::now();
     let txid = client.send_raw_transaction(&hex::encode(&tx_bytes)).await?;
+    let rpc_submit_duration_ms = duration_ms_u64(submit_start.elapsed().as_millis());
+    let submitted_at = Instant::now();
     let recovered_notes = recovered_notes
         .into_iter()
         .map(|note| note.with_origin(&txid, Some(tracked.note_id.clone())))
@@ -545,15 +644,23 @@ pub(crate) async fn build_and_send_lane_advance_tx(
         eprintln!("[shielded] Orchard proving took {proving_ms}ms");
     }
 
-    Ok((
+    Ok(SubmittedTx {
         txid,
-        PendingTx {
+        pending: PendingTx {
             recovered_notes,
             kind: PendingTxKind::LaneAdvance,
             spent_note_id: Some(tracked.note_id.clone()),
+            spent_lane_id: tracked.lane_id,
+            spent_note_role: Some(tracked.role),
+            spent_note_value: Some(tracked.value()),
             spent_transparent_outpoint: None,
+            submitted_at,
+            submitted_height,
+            last_rpc_status: PendingRpcStatus::Unknown,
         },
-    ))
+        build_duration_ms: proving_ms,
+        rpc_submit_duration_ms,
+    })
 }
 
 pub(crate) async fn build_and_send_reservoir_expand_tx(
@@ -562,9 +669,10 @@ pub(crate) async fn build_and_send_reservoir_expand_tx(
     tracked: &TrackedNote,
     merkle_path: orchard::tree::MerklePath,
     anchor: orchard::Anchor,
+    submitted_height: u32,
     target_height: u32,
     cfg: &OrchardBlastRuntimeConfig,
-) -> Result<(String, PendingTx)> {
+) -> Result<SubmittedTx> {
     let planned_outputs = plan_reservoir_expand_outputs(tracked.value(), cfg)?;
 
     let build_config = BuildConfig::Standard {
@@ -603,7 +711,7 @@ pub(crate) async fn build_and_send_reservoir_expand_tx(
             &fee_rule,
         )
         .map_err(|e| anyhow::anyhow!("Orchard fanout build failed: {e}"))?;
-    let proving_ms = start.elapsed().as_millis();
+    let proving_ms = duration_ms_u64(start.elapsed().as_millis());
 
     let tx = result.transaction();
     let roles = planned_outputs
@@ -613,7 +721,10 @@ pub(crate) async fn build_and_send_reservoir_expand_tx(
     let recovered_notes = recover_notes_from_tx(tx, &keys.ovk, &roles);
     let mut tx_bytes = Vec::new();
     tx.write(&mut tx_bytes)?;
+    let submit_start = Instant::now();
     let txid = client.send_raw_transaction(&hex::encode(&tx_bytes)).await?;
+    let rpc_submit_duration_ms = duration_ms_u64(submit_start.elapsed().as_millis());
+    let submitted_at = Instant::now();
     let recovered_notes = recovered_notes
         .into_iter()
         .map(|note| note.with_origin(&txid, Some(tracked.note_id.clone())))
@@ -623,15 +734,23 @@ pub(crate) async fn build_and_send_reservoir_expand_tx(
         eprintln!("[shielded] Orchard proving took {proving_ms}ms");
     }
 
-    Ok((
+    Ok(SubmittedTx {
         txid,
-        PendingTx {
+        pending: PendingTx {
             recovered_notes,
             kind: PendingTxKind::ReservoirExpand,
             spent_note_id: Some(tracked.note_id.clone()),
+            spent_lane_id: tracked.lane_id,
+            spent_note_role: Some(tracked.role),
+            spent_note_value: Some(tracked.value()),
             spent_transparent_outpoint: None,
+            submitted_at,
+            submitted_height,
+            last_rpc_status: PendingRpcStatus::Unknown,
         },
-    ))
+        build_duration_ms: proving_ms,
+        rpc_submit_duration_ms,
+    })
 }
 
 pub(crate) async fn build_and_send_treasury_reseed_tx(
@@ -640,9 +759,10 @@ pub(crate) async fn build_and_send_treasury_reseed_tx(
     keys: &OrchardKeys,
     utxo: &super::TreasuryUtxo,
     anchor: orchard::Anchor,
+    submitted_height: u32,
     target_height: u32,
     cfg: &OrchardBlastRuntimeConfig,
-) -> Result<(String, PendingTx)> {
+) -> Result<SubmittedTx> {
     let planned_outputs = plan_treasury_reseed_outputs(utxo.satoshis, cfg)?;
     build_and_send_shielding_tx(
         client,
@@ -654,10 +774,15 @@ pub(crate) async fn build_and_send_treasury_reseed_tx(
         utxo.satoshis,
         &planned_outputs,
         anchor,
+        submitted_height,
         target_height,
         PendingTxKind::TreasuryReseed,
     )
     .await
+}
+
+fn duration_ms_u64(duration_ms: u128) -> u64 {
+    duration_ms.min(u128::from(u64::MAX)) as u64
 }
 
 fn recover_notes_from_tx(
@@ -736,6 +861,7 @@ mod tests {
             Some(8),
             Some(4),
             Some(2),
+            None,
             Some(5),
         )
         .expect("runtime config should be valid")

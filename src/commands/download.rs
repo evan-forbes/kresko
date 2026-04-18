@@ -10,6 +10,12 @@ const REMOTE_TRACE_ARCHIVE_PATH: &str = "/tmp/kresko-traces.tar.gz";
 const TRACE_MISSING_MARKER: &str = "KRESKO_TRACE_MISSING";
 const TRACE_TABLE_MISSING_MARKER: &str = "KRESKO_TRACE_TABLE_MISSING";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TraceSelection {
+    All,
+    Tables(Vec<TraceTable>),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TraceTable {
     PeerMessage,
@@ -18,6 +24,8 @@ enum TraceTable {
     TxblastRegistry,
     TxblastNote,
     TxblastTraceDropped,
+    ForkEvent,
+    ForkSnapshot,
 }
 
 impl TraceTable {
@@ -29,10 +37,12 @@ impl TraceTable {
             Self::TxblastRegistry => "txblast_registry.jsonl",
             Self::TxblastNote => "txblast_note.jsonl",
             Self::TxblastTraceDropped => "txblast_trace_dropped.jsonl",
+            Self::ForkEvent => "fork_event.jsonl",
+            Self::ForkSnapshot => "fork_snapshot.jsonl",
         }
     }
 
-    fn parse_list(input: &str) -> Result<Vec<Self>> {
+    fn parse_list(input: &str) -> Result<TraceSelection> {
         let mut tables = Vec::new();
         for raw in input.split(',') {
             let raw = raw.trim();
@@ -40,14 +50,7 @@ impl TraceTable {
                 continue;
             }
             if raw.eq_ignore_ascii_case("all") {
-                return Ok(vec![
-                    Self::PeerMessage,
-                    Self::TraceDropped,
-                    Self::TxblastEvent,
-                    Self::TxblastRegistry,
-                    Self::TxblastNote,
-                    Self::TxblastTraceDropped,
-                ]);
+                return Ok(TraceSelection::All);
             }
             let table = match raw {
                 "peer_message" | "peer-message" => Self::PeerMessage,
@@ -56,8 +59,10 @@ impl TraceTable {
                 "txblast_registry" | "txblast-registry" => Self::TxblastRegistry,
                 "txblast_note" | "txblast-note" => Self::TxblastNote,
                 "txblast_trace_dropped" | "txblast-trace-dropped" => Self::TxblastTraceDropped,
+                "fork_event" | "fork-event" => Self::ForkEvent,
+                "fork_snapshot" | "fork-snapshot" => Self::ForkSnapshot,
                 other => anyhow::bail!(
-                    "unknown trace table: {other}. Use one of: all, peer_message, trace_dropped, txblast_event, txblast_registry, txblast_note, txblast_trace_dropped"
+                    "unknown trace table: {other}. Use one of: all, peer_message, trace_dropped, txblast_event, txblast_registry, txblast_note, txblast_trace_dropped, fork_event, fork_snapshot"
                 ),
             };
             if !tables.contains(&table) {
@@ -67,11 +72,11 @@ impl TraceTable {
 
         if tables.is_empty() {
             anyhow::bail!(
-                "no trace tables selected. Use one of: all, peer_message, trace_dropped, txblast_event, txblast_registry, txblast_note, txblast_trace_dropped"
+                "no trace tables selected. Use one of: all, peer_message, trace_dropped, txblast_event, txblast_registry, txblast_note, txblast_trace_dropped, fork_event, fork_snapshot"
             );
         }
 
-        Ok(tables)
+        Ok(TraceSelection::Tables(tables))
     }
 }
 
@@ -80,12 +85,13 @@ pub async fn run_logs(
     workers: usize,
     no_compress: bool,
     directory: &str,
+    data_subdir: Option<&str>,
 ) -> Result<()> {
     if workers == 0 {
         anyhow::bail!("workers must be greater than 0");
     }
 
-    let (targets, key, data_dir) = download_context(nodes, directory)?;
+    let (targets, key, data_dir) = download_context(nodes, directory, data_subdir)?;
 
     if targets.is_empty() {
         println!("No matching nodes found.");
@@ -126,28 +132,42 @@ pub async fn run_logs(
     Ok(())
 }
 
-pub async fn run_traces(nodes: &str, workers: usize, tables: &str, directory: &str) -> Result<()> {
+pub async fn run_traces(
+    nodes: &str,
+    workers: usize,
+    tables: &str,
+    directory: &str,
+    data_subdir: Option<&str>,
+) -> Result<()> {
     if workers == 0 {
         anyhow::bail!("workers must be greater than 0");
     }
 
-    let trace_tables = TraceTable::parse_list(tables)?;
-    let (targets, key, data_dir) = download_context(nodes, directory)?;
+    let trace_selection = TraceTable::parse_list(tables)?;
+    let (targets, key, data_dir) = download_context(nodes, directory, data_subdir)?;
 
     if targets.is_empty() {
         println!("No matching nodes found.");
         return Ok(());
     }
 
-    let table_names = trace_tables
-        .iter()
-        .map(|table| table.file_name())
-        .collect::<Vec<_>>()
-        .join(", ");
-    println!(
-        "Downloading structured traces ({table_names}) from {} nodes...",
-        targets.len()
-    );
+    match &trace_selection {
+        TraceSelection::All => println!(
+            "Downloading all files from discovered trace directories on {} nodes...",
+            targets.len()
+        ),
+        TraceSelection::Tables(trace_tables) => {
+            let table_names = trace_tables
+                .iter()
+                .map(|table| table.file_name())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "Downloading structured traces ({table_names}) from {} nodes...",
+                targets.len()
+            );
+        }
+    }
 
     for chunk in targets.chunks(workers) {
         let futs: Vec<_> = chunk
@@ -157,11 +177,12 @@ pub async fn run_traces(nodes: &str, workers: usize, tables: &str, directory: &s
                 let name = inst.name.clone();
                 let key = key.clone();
                 let node_dir = data_dir.join(&name);
-                let trace_tables = trace_tables.clone();
+                let trace_selection = trace_selection.clone();
 
                 async move {
                     std::fs::create_dir_all(&node_dir)?;
-                    download_structured_traces(&ip, &key, &node_dir, &name, &trace_tables).await?;
+                    download_structured_traces(&ip, &key, &node_dir, &name, &trace_selection)
+                        .await?;
                     Ok::<_, anyhow::Error>(())
                 }
             })
@@ -211,7 +232,43 @@ async fn download_logs(
         println!("  {name}: downloaded logs");
     }
 
+    download_optional_log(
+        ip,
+        key,
+        node_dir,
+        name,
+        "/root/mine.log.jsonl",
+        "mine.log.jsonl",
+    )
+    .await;
+    download_optional_log(
+        ip,
+        key,
+        node_dir,
+        name,
+        "/root/kresko-mine.log",
+        "kresko-mine.log",
+    )
+    .await;
+
     Ok(())
+}
+
+async fn download_optional_log(
+    ip: &str,
+    key: &str,
+    node_dir: &Path,
+    name: &str,
+    remote_path: &str,
+    local_name: &str,
+) {
+    let local_path = node_dir.join(local_name);
+    match ssh::sftp_download(ip, key, remote_path, local_path.to_str().unwrap()).await {
+        Ok(()) => println!("  {name}: downloaded {local_name}"),
+        Err(_) => {
+            let _ = std::fs::remove_file(&local_path);
+        }
+    }
 }
 
 async fn download_structured_traces(
@@ -219,10 +276,10 @@ async fn download_structured_traces(
     key: &str,
     node_dir: &Path,
     name: &str,
-    tables: &[TraceTable],
+    selection: &TraceSelection,
 ) -> Result<()> {
     let trace_archive = node_dir.join("traces.tar.gz");
-    let trace_script = build_trace_download_script(tables);
+    let trace_script = build_trace_download_script(selection);
 
     match ssh::ssh_exec(ip, key, &trace_script).await {
         Ok(trace_dir) => {
@@ -288,6 +345,7 @@ fn remote_trace_table_missing(err: &anyhow::Error) -> bool {
 fn download_context(
     nodes: &str,
     directory: &str,
+    data_subdir: Option<&str>,
 ) -> Result<(Vec<crate::config::Instance>, String, std::path::PathBuf)> {
     let dir = std::path::Path::new(directory);
     let config = Config::load(dir)?;
@@ -300,18 +358,27 @@ fn download_context(
         .cloned()
         .collect::<Vec<_>>();
 
-    let data_dir = dir.join("data");
+    let data_dir = match data_subdir {
+        Some(sub) => dir.join("data").join(sub),
+        None => dir.join("data"),
+    };
     std::fs::create_dir_all(&data_dir)?;
 
     Ok((targets, key, data_dir))
 }
 
-fn build_trace_download_script(tables: &[TraceTable]) -> String {
-    let requested_files = tables
-        .iter()
-        .map(|table| format!("\"{}\"", table.file_name()))
-        .collect::<Vec<_>>()
-        .join(" ");
+fn build_trace_download_script(selection: &TraceSelection) -> String {
+    let request_mode = match selection {
+        TraceSelection::All => "all".to_owned(),
+        TraceSelection::Tables(tables) => format!(
+            "selected\nrequested_files=({})",
+            tables
+                .iter()
+                .map(|table| format!("\"{}\"", table.file_name()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+    };
 
     format!(
         r#"set -e
@@ -321,7 +388,7 @@ if [ -f /root/payload/vars.sh ]; then
 fi
 
 trace_dir=""
-requested_files=({requested_files})
+request_mode="{request_mode}"
 stage_dir="$(mktemp -d /tmp/kresko-trace-stage.XXXXXX)"
 found_any=0
 
@@ -331,6 +398,9 @@ if [ -n "${{ZEBRA_P2P_TRACE_DIR:-}}" ]; then
 fi
 if [ -n "${{ZEBRA_P2P_TRACE_FILE:-}}" ]; then
     candidate_dirs+=("$(dirname "$ZEBRA_P2P_TRACE_FILE")/traces")
+fi
+if [ -n "${{ZEBRA_TRACE_DIR:-}}" ]; then
+    candidate_dirs+=("$ZEBRA_TRACE_DIR")
 fi
 if [ -n "${{KRESKO_TRACE_DIR:-}}" ]; then
     candidate_dirs+=("$KRESKO_TRACE_DIR")
@@ -342,27 +412,40 @@ if [ -d /root/.cache/kresko/txblast-traces ]; then
     candidate_dirs+=("/root/.cache/kresko/txblast-traces")
 fi
 
-for file in "${{requested_files[@]}}"; do
-    copied=0
+if [ "$request_mode" = "all" ]; then
     for dir in "${{candidate_dirs[@]}}"; do
-        if [ -f "$dir/$file" ]; then
-            cp "$dir/$file" "$stage_dir/$file"
+        [ -d "$dir" ] || continue
+        while IFS= read -r path; do
+            file="$(basename "$path")"
+            if [ ! -e "$stage_dir/$file" ]; then
+                cp "$path" "$stage_dir/$file"
+                found_any=1
+            fi
+        done < <(find "$dir" -maxdepth 1 -type f | sort)
+    done
+else
+    for file in "${{requested_files[@]}}"; do
+        copied=0
+        for dir in "${{candidate_dirs[@]}}"; do
+            if [ -f "$dir/$file" ]; then
+                cp "$dir/$file" "$stage_dir/$file"
+                found_any=1
+                copied=1
+                break
+            fi
+        done
+
+        if [ "$copied" -eq 1 ]; then
+            continue
+        fi
+
+        trace_file="$(find /root /tmp -maxdepth 6 -type f -name "$file" -print -quit 2>/dev/null || true)"
+        if [ -n "$trace_file" ]; then
+            cp "$trace_file" "$stage_dir/$file"
             found_any=1
-            copied=1
-            break
         fi
     done
-
-    if [ "$copied" -eq 1 ]; then
-        continue
-    fi
-
-    trace_file="$(find /root /tmp -maxdepth 6 -type f -name "$file" -print -quit 2>/dev/null || true)"
-    if [ -n "$trace_file" ]; then
-        cp "$trace_file" "$stage_dir/$file"
-        found_any=1
-    fi
-done
+fi
 
 if [ "$found_any" -eq 0 ]; then
     rm -rf "$stage_dir"
@@ -382,5 +465,23 @@ rm -rf "$stage_dir"
         trace_missing = TRACE_MISSING_MARKER,
         trace_table_missing = TRACE_TABLE_MISSING_MARKER,
         archive_path = REMOTE_TRACE_ARCHIVE_PATH,
+        request_mode = request_mode,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TraceSelection, TraceTable, build_trace_download_script};
+
+    #[test]
+    fn parse_all_selects_directory_mode() {
+        assert_eq!(TraceTable::parse_list("all").unwrap(), TraceSelection::All);
+    }
+
+    #[test]
+    fn all_trace_script_walks_candidate_directories() {
+        let script = build_trace_download_script(&TraceSelection::All);
+        assert!(script.contains("request_mode=\"all\""));
+        assert!(script.contains("find \"$dir\" -maxdepth 1 -type f | sort"));
+    }
 }

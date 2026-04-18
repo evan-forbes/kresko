@@ -1,11 +1,15 @@
 use anyhow::Result;
 use futures::future::join_all;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::task::JoinHandle;
 
 use crate::config::{Config, Instance, MiningMode, select_instances};
 
@@ -31,7 +35,13 @@ struct ProgressLogEntry {
     propagation_delay_ms: Option<u128>,
 }
 
-pub async fn run(block_time: u64, random: bool, concurrent: usize, directory: &str) -> Result<()> {
+pub async fn run(
+    block_time: u64,
+    random: bool,
+    concurrent: usize,
+    directory: &str,
+    data_subdir: Option<&str>,
+) -> Result<()> {
     if block_time == 0 {
         anyhow::bail!("block-time must be greater than 0 seconds");
     }
@@ -51,10 +61,70 @@ pub async fn run(block_time: u64, random: bool, concurrent: usize, directory: &s
         return Ok(());
     }
 
+    let log_path = resolve_log_path(dir, data_subdir)?;
+
     match config.mining_mode {
-        MiningMode::Pow => run_observer(block_time, &miners, dir).await,
-        MiningMode::Generate => run_generate(block_time, random, concurrent, &miners, dir).await,
+        MiningMode::Pow => run_observer(block_time, &miners, &log_path, true).await,
+        MiningMode::Generate => {
+            run_generate(block_time, random, concurrent, &miners, &log_path, true).await
+        }
     }
+}
+
+/// Spawn a background progress task for use by `kresko run`. The returned
+/// JoinHandle's `abort()` stops the task. Output goes to
+/// `data/<data_subdir>/progress.log.jsonl`.
+pub async fn spawn_background(
+    directory: &Path,
+    block_time: u64,
+    data_subdir: &str,
+) -> Result<JoinHandle<()>> {
+    if block_time == 0 {
+        anyhow::bail!("block-time must be greater than 0 seconds");
+    }
+
+    let config = Config::load(directory)?;
+    let miners: Vec<Instance> = select_instances(&config.miners, "all")
+        .into_iter()
+        .cloned()
+        .collect();
+
+    if miners.is_empty() {
+        anyhow::bail!("No active miners found for background progress logging.");
+    }
+
+    let log_path = resolve_log_path(directory, Some(data_subdir))?;
+    let mining_mode = config.mining_mode;
+
+    let handle = tokio::spawn(async move {
+        let result = match mining_mode {
+            MiningMode::Pow => run_observer(block_time, &miners, &log_path, false).await,
+            MiningMode::Generate => {
+                run_generate(block_time, false, 1, &miners, &log_path, false).await
+            }
+        };
+        if let Err(e) = result {
+            eprintln!("background progress task error: {e}");
+        }
+    });
+
+    Ok(handle)
+}
+
+fn resolve_log_path(dir: &Path, data_subdir: Option<&str>) -> Result<PathBuf> {
+    let path = match data_subdir {
+        Some(sub) => {
+            let target_dir = dir.join("data").join(sub);
+            std::fs::create_dir_all(&target_dir)?;
+            target_dir.join("progress.log.jsonl")
+        }
+        None => dir.join("progress.log.jsonl"),
+    };
+    // Touch so OpenOptions::append always finds an existing file.
+    if !path.exists() {
+        let _ = File::create(&path)?;
+    }
+    Ok(path)
 }
 
 /// Generate mode: drive block production via the `generate` RPC (PoW disabled).
@@ -63,7 +133,8 @@ async fn run_generate(
     random: bool,
     concurrent: usize,
     miners: &[Instance],
-    dir: &std::path::Path,
+    log_path: &Path,
+    respond_to_ctrl_c: bool,
 ) -> Result<()> {
     let effective_concurrency = concurrent.min(miners.len());
     if effective_concurrency != concurrent {
@@ -80,82 +151,128 @@ async fn run_generate(
         .build()?;
 
     let mode = if random { "random" } else { "round_robin" };
-    let log_path = dir.join("progress.log.jsonl");
     let mut log_file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)?;
+        .open(log_path)?;
 
-    println!(
-        "Progress loop started (miners={}, mode={}, block_time={}s, concurrent={}).",
-        miners.len(),
-        mode,
-        block_time,
-        effective_concurrency
-    );
-    println!("Logging results to {}", log_path.display());
-    println!("Press Ctrl-C to stop.");
+    if respond_to_ctrl_c {
+        println!(
+            "Progress loop started (miners={}, mode={}, block_time={}s, concurrent={}).",
+            miners.len(),
+            mode,
+            block_time,
+            effective_concurrency
+        );
+        println!("Logging results to {}", log_path.display());
+        println!("Press Ctrl-C to stop.");
+    }
 
     let mut ticker = tokio::time::interval(Duration::from_secs(block_time));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut tick: u64 = 0;
     let mut next_idx: usize = 0;
-    let mut rng = rand::rng();
+    let mut rng = StdRng::from_os_rng();
 
     loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                println!("Stopping progress loop.");
-                break;
-            }
-            _ = ticker.tick() => {
-                tick = tick.saturating_add(1);
-
-                let selected = if random {
-                    pick_random_miners(miners, effective_concurrency, &mut rng)
-                } else {
-                    pick_round_robin_miners(miners, effective_concurrency, &mut next_idx)
-                };
-
-                let futs: Vec<_> = selected
-                    .into_iter()
-                    .map(|miner| generate_block(&client, miner, tick, mode))
-                    .collect();
-
-                let results = join_all(futs).await;
-                for entry in results {
-                    print_log_entry(&entry);
-                    let line = serde_json::to_string(&entry)?;
-                    writeln!(log_file, "{line}")?;
+        if respond_to_ctrl_c {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("Stopping progress loop.");
+                    break;
                 }
-                log_file.flush()?;
+                _ = ticker.tick() => {
+                    generate_tick(
+                        &client, miners, &mut log_file, &mut tick, mode, random,
+                        effective_concurrency, &mut next_idx, &mut rng, respond_to_ctrl_c,
+                    ).await?;
+                }
             }
+        } else {
+            ticker.tick().await;
+            generate_tick(
+                &client,
+                miners,
+                &mut log_file,
+                &mut tick,
+                mode,
+                random,
+                effective_concurrency,
+                &mut next_idx,
+                &mut rng,
+                respond_to_ctrl_c,
+            )
+            .await?;
         }
     }
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn generate_tick(
+    client: &reqwest::Client,
+    miners: &[Instance],
+    log_file: &mut std::fs::File,
+    tick: &mut u64,
+    mode: &str,
+    random: bool,
+    effective_concurrency: usize,
+    next_idx: &mut usize,
+    rng: &mut impl rand::Rng,
+    print_entries: bool,
+) -> Result<()> {
+    *tick = tick.saturating_add(1);
+
+    let selected = if random {
+        pick_random_miners(miners, effective_concurrency, rng)
+    } else {
+        pick_round_robin_miners(miners, effective_concurrency, next_idx)
+    };
+
+    let futs: Vec<_> = selected
+        .into_iter()
+        .map(|miner| generate_block(client, miner, *tick, mode))
+        .collect();
+
+    let results = join_all(futs).await;
+    for entry in results {
+        if print_entries {
+            print_log_entry(&entry);
+        }
+        let line = serde_json::to_string(&entry)?;
+        writeln!(log_file, "{line}")?;
+    }
+    log_file.flush()?;
+    Ok(())
+}
+
 /// Observer mode: poll nodes for block height changes (PoW enabled, blocks mined by nodes).
-async fn run_observer(block_time: u64, miners: &[Instance], dir: &std::path::Path) -> Result<()> {
+async fn run_observer(
+    block_time: u64,
+    miners: &[Instance],
+    log_path: &Path,
+    respond_to_ctrl_c: bool,
+) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let log_path = dir.join("progress.log.jsonl");
     let mut log_file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)?;
+        .open(log_path)?;
 
-    println!(
-        "Progress observer started (miners={}, poll_interval={}s, mining_mode=pow).",
-        miners.len(),
-        block_time,
-    );
-    println!("Logging results to {}", log_path.display());
-    println!("Press Ctrl-C to stop.");
+    if respond_to_ctrl_c {
+        println!(
+            "Progress observer started (miners={}, poll_interval={}s, mining_mode=pow).",
+            miners.len(),
+            block_time,
+        );
+        println!("Logging results to {}", log_path.display());
+        println!("Press Ctrl-C to stop.");
+    }
 
     let mut ticker = tokio::time::interval(Duration::from_secs(block_time));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -166,52 +283,83 @@ async fn run_observer(block_time: u64, miners: &[Instance], dir: &std::path::Pat
     let mut height_first_seen: HashMap<u64, (u128, String)> = HashMap::new();
 
     loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                println!("Stopping progress observer.");
-                break;
-            }
-            _ = ticker.tick() => {
-                tick = tick.saturating_add(1);
-
-                let futs: Vec<_> = miners
-                    .iter()
-                    .map(|miner| observe_node(&client, miner, tick))
-                    .collect();
-
-                let results = join_all(futs).await;
-                for (miner_name, mut entry, current_height) in results {
-                    let last = last_heights.get(&miner_name).copied().unwrap_or(0);
-                    if current_height > last || last == 0 {
-                        last_heights.insert(miner_name.clone(), current_height);
-
-                        if current_height > 0 {
-                            if let Some((first_ts, first_miner)) = height_first_seen.get(&current_height) {
-                                entry.discovered_by = Some(first_miner.clone());
-                                entry.propagation_delay_ms = Some(entry.ts_unix_ms.saturating_sub(*first_ts));
-                            } else {
-                                // This node is the first to report this height.
-                                height_first_seen.insert(current_height, (entry.ts_unix_ms, miner_name.clone()));
-                                entry.discovered_by = Some(miner_name);
-                                entry.propagation_delay_ms = Some(0);
-                            }
-                        }
-
-                        print_log_entry(&entry);
-                        let line = serde_json::to_string(&entry)?;
-                        writeln!(log_file, "{line}")?;
-                    }
+        if respond_to_ctrl_c {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("Stopping progress observer.");
+                    break;
                 }
-                log_file.flush()?;
-
-                // Prune old height entries to avoid unbounded growth.
-                if let Some(&max_h) = last_heights.values().max() {
-                    height_first_seen.retain(|h, _| *h + 100 >= max_h);
+                _ = ticker.tick() => {
+                    observer_tick(
+                        &client, miners, &mut log_file, &mut tick,
+                        &mut last_heights, &mut height_first_seen, respond_to_ctrl_c,
+                    ).await?;
                 }
             }
+        } else {
+            ticker.tick().await;
+            observer_tick(
+                &client,
+                miners,
+                &mut log_file,
+                &mut tick,
+                &mut last_heights,
+                &mut height_first_seen,
+                respond_to_ctrl_c,
+            )
+            .await?;
         }
     }
 
+    Ok(())
+}
+
+async fn observer_tick(
+    client: &reqwest::Client,
+    miners: &[Instance],
+    log_file: &mut std::fs::File,
+    tick: &mut u64,
+    last_heights: &mut HashMap<String, u64>,
+    height_first_seen: &mut HashMap<u64, (u128, String)>,
+    print_entries: bool,
+) -> Result<()> {
+    *tick = tick.saturating_add(1);
+
+    let futs: Vec<_> = miners
+        .iter()
+        .map(|miner| observe_node(client, miner, *tick))
+        .collect();
+
+    let results = join_all(futs).await;
+    for (miner_name, mut entry, current_height) in results {
+        let last = last_heights.get(&miner_name).copied().unwrap_or(0);
+        if current_height > last || last == 0 {
+            last_heights.insert(miner_name.clone(), current_height);
+
+            if current_height > 0 {
+                if let Some((first_ts, first_miner)) = height_first_seen.get(&current_height) {
+                    entry.discovered_by = Some(first_miner.clone());
+                    entry.propagation_delay_ms = Some(entry.ts_unix_ms.saturating_sub(*first_ts));
+                } else {
+                    height_first_seen
+                        .insert(current_height, (entry.ts_unix_ms, miner_name.clone()));
+                    entry.discovered_by = Some(miner_name);
+                    entry.propagation_delay_ms = Some(0);
+                }
+            }
+
+            if print_entries {
+                print_log_entry(&entry);
+            }
+            let line = serde_json::to_string(&entry)?;
+            writeln!(log_file, "{line}")?;
+        }
+    }
+    log_file.flush()?;
+
+    if let Some(&max_h) = last_heights.values().max() {
+        height_first_seen.retain(|h, _| *h + 100 >= max_h);
+    }
     Ok(())
 }
 

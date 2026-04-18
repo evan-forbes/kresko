@@ -366,11 +366,12 @@ fn query_local(trace_dir: &str, stall_secs: i64) -> TxblastLocalStatus {
     let age_secs = parse_age_secs(&record.ts);
     let stall_reason =
         compute_stall_reason(&record, ready, within_pending_limits, age_secs, stall_secs);
+    let effective_stall_secs = stall_secs_for_record(&record, stall_secs);
     let status = if ready {
         "ready"
     } else if record.phase == "recovering" {
         "recovering"
-    } else if is_stalled(age_secs, stall_secs) {
+    } else if is_stalled(age_secs, effective_stall_secs) {
         "stalled"
     } else {
         "warming_up"
@@ -434,6 +435,22 @@ fn is_stalled(age_secs: Option<i64>, stall_secs: i64) -> bool {
     age_secs.is_some_and(|age| age >= stall_secs)
 }
 
+fn is_proving_record(record: &RegistryRecord) -> bool {
+    record.event == "build_start"
+        || record
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("proving_"))
+}
+
+fn stall_secs_for_record(record: &RegistryRecord, stall_secs: i64) -> i64 {
+    if is_proving_record(record) {
+        stall_secs.max(600)
+    } else {
+        stall_secs
+    }
+}
+
 fn live_note_count(record: &RegistryRecord) -> usize {
     record.ready_lanes + record.reservoir_count
 }
@@ -467,7 +484,7 @@ fn compute_stall_reason(
         return Some("pending_limit_exceeded".to_owned());
     }
 
-    let stale = is_stalled(age_secs, stall_secs);
+    let stale = is_stalled(age_secs, stall_secs_for_record(record, stall_secs));
 
     if let Some(reason) = record.reason.as_deref() {
         return Some(if stale {
@@ -653,6 +670,23 @@ mod tests {
         let status = compute_stall_reason(&steady, false, true, Some(10), 120);
 
         assert_eq!(status.as_deref(), Some("proving_lane_advance"));
+    }
+
+    #[test]
+    fn proving_records_get_extended_stall_budget() {
+        let mut bootstrap = record("bootstrap_shield");
+        bootstrap.event = "build_start".to_owned();
+        bootstrap.reason = Some("proving_bootstrap_shield".to_owned());
+
+        assert_eq!(stall_secs_for_record(&bootstrap, 120), 600);
+        assert_eq!(
+            compute_stall_reason(&bootstrap, false, true, Some(300), 120).as_deref(),
+            Some("proving_bootstrap_shield")
+        );
+        assert_eq!(
+            compute_stall_reason(&bootstrap, false, true, Some(601), 120).as_deref(),
+            Some("proving_bootstrap_shield_stalled")
+        );
     }
 
     #[test]

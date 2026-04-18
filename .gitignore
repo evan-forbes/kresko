@@ -1,2 +1,6 @@
 /target
 /build
+
+# Locally generated premine cache. Each entry is keyed by
+# (target_difficulty_limit, block_time_secs); see src/premine.rs.
+/bootstrap/cache

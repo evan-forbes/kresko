@@ -11,8 +11,8 @@ use zcash_transparent::address::TransparentAddress;
 use zebra_chain::serialization::ZcashDeserialize;
 
 use crate::config::{
-    Config, Instance, LocalGenesisBootstrapMode, LocalGenesisFundedKey, OrchardTxblastConfig,
-    resolve_value, shellexpand,
+    Config, Instance, LocalGenesisFundedKey, MiningMode, OrchardTxblastConfig, resolve_value,
+    shellexpand,
 };
 use crate::ssh;
 use crate::txblast::orchard::{
@@ -110,13 +110,18 @@ pub async fn run(directory: &str) -> Result<()> {
         .as_ref()
         .context("missing local_genesis config; run 'kresko genesis' first")?;
 
-    if local_genesis.bootstrap_mode != LocalGenesisBootstrapMode::Cached {
-        println!("Runtime funding skipped: bootstrap mode is generated.");
+    if config.mining_mode != MiningMode::Pow {
+        println!("Runtime funding skipped: mining mode is not PoW.");
+        return Ok(());
+    }
+    if local_genesis.bootstrap_treasury_key.is_none() {
+        println!("Runtime funding skipped: no treasury key attached to local genesis config.");
         return Ok(());
     }
 
     let runtime = OrchardBlastRuntimeConfig::from_parts(
         config.orchard_txblast.clone(),
+        None,
         None,
         None,
         None,
@@ -225,6 +230,54 @@ pub async fn expected_funding_txid(directory: &str) -> Result<Option<String>> {
     Ok(status.observed_funding_txid)
 }
 
+pub async fn ensure_local_runtime_funding(
+    rpc_endpoint: &str,
+    local_genesis_dir: &str,
+    minimum_recipient_zats: u64,
+    confirm_timeout_secs: u64,
+    expected_funding_txid: Option<&str>,
+) -> Result<()> {
+    if let Some(expected_funding_txid) = expected_funding_txid {
+        let status = verify_runtime_funding_local(
+            rpc_endpoint,
+            local_genesis_dir,
+            minimum_recipient_zats,
+            Some(expected_funding_txid),
+        )
+        .await?;
+        if status.ready {
+            return Ok(());
+        }
+
+        let reason = status
+            .stall_reason
+            .as_deref()
+            .unwrap_or("runtime funding verification failed");
+        println!(
+            "[fund-runtime-keys] expected runtime funding tx {} is not ready locally ({reason}); refreshing funding state",
+            expected_funding_txid
+        );
+    }
+
+    let status = fund_runtime_keys_local(
+        rpc_endpoint,
+        local_genesis_dir,
+        minimum_recipient_zats,
+        confirm_timeout_secs,
+    )
+    .await?;
+    if !status.ready {
+        anyhow::bail!(
+            "runtime funding did not become ready locally: {}",
+            status
+                .stall_reason
+                .unwrap_or_else(|| "unknown stall".to_owned())
+        );
+    }
+
+    Ok(())
+}
+
 async fn fund_runtime_keys_local(
     rpc_endpoint: &str,
     local_genesis_dir: &str,
@@ -323,7 +376,7 @@ async fn fund_runtime_keys_local(
 
     let shield_anchor = fetch_orchard_anchor(&client).await?;
     let shield_target_height = current_height.saturating_add(10);
-    let (shield_txid, shield_pending) = build_and_send_shielding_tx(
+    let shield_submitted = build_and_send_shielding_tx(
         &client,
         &treasury_key,
         &treasury_orchard_keys,
@@ -336,10 +389,13 @@ async fn fund_runtime_keys_local(
             value: shield_value,
         }],
         shield_anchor,
+        current_height,
         shield_target_height,
         PendingTxKind::WarmupShielding,
     )
     .await?;
+    let shield_txid = shield_submitted.txid;
+    let shield_pending = shield_submitted.pending;
     println!(
         "[fund-runtime-keys] submitted treasury shielding transaction {} ({} zats)",
         shield_txid, shield_value
@@ -355,6 +411,7 @@ async fn fund_runtime_keys_local(
 
     let orchard_runtime = OrchardBlastRuntimeConfig::from_parts(
         OrchardTxblastConfig::default(),
+        None,
         None,
         None,
         None,
@@ -670,18 +727,21 @@ async fn verify_runtime_funding_local(
     let expected_funding_txid = expected_funding_txid
         .map(ToOwned::to_owned)
         .or_else(|| observed_funding_txid.clone());
+    let expected_funding_utxo_observed =
+        expected_funding_txid.is_some() && recipient_state.spendable_non_coinbase_utxo_count > 0;
     let funding_tx = if let Some(txid) = expected_funding_txid.as_deref() {
         client.try_get_raw_transaction_verbose(txid).await?
     } else {
         None
     };
-    let funding_tx_visible = funding_tx.is_some();
+    let funding_tx_visible = funding_tx.is_some() || expected_funding_utxo_observed;
     let funding_tx_confirmations = funding_tx.as_ref().and_then(|tx| tx.confirmations);
     let funding_tx_confirmed = funding_tx_confirmations.is_some_and(|value| value > 0)
         && funding_tx
             .as_ref()
             .and_then(|tx| tx.blockhash.as_ref())
-            .is_some();
+            .is_some()
+        || expected_funding_utxo_observed;
     let funding_tx_blockhash = funding_tx.and_then(|tx| tx.blockhash);
 
     let ready = recipient_state.spendable_non_coinbase_utxo_count > 0
@@ -761,6 +821,7 @@ async fn verify_network_runtime_funding(
 ) -> Result<RuntimeFundingVerificationReport> {
     let operator_status =
         query_runtime_funding_node(operator, ssh_key, minimum_recipient_zats, None).await?;
+    let expected_best_height = operator_status.status.best_height;
     let expected_funding_txid = operator_status
         .status
         .observed_funding_txid
@@ -783,8 +844,11 @@ async fn verify_network_runtime_funding(
 
     for node in &mut nodes {
         if node.status.ready
-            && expected_best_block_hash.is_some()
-            && node.status.best_block_hash != expected_best_block_hash
+            && node_is_best_chain_diverged(
+                expected_best_height,
+                expected_best_block_hash.as_deref(),
+                &node.status,
+            )
         {
             node.status.ready = false;
             node.status.stall_reason = Some("best_chain_diverged".to_owned());
@@ -832,6 +896,23 @@ async fn query_runtime_funding_node(
 
 fn runtime_funding_verification_ready(report: &RuntimeFundingVerificationReport) -> bool {
     report.nodes.iter().all(|node| node.status.ready)
+}
+
+fn node_is_best_chain_diverged(
+    expected_best_height: Option<u32>,
+    expected_best_block_hash: Option<&str>,
+    status: &RuntimeFundingLocalStatus,
+) -> bool {
+    matches!(
+        (
+            expected_best_height,
+            expected_best_block_hash,
+            status.best_height,
+            status.best_block_hash.as_deref(),
+        ),
+        (Some(expected_height), Some(expected_hash), Some(node_height), Some(node_hash))
+            if node_height == expected_height && node_hash != expected_hash
+    )
 }
 
 fn print_runtime_funding_verification(report: &RuntimeFundingVerificationReport) {
@@ -899,6 +980,7 @@ fn print_runtime_funding_local_status(status: &RuntimeFundingLocalStatus) {
 fn minimum_recipient_zats(config: &Config) -> Result<u64> {
     let runtime = OrchardBlastRuntimeConfig::from_parts(
         config.orchard_txblast.clone(),
+        None,
         None,
         None,
         None,
@@ -1051,4 +1133,71 @@ async fn is_coinbase_transaction(
     let is_coinbase = tx.vin.first().is_some_and(|vin| vin.coinbase.is_some());
     coinbase_cache.insert(txid.to_owned(), is_coinbase);
     Ok(is_coinbase)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn does_not_flag_best_chain_divergence_when_node_is_ahead() {
+        let status = RuntimeFundingLocalStatus {
+            node: "miner-1".to_owned(),
+            funded_key_name: "miner-1".to_owned(),
+            funded_address: "tmTest".to_owned(),
+            minimum_recipient_zats: 1,
+            best_height: Some(312),
+            best_block_hash: Some("hash-312".to_owned()),
+            observed_funding_txid: Some("funding".to_owned()),
+            expected_funding_txid: Some("funding".to_owned()),
+            funding_tx_visible: true,
+            funding_tx_confirmed: true,
+            funding_tx_confirmations: Some(1),
+            funding_tx_blockhash: Some("funding-block".to_owned()),
+            spendable_non_coinbase_utxo_count: 1,
+            spendable_non_coinbase_balance_zats: 10,
+            immature_coinbase_utxo_count: 0,
+            immature_coinbase_balance_zats: 0,
+            ready: true,
+            stall_reason: None,
+            error: None,
+        };
+
+        assert!(!node_is_best_chain_diverged(
+            Some(311),
+            Some("hash-311"),
+            &status
+        ));
+    }
+
+    #[test]
+    fn flags_best_chain_divergence_when_same_height_hash_differs() {
+        let status = RuntimeFundingLocalStatus {
+            node: "miner-1".to_owned(),
+            funded_key_name: "miner-1".to_owned(),
+            funded_address: "tmTest".to_owned(),
+            minimum_recipient_zats: 1,
+            best_height: Some(311),
+            best_block_hash: Some("different-hash".to_owned()),
+            observed_funding_txid: Some("funding".to_owned()),
+            expected_funding_txid: Some("funding".to_owned()),
+            funding_tx_visible: true,
+            funding_tx_confirmed: true,
+            funding_tx_confirmations: Some(1),
+            funding_tx_blockhash: Some("funding-block".to_owned()),
+            spendable_non_coinbase_utxo_count: 1,
+            spendable_non_coinbase_balance_zats: 10,
+            immature_coinbase_utxo_count: 0,
+            immature_coinbase_balance_zats: 0,
+            ready: true,
+            stall_reason: None,
+            error: None,
+        };
+
+        assert!(node_is_best_chain_diverged(
+            Some(311),
+            Some("hash-311"),
+            &status
+        ));
+    }
 }

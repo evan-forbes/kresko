@@ -1,7 +1,10 @@
-mod bootstrap;
 mod cloud;
 mod commands;
 mod config;
+mod pow_sim;
+mod pow_tuning;
+mod premine;
+mod run_manifest;
 mod s3;
 mod ssh;
 mod tmux;
@@ -49,6 +52,10 @@ enum Commands {
         /// Target block time in seconds (default: 75, post-Blossom)
         #[arg(long)]
         block_time: Option<u32>,
+
+        /// Optional shared env file to seed the generated experiment .env
+        #[arg(long)]
+        env_source: Option<String>,
     },
 
     /// Add nodes to the experiment config
@@ -65,6 +72,10 @@ enum Commands {
         #[arg(long)]
         provider: Option<String>,
 
+        /// Use a low-resource instance size (for proving small nodes can keep up)
+        #[arg(long, default_value = "false")]
+        low_resource: bool,
+
         /// Region (or "random")
         #[arg(long, default_value = "random")]
         region: String,
@@ -77,7 +88,7 @@ enum Commands {
     /// Spin up cloud instances
     Up {
         /// Number of parallel workers
-        #[arg(long, default_value = "4")]
+        #[arg(short = 'w', long, default_value = "4")]
         workers: usize,
 
         /// Path to SSH public key
@@ -87,6 +98,17 @@ enum Commands {
         /// SSH key name in cloud provider
         #[arg(long)]
         ssh_key_name: Option<String>,
+
+        /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
+    /// Sync instance IPs from cloud provider state back into config.json
+    SyncIps {
+        /// Refresh already-populated IP fields instead of only filling missing values
+        #[arg(long, default_value_t = false)]
+        overwrite: bool,
 
         /// Experiment directory
         #[arg(short = 'd', long, default_value = ".")]
@@ -107,13 +129,11 @@ enum Commands {
         #[arg(long, default_value = "build")]
         build_dir: String,
 
-        /// Extra empty local-genesis blocks to seed after funding blocks so premine outputs mature
+        /// Extra empty local-genesis blocks to seed after funding blocks so premine outputs mature.
+        /// Only used by the non-PoW genesis path; the PoW path uses the cached premine bundle's
+        /// own fixed padding (see `src/premine.rs::MATURITY_PADDING_BLOCKS`).
         #[arg(long, default_value_t = 125)]
         maturity_padding_blocks: u32,
-
-        /// Bootstrap mode: auto (cached for PoW, generated otherwise), generated, or cached
-        #[arg(long, default_value = "auto")]
-        bootstrap_mode: String,
 
         /// Initial Orchard lanes to create per miner during shielded txblast warmup
         #[arg(long, default_value_t = 384)]
@@ -131,9 +151,84 @@ enum Commands {
         #[arg(long, default_value_t = 4)]
         orchard_fanout_outputs: usize,
 
+        /// Directory whose contents are baked into the payload under `scripts/`.
+        /// Resolved relative to the experiment directory unless absolute.
+        #[arg(long, default_value = "scripts")]
+        scripts_dir: String,
+
+        /// Fractional adjustment to the natural calibrated target.
+        /// `+0.10` = ~10% looser target (faster initial blocks); `-0.10` =
+        /// ~10% tighter. Leave at 0 unless observed block times on your
+        /// fleet need a nudge. Only applied when `mining_mode = pow` AND
+        /// the cache misses (the hit path doesn't recalibrate).
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        pow_adjust: f64,
+
+        /// Premine cache entry to load (directory under `bootstrap/cache/`).
+        /// On HIT, the slow Equihash benchmark + calibration is skipped
+        /// entirely — every parameter is read from the entry's manifest.
+        /// On MISS, kresko prints a loud warning and falls back to
+        /// benchmarking + mining a fresh premine, storing the result under
+        /// this same key so subsequent runs hit. The default key encodes
+        /// `<block_time_secs>-<funded_key_count>` of the canonical premine
+        /// bundle that ships with the repo.
+        #[arg(long, default_value_t = premine::DEFAULT_CACHE_KEY.to_string())]
+        premine_cache_key: String,
+
         /// Experiment directory
         #[arg(short = 'd', long, default_value = ".")]
         directory: String,
+    },
+
+    /// Resolve (or generate) the premine cache entry for a calibration.
+    ///
+    /// Use this to warm the cache ahead of an experiment so the slow Equihash
+    /// mining step is paid down before launch. The command:
+    ///
+    ///   1. Benchmarks Equihash sol/s on this machine (single-threaded).
+    ///   2. Divides by a conservative discount (4×) to estimate fleet sol/s.
+    ///   3. Calibrates a target_difficulty_limit from
+    ///      `(mining_cpus, block_time_secs, assumed_fleet_sol_per_sec)`.
+    ///   4. Resolves the matching cache entry, mining a fresh premine if missing.
+    ///
+    /// `kresko genesis` runs the same algorithm, so the entry warmed here will
+    /// be a cache hit when genesis fires with matching `--mining-cpus` and
+    /// `block_time_secs` (assuming similar local sol/s — different operator
+    /// machines may compute slightly different targets).
+    ///
+    /// A new cache entry is generated whenever the inputs above produce a
+    /// different target_difficulty_limit or block_time_secs. Tighter targets
+    /// (more miners, faster spacing) cost proportionally more mining time on
+    /// first generation.
+    Premine {
+        /// Total mining CPUs in the experiment fleet (one Equihash thread per
+        /// CPU). The calibrated target scales inversely with this count.
+        #[arg(long)]
+        mining_cpus: usize,
+
+        /// Target block spacing in seconds (post-Blossom). Must match the
+        /// experiment's `block_time_secs` config value.
+        #[arg(long)]
+        block_time_secs: u32,
+
+        /// Fractional adjustment to the natural calibrated target. `+0.10` =
+        /// ~10% looser target (faster initial blocks); `-0.10` = ~10% tighter.
+        /// Mirror of `kresko genesis --pow-adjust`. Leave at 0 unless
+        /// observed block times need a nudge.
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        pow_adjust: f64,
+
+        /// Override the cache root directory. Defaults to the repo-local
+        /// `bootstrap/cache/` (gitignored).
+        #[arg(long)]
+        cache_dir: Option<std::path::PathBuf>,
+
+        /// Number of OS threads to run the Equihash solver in parallel. Each
+        /// thread searches a disjoint nonce partition; the first to find a
+        /// valid solution wins. Default auto-detects available CPUs and caps
+        /// at 8 (Equihash uses ~144 MB per thread).
+        #[arg(long)]
+        solver_threads: Option<usize>,
     },
 
     /// Deploy payload to cloud instances and start nodes
@@ -142,17 +237,25 @@ enum Commands {
         #[arg(long)]
         ssh_key_path: Option<String>,
 
-        /// Upload payload directly via SCP instead of S3
-        #[arg(long)]
-        direct_payload_upload: bool,
+        /// Comma-separated miner indices, "all", or wildcard patterns
+        #[arg(short = 'n', long, default_value = "all")]
+        nodes: String,
 
         /// Number of parallel workers
-        #[arg(long, default_value = "4")]
+        #[arg(short = 'w', long, default_value = "4")]
         workers: usize,
 
         /// Continue even if some miners fail
         #[arg(long)]
         ignore_failed_miners: bool,
+
+        /// Reuse an existing healthy `app` tmux session instead of failing.
+        #[arg(long, default_value_t = false)]
+        reuse_app_session: bool,
+
+        /// Kill any existing `app` tmux session before starting the payload.
+        #[arg(long, default_value_t = false, conflicts_with = "reuse_app_session")]
+        restart_app_session: bool,
 
         /// Experiment directory
         #[arg(short = 'd', long, default_value = ".")]
@@ -164,6 +267,18 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Aggregate node heights into a compact summary
+        #[arg(long, default_value_t = false)]
+        summary: bool,
+
+        /// Include SSH / tmux / loopback RPC diagnostics
+        #[arg(long, default_value_t = false)]
+        deep: bool,
+
+        /// Path to SSH private key for deep status checks
+        #[arg(long)]
+        ssh_key_path: Option<String>,
 
         /// Experiment directory
         #[arg(short = 'd', long, default_value = ".")]
@@ -189,6 +304,17 @@ enum Commands {
         directory: String,
     },
 
+    /// Remove instances with public_ip="TBD" (failed provisioning) from config
+    Prune {
+        /// Print what would be removed without modifying config
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
     /// Progress chain by generating blocks on miner RPC endpoints
     Progress {
         /// Block interval in seconds
@@ -203,6 +329,10 @@ enum Commands {
         #[arg(short = 'c', long, default_value = "1")]
         concurrent: usize,
 
+        /// Subdirectory under data/ for progress.log.jsonl
+        #[arg(long)]
+        data_subdir: Option<String>,
+
         /// Experiment directory
         #[arg(short = 'd', long, default_value = ".")]
         directory: String,
@@ -213,10 +343,6 @@ enum Commands {
         /// Comma-separated instance indices or "all"
         #[arg(short = 'i', long, default_value = "all")]
         instances: String,
-
-        /// Transaction type: transparent, shielded, or both
-        #[arg(long, default_value = "transparent")]
-        tx_type: String,
 
         /// Transactions per second
         #[arg(long, default_value = "10")]
@@ -242,13 +368,21 @@ enum Commands {
         #[arg(long)]
         orchard_fanout_max_in_flight: Option<usize>,
 
+        /// Number of parallel Orchard proving workers
+        #[arg(long)]
+        orchard_proving_workers: Option<usize>,
+
         /// Orchard progress log interval in seconds
         #[arg(long)]
         orchard_progress_interval_secs: Option<u64>,
 
-        /// Enable txblast JSONL tracing on remote nodes
+        /// Deprecated no-op: txblast tracing is always enabled. Retained for script compatibility.
         #[arg(long)]
         trace_enable: bool,
+
+        /// Skip runtime funding preflight and start txblast immediately
+        #[arg(long)]
+        skip_funding: bool,
 
         /// Trace directory for txblast JSONL files on remote nodes
         #[arg(long)]
@@ -296,6 +430,56 @@ enum Commands {
         rpc_endpoint: String,
     },
 
+    /// Monte Carlo-simulate PoW block production for calibration validation
+    /// without spinning up a network. Useful for checking whether a given
+    /// miner count / target spacing / profile combination produces stable
+    /// block times and a tolerable orphan rate.
+    PowSimulate {
+        /// Number of single-thread miners to simulate.
+        #[arg(long)]
+        miners: usize,
+
+        /// Per-thread Equihash (200, 9) solutions per second. Run with
+        /// `kresko genesis --pow-profile=... -d <dir>` on a representative
+        /// host to measure this, or use a value from the CPU-class table.
+        #[arg(long)]
+        sol_per_sec: f64,
+
+        /// Target block spacing in seconds.
+        #[arg(long, default_value_t = 75)]
+        target_spacing: u32,
+
+        /// Number of canonical blocks to simulate.
+        #[arg(long, default_value_t = 1000)]
+        blocks: u32,
+
+        /// Mean inter-miner block-propagation delay (seconds). Used for
+        /// orphan-rate accounting.
+        #[arg(long, default_value_t = 2.0)]
+        propagation_delay: f64,
+
+        /// DAA round-tuning preset.
+        #[arg(long, default_value = "mainnet")]
+        pow_profile: String,
+
+        /// Headroom bits used during calibration (see `kresko genesis`).
+        #[arg(long, default_value_t = 0)]
+        pow_headroom_bits: u8,
+
+        /// Explicit hex target_difficulty_limit (64 chars, big-endian, no
+        /// `0x` prefix). When set, skips calibration and uses this directly.
+        #[arg(long)]
+        target_difficulty_limit: Option<String>,
+
+        /// RNG seed for reproducible runs.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+
+        /// Optional path to write a per-block CSV.
+        #[arg(long)]
+        csv: Option<String>,
+    },
+
     /// Start PoW mining on remote nodes
     StartMiners {
         /// Comma-separated instance indices or "all"
@@ -312,10 +496,6 @@ enum Commands {
         /// RPC endpoint
         #[arg(long, default_value = "http://localhost:18232")]
         rpc_endpoint: String,
-
-        /// Transaction type: transparent, shielded, or both
-        #[arg(long, default_value = "transparent")]
-        tx_type: String,
 
         /// Transactions per second
         #[arg(long, default_value = "10")]
@@ -357,13 +537,21 @@ enum Commands {
         #[arg(long)]
         orchard_fanout_max_in_flight: Option<usize>,
 
+        /// Number of parallel Orchard proving workers
+        #[arg(long)]
+        orchard_proving_workers: Option<usize>,
+
         /// Orchard progress log interval in seconds
         #[arg(long)]
         orchard_progress_interval_secs: Option<u64>,
 
-        /// Enable txblast JSONL tracing
+        /// Deprecated no-op: txblast tracing is always enabled. Retained for script compatibility.
         #[arg(long)]
         trace_enable: bool,
+
+        /// Skip cached runtime funding verification and refresh before startup
+        #[arg(long)]
+        skip_funding: bool,
 
         /// Trace directory for txblast JSONL files
         #[arg(long)]
@@ -439,6 +627,76 @@ enum Commands {
         directory: String,
     },
 
+    /// Execute a queue of run manifests back-to-back, with optional resume.
+    Queue {
+        /// Path to queue.toml file.
+        #[arg(short = 'f', long)]
+        file: String,
+
+        /// Resume from .kresko-queue-state.json if present.
+        #[arg(long, default_value = "false")]
+        resume: bool,
+
+        /// Stop the queue on a catastrophic failure (per-node init failures
+        /// never halt the queue).
+        #[arg(long, default_value = "false")]
+        halt_on_failure: bool,
+
+        /// Number of parallel workers
+        #[arg(short = 'w', long, default_value = "8")]
+        workers: usize,
+
+        /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
+    /// Execute a single run manifest (init_script -> wait -> stop -> collect).
+    Run {
+        /// Path to the run manifest TOML file.
+        #[arg(short = 'f', long)]
+        manifest: String,
+
+        /// Number of parallel workers
+        #[arg(short = 'w', long, default_value = "8")]
+        workers: usize,
+
+        /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
+    /// Upload and run a script on miners, or execute an inline command.
+    Exec {
+        /// Local script file to upload and run.
+        #[arg(short = 'f', long, conflicts_with = "command")]
+        file: Option<String>,
+
+        /// Inline command (runs as bash -c "<command>").
+        #[arg(short = 'c', long, conflicts_with = "file")]
+        command: Option<String>,
+
+        /// Only re-run on nodes that failed the last exec in this directory.
+        #[arg(long, default_value = "false")]
+        on_failed: bool,
+
+        /// After all nodes finish, print each node's captured stdout/stderr.
+        #[arg(long, default_value = "false")]
+        with_output: bool,
+
+        /// Comma-separated miner indices, "all", or wildcard patterns.
+        #[arg(short = 'm', long, default_value = "all")]
+        miners: String,
+
+        /// Number of parallel workers
+        #[arg(short = 'w', long, default_value = "8")]
+        workers: usize,
+
+        /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
     /// Download logs and data from remote nodes
     Download {
         #[command(subcommand)]
@@ -449,12 +707,39 @@ enum Commands {
         nodes: String,
 
         /// Number of parallel workers
-        #[arg(long, default_value = "4")]
+        #[arg(short = 'w', long, default_value = "4")]
         workers: usize,
 
         /// Skip remote compression before download
         #[arg(long)]
         no_compress: bool,
+
+        /// Subdirectory under data/ for downloaded artifacts
+        #[arg(long)]
+        data_subdir: Option<String>,
+
+        /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
+    /// Download the standard artifact set: logs, heights, and traces
+    Collect {
+        /// Node name pattern (or "all")
+        #[arg(short = 'n', long, default_value = "all")]
+        nodes: String,
+
+        /// Number of parallel workers
+        #[arg(short = 'w', long, default_value = "4")]
+        workers: usize,
+
+        /// `all` downloads every file from discovered trace directories; otherwise pass a comma-separated table list
+        #[arg(long, default_value = "all")]
+        trace_tables: String,
+
+        /// Subdirectory under data/ for downloaded artifacts
+        #[arg(long)]
+        data_subdir: Option<String>,
 
         /// Experiment directory
         #[arg(short = 'd', long, default_value = ".")]
@@ -475,7 +760,7 @@ enum Commands {
         miners: String,
 
         /// Number of parallel workers
-        #[arg(long, default_value = "4")]
+        #[arg(short = 'w', long, default_value = "4")]
         workers: usize,
 
         /// Experiment directory
@@ -490,10 +775,39 @@ enum Commands {
         all: bool,
 
         /// Number of parallel workers
-        #[arg(long, default_value = "4")]
+        #[arg(short = 'w', long, default_value = "4")]
         workers: usize,
 
+        /// Return after delete requests are sent without polling for provider cleanup
+        #[arg(long, default_value_t = false)]
+        no_wait: bool,
+
+        /// Maximum time to wait for provider-side deletion confirmation
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+
         /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
+    /// Force-destroy every kresko-managed cloud instance across all experiments.
+    /// Only touches provider-wide kresko markers:
+    /// DigitalOcean tag `kresko`, GCP label `kresko=true`, Linode group/tag `kresko`.
+    ForceDown {
+        /// Number of parallel workers
+        #[arg(short = 'w', long, default_value = "4")]
+        workers: usize,
+
+        /// Return after delete requests are sent without polling for provider cleanup
+        #[arg(long, default_value_t = false)]
+        no_wait: bool,
+
+        /// Maximum time to wait for provider-side deletion confirmation
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+
+        /// Directory used to discover `.env` credentials
         #[arg(short = 'd', long, default_value = ".")]
         directory: String,
     },
@@ -503,13 +817,17 @@ enum Commands {
 enum DownloadTarget {
     /// Download block height/time/size traces via node RPC and store JSONL locally
     Heights {
-        /// Number of active nodes to download from
-        #[arg(short = 'n', long = "nodes", default_value_t = 1)]
-        node_count: usize,
+        /// Number of heights to request from a node at a time before checking for failures
+        #[arg(long)]
+        batch_size: Option<usize>,
+
+        /// Ignore existing heights.jsonl and redownload every height from scratch
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
-    /// Download selected structured trace JSONL tables from remote nodes
+    /// Download every file from remote trace directories, or a selected trace table subset
     Traces {
-        /// Comma-separated trace tables: all, peer_message, trace_dropped, txblast_event, txblast_registry, txblast_note, txblast_trace_dropped
+        /// `all` downloads every file from discovered trace directories; otherwise pass a comma-separated table list
         #[arg(long, default_value = "all")]
         tables: String,
     },
@@ -522,24 +840,33 @@ impl Commands {
             | Commands::TxblastLocal { .. }
             | Commands::FundRuntimeKeysLocal { .. }
             | Commands::TxblastStatusLocal { .. }
-            | Commands::Mine { .. } => None,
+            | Commands::Mine { .. }
+            | Commands::PowSimulate { .. }
+            | Commands::Premine { .. } => None,
             Commands::Add { directory, .. }
             | Commands::Up { directory, .. }
+            | Commands::SyncIps { directory, .. }
             | Commands::Genesis { directory, .. }
             | Commands::Deploy { directory, .. }
             | Commands::Status { directory, .. }
             | Commands::Check { directory, .. }
             | Commands::List { directory }
+            | Commands::Prune { directory, .. }
             | Commands::Progress { directory, .. }
             | Commands::StartMiners { directory, .. }
             | Commands::FundRuntimeKeys { directory }
             | Commands::Txblast { directory, .. }
             | Commands::TxblastStatus { directory, .. }
             | Commands::KillSession { directory, .. }
+            | Commands::Queue { directory, .. }
+            | Commands::Run { directory, .. }
+            | Commands::Exec { directory, .. }
             | Commands::Download { directory, .. }
+            | Commands::Collect { directory, .. }
             | Commands::UploadData { directory }
             | Commands::Reset { directory, .. }
-            | Commands::Down { directory, .. } => Some(directory),
+            | Commands::Down { directory, .. }
+            | Commands::ForceDown { directory, .. } => Some(directory),
         }
     }
 }
@@ -551,11 +878,35 @@ async fn main() -> Result<()> {
     // Load .env files with override so they always win over shell env vars.
     // Priority (lowest → highest): CWD, ancestor of experiment dir, experiment dir.
     let _ = dotenvy::dotenv_override();
-    if let Some(dir) = cli.command.directory() {
-        // Walk up from the experiment directory's parent looking for a shared .env.
-        // This lets users place credentials in a parent directory shared across experiments.
-        if let Some(parent) = std::path::Path::new(dir).canonicalize().ok() {
-            let mut ancestor = parent.parent().map(|p| p.to_path_buf());
+    let (env_anchor, anchor_exists) = match cli.command.directory() {
+        Some(dir) => (Some(dir.to_string()), true),
+        None => match &cli.command {
+            // For Init, the experiment directory doesn't exist yet; anchor on its
+            // would-be parent so a shared parent .env still gets picked up.
+            Commands::Init { experiment, .. } => (Some(experiment.clone()), false),
+            _ => (None, false),
+        },
+    };
+    if let Some(dir) = env_anchor.as_deref() {
+        // Determine the directory from which to start walking up for a shared .env.
+        // For existing experiments, that's the experiment dir's parent.
+        // For Init, the experiment dir doesn't exist, so we start from where it would
+        // be created (i.e., its parent's canonical path).
+        let anchor = std::path::Path::new(dir);
+        let start = if anchor_exists {
+            anchor
+                .canonicalize()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        } else {
+            anchor
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .and_then(|p| p.canonicalize().ok())
+                .or_else(|| std::env::current_dir().ok())
+        };
+        if let Some(start) = start {
+            let mut ancestor = Some(start);
             while let Some(dir) = ancestor {
                 let env_path = dir.join(".env");
                 if env_path.is_file() {
@@ -565,7 +916,7 @@ async fn main() -> Result<()> {
                 ancestor = dir.parent().map(|p| p.to_path_buf());
             }
         }
-        // Experiment directory .env wins over everything.
+        // Experiment directory .env wins over everything (no-op for Init).
         let env_path = std::path::Path::new(dir).join(".env");
         let _ = dotenvy::from_path_override(&env_path);
     }
@@ -579,6 +930,7 @@ async fn main() -> Result<()> {
             ssh_key_name,
             mining_mode,
             block_time,
+            env_source,
         } => {
             let mining_mode: config::MiningMode = mining_mode.parse()?;
             commands::init::run(
@@ -589,16 +941,26 @@ async fn main() -> Result<()> {
                 ssh_key_name,
                 mining_mode,
                 block_time,
+                env_source.as_deref(),
             )?;
         }
         Commands::Add {
             node_type,
             count,
             provider,
+            low_resource,
             region,
             directory,
         } => {
-            commands::add::run(&node_type, count, provider.as_deref(), &region, &directory)?;
+            commands::add::run(
+                &node_type,
+                count,
+                provider.as_deref(),
+                &region,
+                &directory,
+                low_resource,
+            )
+            .await?;
         }
         Commands::Up {
             workers,
@@ -608,49 +970,87 @@ async fn main() -> Result<()> {
         } => {
             commands::up::run(workers, ssh_pub_key_path, ssh_key_name, &directory).await?;
         }
+        Commands::SyncIps {
+            overwrite,
+            directory,
+        } => {
+            commands::sync_ips::run(&directory, overwrite).await?;
+        }
         Commands::Genesis {
             zebrad_binary,
             kresko_binary,
             build_dir,
             maturity_padding_blocks,
-            bootstrap_mode,
             orchard_lanes_per_miner,
             orchard_lane_value_zats,
             orchard_fanout_source_value_zats,
             orchard_fanout_outputs,
+            scripts_dir,
+            pow_adjust,
+            premine_cache_key,
             directory,
         } => {
+            let pow_calibration = commands::genesis::PowCalibrationCli {
+                adjust_fraction: pow_adjust,
+            };
             commands::genesis::run(
                 &zebrad_binary,
                 kresko_binary.as_deref(),
                 &build_dir,
                 maturity_padding_blocks,
-                &bootstrap_mode,
                 orchard_lanes_per_miner,
                 orchard_lane_value_zats,
                 orchard_fanout_source_value_zats,
                 orchard_fanout_outputs,
+                &scripts_dir,
+                pow_calibration,
+                &premine_cache_key,
                 &directory,
+            )?;
+        }
+        Commands::Premine {
+            mining_cpus,
+            block_time_secs,
+            pow_adjust,
+            cache_dir,
+            solver_threads,
+        } => {
+            commands::premine::run(
+                mining_cpus,
+                block_time_secs,
+                pow_adjust,
+                cache_dir,
+                solver_threads,
             )?;
         }
         Commands::Deploy {
             ssh_key_path,
-            direct_payload_upload,
+            nodes,
             workers,
             ignore_failed_miners,
+            reuse_app_session,
+            restart_app_session,
             directory,
         } => {
             commands::deploy::run(
                 ssh_key_path.as_deref(),
-                direct_payload_upload,
+                &nodes,
                 workers,
                 ignore_failed_miners,
+                reuse_app_session,
+                restart_app_session,
                 &directory,
             )
             .await?;
         }
-        Commands::Status { json, directory } => {
-            commands::status::run(json, &directory).await?;
+        Commands::Status {
+            json,
+            summary,
+            deep,
+            ssh_key_path,
+            directory,
+        } => {
+            commands::status::run(json, summary, deep, ssh_key_path.as_deref(), &directory).await?;
         }
         Commands::Check { json, directory } => {
             commands::check::run(json, &directory).await?;
@@ -658,16 +1058,53 @@ async fn main() -> Result<()> {
         Commands::List { directory } => {
             commands::list::run(&directory).await?;
         }
+        Commands::Prune { dry_run, directory } => {
+            commands::prune::run(&directory, dry_run).await?;
+        }
         Commands::Progress {
             block_time,
             random,
             concurrent,
+            data_subdir,
             directory,
         } => {
-            commands::progress::run(block_time, random, concurrent, &directory).await?;
+            commands::progress::run(
+                block_time,
+                random,
+                concurrent,
+                &directory,
+                data_subdir.as_deref(),
+            )
+            .await?;
         }
         Commands::Mine { rpc_endpoint } => {
             commands::mine::run(&rpc_endpoint).await?;
+        }
+        Commands::PowSimulate {
+            miners,
+            sol_per_sec,
+            target_spacing,
+            blocks,
+            propagation_delay,
+            pow_profile,
+            pow_headroom_bits,
+            target_difficulty_limit,
+            seed,
+            csv,
+        } => {
+            let cli = pow_sim::PowSimulateCli {
+                num_miners: miners,
+                sol_per_sec_per_thread: sol_per_sec,
+                target_spacing_secs: target_spacing,
+                blocks,
+                propagation_delay_secs: propagation_delay,
+                pow_profile: pow_profile.parse()?,
+                headroom_bits: pow_headroom_bits,
+                target_difficulty_limit_hex: target_difficulty_limit,
+                seed,
+                csv_path: csv,
+            };
+            pow_sim::run(cli)?;
         }
         Commands::StartMiners {
             instances,
@@ -680,30 +1117,30 @@ async fn main() -> Result<()> {
         }
         Commands::Txblast {
             instances,
-            tx_type,
             rate,
             amount,
             orchard_max_in_flight,
             orchard_target_ready_lanes,
             orchard_lane_low_watermark,
             orchard_fanout_max_in_flight,
+            orchard_proving_workers,
             orchard_progress_interval_secs,
-            trace_enable,
+            trace_enable: _,
+            skip_funding,
             trace_dir,
             directory,
         } => {
-            let tx_type: config::TxType = tx_type.parse()?;
             commands::txblast::run(
                 &instances,
-                tx_type,
                 rate,
                 amount,
                 orchard_max_in_flight,
                 orchard_target_ready_lanes,
                 orchard_lane_low_watermark,
                 orchard_fanout_max_in_flight,
+                orchard_proving_workers,
                 orchard_progress_interval_secs,
-                trace_enable,
+                skip_funding,
                 trace_dir.as_deref(),
                 &directory,
             )
@@ -721,7 +1158,6 @@ async fn main() -> Result<()> {
         }
         Commands::TxblastLocal {
             rpc_endpoint,
-            tx_type,
             rate,
             amount,
             orchard_lanes_per_miner,
@@ -732,16 +1168,16 @@ async fn main() -> Result<()> {
             orchard_target_ready_lanes,
             orchard_lane_low_watermark,
             orchard_fanout_max_in_flight,
+            orchard_proving_workers,
             orchard_progress_interval_secs,
-            trace_enable,
+            trace_enable: _,
+            skip_funding,
             trace_dir,
             funded_key_path,
             expected_runtime_funding_txid,
         } => {
-            let tx_type: config::TxType = tx_type.parse()?;
             txblast::run_local(
                 &rpc_endpoint,
-                tx_type,
                 rate,
                 amount,
                 orchard_lanes_per_miner,
@@ -752,8 +1188,9 @@ async fn main() -> Result<()> {
                 orchard_target_ready_lanes,
                 orchard_lane_low_watermark,
                 orchard_fanout_max_in_flight,
+                orchard_proving_workers,
                 orchard_progress_interval_secs,
-                trace_enable,
+                skip_funding,
                 trace_dir.as_deref(),
                 funded_key_path.as_deref(),
                 expected_runtime_funding_txid.as_deref(),
@@ -794,23 +1231,84 @@ async fn main() -> Result<()> {
         } => {
             commands::kill_session::run(&session, timeout, &directory).await?;
         }
+        Commands::Run {
+            manifest,
+            workers,
+            directory,
+        } => {
+            commands::run::run(&manifest, workers, &directory).await?;
+        }
+        Commands::Queue {
+            file,
+            resume,
+            halt_on_failure,
+            workers,
+            directory,
+        } => {
+            commands::queue::run_queue(&file, workers, &directory, resume, halt_on_failure).await?;
+        }
+        Commands::Exec {
+            file,
+            command,
+            on_failed,
+            with_output,
+            miners,
+            workers,
+            directory,
+        } => {
+            let target = match (file, command) {
+                (Some(path), None) => commands::exec::ExecTarget::LocalFile(path.into()),
+                (None, Some(cmd)) => commands::exec::ExecTarget::InlineCommand(cmd),
+                (None, None) => {
+                    anyhow::bail!("must provide one of --file or --command");
+                }
+                (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
+            };
+            commands::exec::run(&miners, workers, &directory, target, on_failed, with_output)
+                .await?;
+        }
         Commands::Download {
             target,
             nodes,
             workers,
             no_compress,
+            data_subdir,
             directory,
-        } => match target {
-            Some(DownloadTarget::Heights { node_count }) => {
-                commands::download_heights::run(node_count, workers, &directory).await?;
+        } => {
+            let subdir = data_subdir.as_deref();
+            match target {
+                Some(DownloadTarget::Heights { batch_size, force }) => {
+                    commands::download_heights::run(
+                        &nodes, workers, batch_size, force, &directory, subdir,
+                    )
+                    .await?;
+                }
+                Some(DownloadTarget::Traces { tables }) => {
+                    commands::download::run_traces(&nodes, workers, &tables, &directory, subdir)
+                        .await?;
+                }
+                None => {
+                    commands::download::run_logs(&nodes, workers, no_compress, &directory, subdir)
+                        .await?;
+                }
             }
-            Some(DownloadTarget::Traces { tables }) => {
-                commands::download::run_traces(&nodes, workers, &tables, &directory).await?;
-            }
-            None => {
-                commands::download::run_logs(&nodes, workers, no_compress, &directory).await?;
-            }
-        },
+        }
+        Commands::Collect {
+            nodes,
+            workers,
+            trace_tables,
+            data_subdir,
+            directory,
+        } => {
+            commands::collect::run(
+                &nodes,
+                workers,
+                &trace_tables,
+                &directory,
+                data_subdir.as_deref(),
+            )
+            .await?;
+        }
         Commands::UploadData { directory } => {
             commands::upload_data::run(&directory).await?;
         }
@@ -824,9 +1322,19 @@ async fn main() -> Result<()> {
         Commands::Down {
             all,
             workers,
+            no_wait,
+            timeout_secs,
             directory,
         } => {
-            commands::down::run(all, workers, &directory).await?;
+            commands::down::run(all, workers, !no_wait, timeout_secs, &directory).await?;
+        }
+        Commands::ForceDown {
+            workers,
+            no_wait,
+            timeout_secs,
+            directory,
+        } => {
+            commands::down::run_force(workers, !no_wait, timeout_secs, &directory).await?;
         }
     }
 

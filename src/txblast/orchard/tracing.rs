@@ -14,7 +14,10 @@ use crate::txblast::{OrchardBlastRuntimeConfig, TxblastTraceConfig};
 
 use super::{
     state::{LaneRegistry, RegistrySnapshot, TreasuryInventory, TreasurySnapshot},
-    types::{NoteRole, PendingTxCounts, PendingTxKind, RecoveredNote, RuntimePhase, TrackedNote},
+    types::{
+        NoteRole, PendingTraceSummary, PendingTxCounts, PendingTxKind, RecoveredNote, RuntimePhase,
+        TrackedNote,
+    },
 };
 
 const TRACE_ENABLE_ENV: &str = "KRESKO_TXBLAST_TRACE_ENABLE";
@@ -82,6 +85,16 @@ struct EventRecord {
     reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_class: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rpc_submit_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirm_delay_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirm_delay_blocks: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -111,6 +124,25 @@ struct RegistryRecord {
     lane_low_watermark: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_pending_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_pending_blocks: Option<u32>,
+    rpc_pending_unknown: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_unknown_pending_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_unknown_pending_blocks: Option<u32>,
+    rpc_pending_mempool: usize,
+    rpc_pending_confirmed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_mempool_pending_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_mempool_pending_blocks: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_confirmed_rpc_pending_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_confirmed_rpc_pending_blocks: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -167,6 +199,11 @@ pub(crate) struct EventContext<'a> {
     pub(crate) treasury: TreasurySnapshot,
     pub(crate) reason: Option<&'a str>,
     pub(crate) error: Option<String>,
+    pub(crate) error_class: Option<&'static str>,
+    pub(crate) build_duration_ms: Option<u64>,
+    pub(crate) rpc_submit_duration_ms: Option<u64>,
+    pub(crate) confirm_delay_ms: Option<u64>,
+    pub(crate) confirm_delay_blocks: Option<u32>,
 }
 
 impl OrchardTxblastTracer {
@@ -234,6 +271,11 @@ impl OrchardTxblastTracer {
             drained: event.registry.drained_notes,
             reason: event.reason.map(ToOwned::to_owned),
             error: event.error,
+            error_class: event.error_class,
+            build_duration_ms: event.build_duration_ms,
+            rpc_submit_duration_ms: event.rpc_submit_duration_ms,
+            confirm_delay_ms: event.confirm_delay_ms,
+            confirm_delay_blocks: event.confirm_delay_blocks,
         };
 
         self.emit_json(TXBLAST_EVENT_TABLE, TXBLAST_EVENT_FILE, &record);
@@ -247,6 +289,7 @@ impl OrchardTxblastTracer {
         registry: &LaneRegistry,
         treasury: &TreasuryInventory,
         pending: PendingTxCounts,
+        pending_trace: PendingTraceSummary,
         submit_credit: f64,
         cfg: &OrchardBlastRuntimeConfig,
         reason: Option<&str>,
@@ -279,6 +322,17 @@ impl OrchardTxblastTracer {
             target_ready_lanes: cfg.target_ready_lanes,
             lane_low_watermark: cfg.lane_low_watermark,
             reason: reason.map(ToOwned::to_owned),
+            oldest_pending_ms: pending_trace.oldest_pending_ms,
+            oldest_pending_blocks: pending_trace.oldest_pending_blocks,
+            rpc_pending_unknown: pending_trace.rpc_pending_unknown,
+            oldest_unknown_pending_ms: pending_trace.oldest_unknown_pending_ms,
+            oldest_unknown_pending_blocks: pending_trace.oldest_unknown_pending_blocks,
+            rpc_pending_mempool: pending_trace.rpc_pending_mempool,
+            rpc_pending_confirmed: pending_trace.rpc_pending_confirmed,
+            oldest_mempool_pending_ms: pending_trace.oldest_mempool_pending_ms,
+            oldest_mempool_pending_blocks: pending_trace.oldest_mempool_pending_blocks,
+            oldest_confirmed_rpc_pending_ms: pending_trace.oldest_confirmed_rpc_pending_ms,
+            oldest_confirmed_rpc_pending_blocks: pending_trace.oldest_confirmed_rpc_pending_blocks,
         };
 
         self.emit_json(TXBLAST_REGISTRY_TABLE, TXBLAST_REGISTRY_FILE, &record);

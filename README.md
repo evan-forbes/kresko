@@ -12,7 +12,7 @@ Kresko is an experimental Zcash bench for spinning up arbitrary numbers of geogr
 ## Current Scope
 
 - Node role: `miner`
-- Providers: `digitalocean`, `googlecloud`
+- Providers: `digitalocean`, `googlecloud`, `linode`
 - RPC-focused workflows: chain progress, status checks, transaction blasting, height trace collection
 - Data export: local `data/` plus optional S3 upload
 
@@ -23,11 +23,12 @@ Typical flow:
 1. `init` creates an experiment directory with config, scripts, and `.env`.
 2. `add` defines miners (count + region/provider).
 3. `up` creates cloud instances and records their IPs in `config.json`.
-4. `genesis` builds payload content (local genesis artifacts, per-node `zebrad.toml`, binaries).
-5. `deploy` ships payload and starts nodes via tmux session `app`.
-6. `status` / `progress` / `txblast` drive and observe network behavior.
-7. `download` / `download heights` / `upload-data` collect artifacts.
-8. `reset` / `down` clean up sessions, state, and instances.
+4. `sync-ips` reconstructs missing IPs in `config.json` from provider state when needed.
+5. `genesis` builds payload content (local genesis artifacts, per-node `zebrad.toml`, binaries).
+6. `deploy` ships payload and starts nodes via tmux session `app`.
+7. `status` / `progress` / `txblast` drive and observe network behavior.
+8. `download` / `download heights` / `upload-data` collect artifacts.
+9. `reset` / `down` clean up sessions, state, and instances.
 
 ## Prerequisites
 
@@ -39,6 +40,7 @@ Typical flow:
 - Cloud credentials:
   - DigitalOcean: `DIGITALOCEAN_TOKEN`
   - Google Cloud: `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_KEY_JSON_PATH`
+  - Linode: `LINODE_TOKEN`
 - SSH key pair available for instance access
 
 ## Install
@@ -66,11 +68,17 @@ cd exp-nyc-sfo
 
 # 2) Fill credentials in .env
 # Required: DIGITALOCEAN_TOKEN
-# Required for default deploy path: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_S3_BUCKET
-# (or use --direct-payload-upload on deploy to skip S3 payload distribution)
+# Required: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_S3_BUCKET
+# Optional: AWS_S3_ENDPOINT for Spaces-compatible providers
+# Payload distribution always goes through S3 — nodes curl the tarball
+# from a presigned URL. The deploy path retries S3 uploads and falls back
+# to `aws s3 cp` if the AWS CLI is installed.
 
 # 3) Define miners (random regions)
 ../target/release/kresko add --node-type miner --count 8 --region random
+
+# Optional: add a smaller proof node without memorizing provider-specific slugs
+../target/release/kresko add --node-type miner --count 1 --region random --low-resource
 
 # 4) Create cloud instances
 ../target/release/kresko up --workers 8
@@ -131,13 +139,19 @@ kresko kill-session --session app
 kresko kill-session --session txblast
 
 # Download logs from all nodes into ./data/
-kresko download --nodes all --workers 8
+kresko download -n all -w 8
 
 # Download only peer_message structured traces
-kresko download traces --nodes all --workers 8 --tables peer_message
+kresko download -n all -w 8 traces --tables peer_message
 
-# Download block height/time/size traces
-kresko download heights --nodes 3 --workers 4
+# Download every file from each node's discovered trace directories
+kresko download -n all -w 8 traces
+
+# Download a canonical block height/time/size trace from selected miners,
+# using up to 4 concurrent RPC block fetches, 16-height batches,
+# async tip probing, failover between miners, and resume from any
+# existing data/heights.jsonl unless --force is set
+kresko download -n 0,1,2 -w 4 heights --batch-size 16
 ```
 
 `scripts/network_diag.sh` is included for per-node RPC/network checks and can be run directly on a node.
@@ -145,22 +159,25 @@ kresko download heights --nodes 3 --workers 4
 ## Command Reference
 
 - `init`: bootstrap experiment directory and provider-specific `.env`
-- `add`: append miner definitions to config (`--region random` supported)
-- `up`: create instances in provider
-- `list`: list running kresko instances in provider
+- `add`: append miner definitions to config (`--region random` and `--low-resource` supported)
+- `up`: create instances across the providers referenced by the experiment config
+- `sync-ips`: repopulate missing `public_ip` / `private_ip` fields in `config.json` from cloud provider state
+- `list`: list running kresko instances across the providers referenced by the experiment config
 - `genesis`: generate local genesis + payload
-- `deploy`: distribute payload and start nodes (`--direct-payload-upload` skips S3 payload hop)
+- `deploy`: distribute payload via S3 (operator uploads to S3, nodes curl a presigned URL) and start nodes.
+  The S3 upload path retries and can fall back to the `aws` CLI. Override with:
+  `KRESKO_S3_UPLOAD_ATTEMPTS`, `KRESKO_S3_UPLOAD_RETRY_DELAY_SECS`, and `KRESKO_S3_UPLOAD_AWS_CLI_FALLBACK=0`.
 - `status`: query node RPC status/height/sync
 - `progress`: continuously call `generate` on miners
 - `txblast`: start remote tx blast (`transparent`, `shielded`, or `both`; shielded mode supports Orchard lane and fanout controls)
 - `txblast-local`: local tx blast runner intended for remote execution
 - `download`: fetch logs from nodes
-- `download traces`: fetch selected structured trace tables from nodes
-- `download heights`: collect per-block traces via RPC into JSONL
+- `download traces`: fetch every file from discovered remote trace directories by default, or a selected trace-table subset via `--tables`
+- `download heights`: collect one canonical per-block RPC trace into JSONL, with async tip probing, retry/fallback across selected nodes, and reuse of existing heights unless `--force` is set
 - `upload-data`: upload collected `data/` to S3 prefix `<experiment>/data/`
 - `reset`: stop sessions and clean remote node state
 - `down`: destroy instances for this experiment
-- `down --all`: destroy all kresko-tagged instances across configured providers
+- `down --all`: destroy all kresko-tagged/grouped instances across configured providers
 
 ## Notes and Caveats
 

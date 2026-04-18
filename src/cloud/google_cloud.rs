@@ -3,6 +3,7 @@ use base64::Engine;
 use futures::future::join_all;
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
@@ -237,7 +238,7 @@ impl GoogleCloudClient {
             }
         });
 
-        let resp: Operation = self
+        let response = self
             .http
             .post(format!(
                 "{COMPUTE_API}/projects/{}/zones/{zone}/instances",
@@ -246,11 +247,27 @@ impl GoogleCloudClient {
             .bearer_auth(token)
             .json(&body)
             .send()
-            .await?
-            .error_for_status()
-            .context("failed to create GCP instance")?
-            .json()
-            .await?;
+            .await
+            .context("failed to call GCP create instance API")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "failed to create GCP instance '{}' (zone='{}', machine='{}'): HTTP {}{}{}",
+                instance.name,
+                zone,
+                instance.slug,
+                status.as_u16(),
+                status
+                    .canonical_reason()
+                    .map(|reason| format!(" ({reason})"))
+                    .unwrap_or_default(),
+                format_gcp_error_detail(&body),
+            );
+        }
+
+        let resp: Operation = response.json().await?;
 
         println!("Created GCP instance {} (op: {})", instance.name, resp.name);
         Ok(resp.name)
@@ -359,6 +376,68 @@ impl GoogleCloudClient {
 }
 
 impl GoogleCloudClient {
+    pub async fn matching_resource_names(&self, all: bool) -> Result<Vec<String>> {
+        let token = self.get_access_token().await?;
+        let filter = if all {
+            "labels.kresko%3Dtrue".to_string()
+        } else {
+            format!("labels.experiment%3D{}", self.config.experiment)
+        };
+        Ok(self
+            .list_instances_all_zones(&token, &filter)
+            .await
+            .into_iter()
+            .map(|(instance, _)| instance.name)
+            .collect())
+    }
+
+    pub async fn sync_config_ips(&self, overwrite: bool) -> Result<Vec<Instance>> {
+        let token = self.get_access_token().await?;
+        let found = self.list_config_instances(&token).await;
+        let mut instances_by_name: HashMap<String, Vec<(&InstanceResponse, &str)>> = HashMap::new();
+        for (instance, zone) in &found {
+            instances_by_name
+                .entry(instance.name.clone())
+                .or_default()
+                .push((instance, zone.as_str()));
+        }
+
+        let mut updated = self.config.miners.clone();
+        for inst in &mut updated {
+            if !should_refresh_ips(inst, overwrite) {
+                continue;
+            }
+
+            let Some(matches) = instances_by_name.get(&inst.name) else {
+                continue;
+            };
+
+            if matches.len() > 1 {
+                let zones = matches
+                    .iter()
+                    .map(|(_, zone)| zone.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "multiple GCP instances match node '{}': zones [{}]. Clean up duplicates before syncing IPs.",
+                    inst.name,
+                    zones
+                );
+            }
+
+            let (response, _) = matches[0];
+            let (public_ip, private_ip) = gcp_instance_ips(response);
+            if !public_ip.is_empty() {
+                inst.public_ip = public_ip;
+            }
+            if !private_ip.is_empty() {
+                inst.private_ip = private_ip;
+            }
+        }
+
+        Ok(updated)
+    }
+
     pub async fn up(&self, workers: usize) -> Result<Vec<Instance>> {
         if workers == 0 {
             anyhow::bail!("workers must be greater than 0");
@@ -382,48 +461,80 @@ impl GoogleCloudClient {
 
         println!("Creating {} GCP instances...", pending.len());
 
+        let mut wait_targets = Vec::new();
         for chunk in pending.chunks(workers) {
             let create_futs: Vec<_> = chunk
                 .iter()
-                .map(|inst| self.create_instance(inst, &token))
+                .map(|inst| {
+                    let zone = Self::zone_for_region(&inst.region);
+                    let token = token.clone();
+                    async move {
+                        self.create_instance(inst, &token).await?;
+                        Ok::<_, anyhow::Error>((inst.name.clone(), zone))
+                    }
+                })
                 .collect();
 
-            let _op_names: Vec<String> = join_all(create_futs)
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
+            for result in join_all(create_futs).await {
+                match result {
+                    Ok(target) => wait_targets.push(target),
+                    Err(error) => eprintln!("Warning: {error}"),
+                }
+            }
         }
 
         // Wait for IPs
         println!("Waiting for IPs...");
-        let mut ips = Vec::with_capacity(pending.len());
-        for chunk in pending.chunks(workers) {
+        let mut resolved = Vec::with_capacity(pending.len());
+        for chunk in wait_targets.chunks(workers) {
             let ip_futs: Vec<_> = chunk
                 .iter()
-                .map(|inst| {
-                    let zone = Self::zone_for_region(&inst.region);
-                    let name = inst.name.clone();
+                .map(|(name, zone)| {
+                    let name = name.clone();
+                    let zone = zone.clone();
                     let token = token.clone();
-                    async move { self.wait_for_instance_ip(&name, &zone, &token).await }
+                    async move {
+                        let (public_ip, private_ip) =
+                            self.wait_for_instance_ip(&name, &zone, &token).await?;
+                        Ok::<_, anyhow::Error>((name, public_ip, private_ip))
+                    }
                 })
                 .collect();
 
-            let mut resolved_ips: Vec<(String, String)> = join_all(ip_futs)
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
-            ips.append(&mut resolved_ips);
+            for result in join_all(ip_futs).await {
+                match result {
+                    Ok(entry) => resolved.push(entry),
+                    Err(error) => eprintln!("Warning: {error}"),
+                }
+            }
+        }
+
+        let mut resolved_by_name: HashMap<String, (String, String)> = HashMap::new();
+        for (name, public_ip, private_ip) in resolved {
+            resolved_by_name.insert(name, (public_ip, private_ip));
         }
 
         let mut updated = self.config.miners.clone();
-        let mut ip_idx = 0;
         for inst in &mut updated {
-            if inst.public_ip == "TBD" && ip_idx < ips.len() {
-                inst.public_ip = ips[ip_idx].0.clone();
-                inst.private_ip = ips[ip_idx].1.clone();
+            if inst.public_ip == "TBD" {
+                let Some((public_ip, private_ip)) = resolved_by_name.get(&inst.name) else {
+                    continue;
+                };
+                inst.public_ip = public_ip.clone();
+                inst.private_ip = private_ip.clone();
                 println!("  {} -> {}", inst.name, inst.public_ip);
-                ip_idx += 1;
             }
+        }
+
+        let unresolved = updated
+            .iter()
+            .filter(|inst| inst.public_ip == "TBD")
+            .count();
+        if unresolved > 0 {
+            eprintln!(
+                "Warning: {} GCP node(s) still have no public IP and remain unavailable.",
+                unresolved
+            );
         }
 
         Ok(updated)
@@ -467,6 +578,24 @@ impl GoogleCloudClient {
             .flatten()
             .flatten()
             .collect()
+    }
+
+    async fn list_config_instances(&self, token: &str) -> Vec<(InstanceResponse, String)> {
+        let target_names: HashSet<_> = self
+            .config
+            .miners
+            .iter()
+            .map(|instance| instance.name.as_str())
+            .collect();
+
+        self.list_instances_all_zones(
+            token,
+            &format!("labels.experiment%3D{}", self.config.experiment),
+        )
+        .await
+        .into_iter()
+        .filter(|(instance, _)| target_names.contains(instance.name.as_str()))
+        .collect()
     }
 
     pub async fn down(&self, workers: usize, all: bool) -> Result<()> {
@@ -556,4 +685,66 @@ impl GoogleCloudClient {
 
         Ok(())
     }
+}
+
+fn format_gcp_error_detail(body: &str) -> String {
+    if body.trim().is_empty() {
+        return String::new();
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(error) = value.get("error") {
+            if let Some(message) = error.get("message").and_then(|value| value.as_str()) {
+                return format!(" [message={message}]");
+            }
+            if let Some(errors) = error.get("errors").and_then(|value| value.as_array()) {
+                let joined = errors
+                    .iter()
+                    .filter_map(|entry| {
+                        let reason = entry.get("reason").and_then(|value| value.as_str());
+                        let message = entry.get("message").and_then(|value| value.as_str());
+                        match (reason, message) {
+                            (Some(reason), Some(message)) => Some(format!("{reason}: {message}")),
+                            (Some(reason), None) => Some(reason.to_string()),
+                            (None, Some(message)) => Some(message.to_string()),
+                            (None, None) => None,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if !joined.is_empty() {
+                    return format!(" [{}]", joined.join("; "));
+                }
+            }
+        }
+    }
+
+    let trimmed = body.trim();
+    let excerpt = if trimmed.len() > 400 {
+        format!("{}...", &trimmed[..400])
+    } else {
+        trimmed.to_string()
+    };
+    format!(" [body={excerpt}]")
+}
+
+fn gcp_instance_ips(instance: &InstanceResponse) -> (String, String) {
+    let Some(iface) = instance.network_interfaces.first() else {
+        return (String::new(), String::new());
+    };
+
+    let public_ip = iface
+        .access_configs
+        .first()
+        .map(|config| config.nat_ip.clone())
+        .unwrap_or_default();
+    let private_ip = iface.network_ip.clone();
+    (public_ip, private_ip)
+}
+
+fn should_refresh_ips(instance: &Instance, overwrite: bool) -> bool {
+    overwrite
+        || instance.public_ip.is_empty()
+        || instance.public_ip == "TBD"
+        || instance.private_ip.is_empty()
+        || instance.private_ip == "TBD"
 }

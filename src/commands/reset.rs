@@ -6,6 +6,40 @@ use crate::config::{Config, resolve_value, select_instances, shellexpand};
 use crate::ssh;
 use crate::tmux;
 
+/// Canonical tmux session names known to kresko-managed scripts.
+/// `kresko run` uses these to stop the workload at the end of a wallclock
+/// window (without the rest of `reset`'s state-wipe).
+pub const KNOWN_SESSIONS: &[&str] = &["app", "txblast", "mine"];
+
+/// Kill the canonical tmux sessions on the selected miners, without
+/// wiping any on-disk state. Used by `kresko run`'s default shutdown.
+pub async fn kill_known_sessions(miners: &str, workers: usize, directory: &str) -> Result<()> {
+    if workers == 0 {
+        anyhow::bail!("workers must be greater than 0");
+    }
+
+    let dir = std::path::Path::new(directory);
+    let config = Config::load(dir)?;
+    let key = shellexpand(&resolve_value(
+        None,
+        "KRESKO_SSH_KEY_PATH",
+        &config.ssh_key_path,
+    ));
+
+    let targets = select_instances(&config.miners, miners);
+    if targets.is_empty() {
+        println!("No matching miners found.");
+        return Ok(());
+    }
+
+    let owned_targets: Vec<_> = targets.iter().map(|&inst| inst.clone()).collect();
+    for session in KNOWN_SESSIONS {
+        println!("  Killing {session} sessions...");
+        tmux::stop_tmux_session(&owned_targets, &key, session, Duration::from_secs(30)).await;
+    }
+    Ok(())
+}
+
 pub async fn run(miners: &str, workers: usize, directory: &str) -> Result<()> {
     if workers == 0 {
         anyhow::bail!("workers must be greater than 0");
@@ -28,7 +62,7 @@ pub async fn run(miners: &str, workers: usize, directory: &str) -> Result<()> {
 
     // Kill tmux sessions
     let owned_targets: Vec<_> = targets.iter().map(|&inst| inst.clone()).collect();
-    for session in &["app", "txblast", "mine"] {
+    for session in KNOWN_SESSIONS {
         println!("  Killing {session} sessions...");
         tmux::stop_tmux_session(&owned_targets, &key, session, Duration::from_secs(30)).await;
     }

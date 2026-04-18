@@ -60,6 +60,7 @@ pub enum Provider {
     #[default]
     DigitalOcean,
     GoogleCloud,
+    Linode,
 }
 
 impl std::fmt::Display for Provider {
@@ -67,6 +68,7 @@ impl std::fmt::Display for Provider {
         match self {
             Provider::DigitalOcean => write!(f, "digitalocean"),
             Provider::GoogleCloud => write!(f, "googlecloud"),
+            Provider::Linode => write!(f, "linode"),
         }
     }
 }
@@ -77,6 +79,7 @@ impl std::str::FromStr for Provider {
         match s.to_lowercase().as_str() {
             "digitalocean" | "do" => Ok(Provider::DigitalOcean),
             "googlecloud" | "gcp" | "google" => Ok(Provider::GoogleCloud),
+            "linode" => Ok(Provider::Linode),
             other => anyhow::bail!("unknown provider: {other}"),
         }
     }
@@ -92,6 +95,12 @@ pub struct Instance {
     pub region: String,
     pub name: String,
     pub tags: Vec<String>,
+    #[serde(default = "default_tier")]
+    pub tier: String,
+}
+
+pub fn default_tier() -> String {
+    "full".into()
 }
 
 impl Instance {
@@ -102,6 +111,7 @@ impl Instance {
         region: &str,
         name: &str,
         experiment: &str,
+        tier: &str,
     ) -> Self {
         Self {
             node_type,
@@ -112,6 +122,7 @@ impl Instance {
             region: region.to_string(),
             name: name.to_string(),
             tags: vec!["kresko".to_string(), experiment_tag(experiment)],
+            tier: tier.to_string(),
         }
     }
 
@@ -179,7 +190,7 @@ pub struct OrchardTxblastConfig {
 impl Default for OrchardTxblastConfig {
     fn default() -> Self {
         Self {
-            lanes_per_miner: 200,
+            lanes_per_miner: 100,
             lane_value_zats: 30_000,
             fanout_source_value_zats: 500_000,
             fanout_outputs: 4,
@@ -190,9 +201,7 @@ impl Default for OrchardTxblastConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalGenesisConfig {
     #[serde(default)]
-    pub bootstrap_mode: LocalGenesisBootstrapMode,
-    #[serde(default)]
-    pub bootstrap_artifact_id: Option<String>,
+    pub premine_cache_key: Option<String>,
     pub network_name: String,
     pub network_magic: [u8; 4],
     pub target_difficulty_limit: String,
@@ -213,14 +222,6 @@ pub struct LocalGenesisConfig {
     #[serde(default)]
     pub bootstrap_treasury_key: Option<LocalGenesisFundedKey>,
     pub funded_keys: Vec<LocalGenesisFundedKey>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LocalGenesisBootstrapMode {
-    #[default]
-    Generated,
-    Cached,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +269,37 @@ impl Config {
     }
 }
 
+pub fn provider_configs(base: &Config) -> Vec<Config> {
+    let mut providers = Vec::new();
+
+    if base.miners.is_empty() {
+        providers.push(base.provider);
+    } else {
+        for instance in &base.miners {
+            if !providers.contains(&instance.provider) {
+                providers.push(instance.provider);
+            }
+        }
+    }
+
+    providers
+        .into_iter()
+        .map(|provider| {
+            let mut config = base.clone();
+            config.provider = provider;
+            if !base.miners.is_empty() {
+                config.miners = base
+                    .miners
+                    .iter()
+                    .filter(|instance| instance.provider == provider)
+                    .cloned()
+                    .collect();
+            }
+            config
+        })
+        .collect()
+}
+
 /// Resolve a value with priority: flag > env > config
 pub fn resolve_value(flag: Option<&str>, env_var: &str, config_val: &str) -> String {
     if let Some(v) = flag {
@@ -291,35 +323,6 @@ pub fn shellexpand(path: &str) -> String {
         }
     }
     path.to_string()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TxType {
-    Transparent,
-    Shielded,
-    Both,
-}
-
-impl std::fmt::Display for TxType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TxType::Transparent => write!(f, "transparent"),
-            TxType::Shielded => write!(f, "shielded"),
-            TxType::Both => write!(f, "both"),
-        }
-    }
-}
-
-impl std::str::FromStr for TxType {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "transparent" => Ok(TxType::Transparent),
-            "shielded" => Ok(TxType::Shielded),
-            "both" => Ok(TxType::Both),
-            other => anyhow::bail!("unknown tx type: {other}. Use transparent, shielded, or both."),
-        }
-    }
 }
 
 /// Select active instances by pattern. Supports:
@@ -386,15 +389,23 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-// Default slugs/regions per provider
-pub const DO_DEFAULT_MINER_SLUG: &str = "s-8vcpu-16gb";
+// Default instance shapes/images per provider
+/// DigitalOcean miner slugs in preference order. `add` walks this list per
+/// region and assigns the first slug the region actually carries, so we
+/// fall back to premium AMD / Intel variants when the basic Intel slug
+/// isn't stocked in that datacenter.
+pub const DO_FULL_MINER_SLUG_FALLBACKS: &[&str] =
+    &["s-8vcpu-16gb", "s-8vcpu-16gb-amd", "s-8vcpu-16gb-intel"];
+pub const DO_LOW_MINER_SLUG_FALLBACKS: &[&str] =
+    &["s-4vcpu-8gb", "s-4vcpu-8gb-amd", "s-4vcpu-8gb-intel"];
 pub const DO_DEFAULT_IMAGE: &str = "ubuntu-22-04-x64";
 pub const DO_REGIONS: &[&str] = &[
     "nyc1", "nyc3", "tor1", "sfo2", "sfo3", "ams3", "sgp1", "lon1", "fra1", "syd1",
 ];
 
 pub const GCP_DEFAULT_MACHINE: &str = "c3d-highcpu-8";
-pub const GCP_DEFAULT_DISK_SIZE_GB: u64 = 400;
+pub const GCP_LOW_RESOURCE_MACHINE: &str = "c3d-highcpu-4";
+pub const GCP_DEFAULT_DISK_SIZE_GB: u64 = 40;
 pub const GCP_REGIONS: &[&str] = &[
     "us-central1",
     "us-east1",
@@ -402,4 +413,42 @@ pub const GCP_REGIONS: &[&str] = &[
     "asia-southeast1",
     "europe-west1",
     "asia-east1",
+];
+
+pub const LINODE_DEFAULT_MINER_TYPE: &str = "g6-dedicated-8";
+pub const LINODE_LOW_RESOURCE_MINER_TYPE: &str = "g6-dedicated-4";
+pub const LINODE_DEFAULT_IMAGE: &str = "linode/ubuntu22.04";
+pub const LINODE_REGIONS: &[&str] = &[
+    "us-east",
+    "us-central",
+    "us-west",
+    "us-southeast",
+    "us-ord",
+    "us-iad",
+    "us-lax",
+    "us-mia",
+    "us-sea",
+    "ca-central",
+    "br-gru",
+    "eu-west",
+    "eu-central",
+    "gb-lon",
+    "fr-par",
+    "fr-par-2",
+    "de-fra-2",
+    "nl-ams",
+    "es-mad",
+    "it-mil",
+    "se-sto",
+    "ap-south",
+    "ap-west",
+    "ap-southeast",
+    "ap-northeast",
+    "in-maa",
+    "in-bom-2",
+    "jp-osa",
+    "jp-tyo-3",
+    "sg-sin-2",
+    "id-cgk",
+    "au-mel",
 ];

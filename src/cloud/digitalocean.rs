@@ -5,9 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crate::config::{
-    Config, DO_DEFAULT_IMAGE, Instance, experiment_tag, require_env, resolve_value, shellexpand,
-};
+use crate::config::{Config, DO_DEFAULT_IMAGE, Instance, require_env, resolve_value, shellexpand};
 
 const DO_API: &str = "https://api.digitalocean.com/v2";
 const MAX_DROPLETS: usize = 100;
@@ -37,6 +35,11 @@ struct DropletResponse {
 #[derive(Debug, Deserialize)]
 struct DropletsResponse {
     droplets: Vec<Droplet>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegionsResponse {
+    regions: Vec<Region>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +81,15 @@ struct SshKey {
     fingerprint: String,
     #[serde(default)]
     public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Region {
+    slug: String,
+    #[serde(default)]
+    available: bool,
+    #[serde(default)]
+    sizes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -303,16 +315,118 @@ impl DigitalOceanClient {
 
         Ok(droplets)
     }
+
+    /// Fetch a map of `region_slug -> {size_slugs}` for every available
+    /// DigitalOcean region. Use this to pick a size that a region actually
+    /// carries (avoiding 422s at create time) and to fall back to premium
+    /// AMD / Intel variants when the basic slug isn't stocked.
+    pub async fn list_region_size_map() -> Result<HashMap<String, HashSet<String>>> {
+        let token = require_env("DIGITALOCEAN_TOKEN")?;
+        let http = Client::builder().timeout(Duration::from_secs(60)).build()?;
+        let mut map: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut page = 1usize;
+
+        loop {
+            let resp: RegionsResponse = http
+                .get(format!("{DO_API}/regions?per_page=200&page={page}"))
+                .bearer_auth(&token)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let count = resp.regions.len();
+            for region in resp.regions {
+                if !region.available {
+                    continue;
+                }
+                map.entry(region.slug).or_default().extend(region.sizes);
+            }
+
+            if count < 200 {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(map)
+    }
 }
 
 impl DigitalOceanClient {
+    async fn list_config_droplets(&self) -> Result<Vec<Droplet>> {
+        let all_kresko = self.list_droplets_by_tag("kresko").await?;
+        let target_names: HashSet<_> = self
+            .config
+            .miners
+            .iter()
+            .map(|instance| instance.name.as_str())
+            .collect();
+
+        Ok(filter_droplets_by_target_names(all_kresko, &target_names))
+    }
+
+    pub async fn matching_resource_names(&self, all: bool) -> Result<Vec<String>> {
+        let droplets = if all {
+            self.list_droplets_by_tag("kresko").await?
+        } else {
+            self.list_config_droplets().await?
+        };
+        Ok(droplets.into_iter().map(|droplet| droplet.name).collect())
+    }
+
+    pub async fn sync_config_ips(&self, overwrite: bool) -> Result<Vec<Instance>> {
+        let droplets = self.list_config_droplets().await?;
+        let mut droplets_by_name: HashMap<String, Vec<&Droplet>> = HashMap::new();
+        for droplet in &droplets {
+            droplets_by_name
+                .entry(droplet.name.clone())
+                .or_default()
+                .push(droplet);
+        }
+
+        let mut updated = self.config.miners.clone();
+        for inst in &mut updated {
+            if !should_refresh_ips(inst, overwrite) {
+                continue;
+            }
+
+            let Some(matches) = droplets_by_name.get(&inst.name) else {
+                continue;
+            };
+
+            if matches.len() > 1 {
+                let ids = matches
+                    .iter()
+                    .map(|droplet| droplet.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "multiple droplets match node '{}': ids [{}]. Run 'kresko down' to clean duplicates before syncing IPs.",
+                    inst.name,
+                    ids
+                );
+            }
+
+            let (public_ip, private_ip) = droplet_ips(matches[0]);
+            if !public_ip.is_empty() {
+                inst.public_ip = public_ip;
+            }
+            if !private_ip.is_empty() {
+                inst.private_ip = private_ip;
+            }
+        }
+
+        Ok(updated)
+    }
+
     pub async fn up(&self, workers: usize) -> Result<Vec<Instance>> {
         if workers == 0 {
             anyhow::bail!("workers must be greater than 0");
         }
 
-        let tag = experiment_tag(&self.config.experiment);
-        let existing = self.list_droplets_by_tag(&tag).await?;
+        let existing = self.list_config_droplets().await?;
         let mut existing_by_name: HashMap<String, Vec<&Droplet>> = HashMap::new();
         for droplet in &existing {
             existing_by_name
@@ -404,11 +518,12 @@ impl DigitalOceanClient {
                     })
                     .collect();
 
-                let mut chunk_targets: Vec<(String, u64)> = join_all(create_futs)
-                    .await
-                    .into_iter()
-                    .collect::<Result<Vec<_>>>()?;
-                created_targets.append(&mut chunk_targets);
+                for result in join_all(create_futs).await {
+                    match result {
+                        Ok(target) => created_targets.push(target),
+                        Err(error) => eprintln!("Warning: {error}"),
+                    }
+                }
             }
             wait_targets.extend(created_targets);
         }
@@ -426,11 +541,12 @@ impl DigitalOceanClient {
                 })
                 .collect();
 
-            let mut chunk_resolved: Vec<(String, String, String)> = join_all(ip_futs)
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
-            resolved.append(&mut chunk_resolved);
+            for result in join_all(ip_futs).await {
+                match result {
+                    Ok(entry) => resolved.push(entry),
+                    Err(error) => eprintln!("Warning: {error}"),
+                }
+            }
         }
 
         let mut resolved_by_name: HashMap<String, (String, String)> = HashMap::new();
@@ -450,6 +566,17 @@ impl DigitalOceanClient {
             }
         }
 
+        let unresolved = updated
+            .iter()
+            .filter(|inst| inst.public_ip == "TBD")
+            .count();
+        if unresolved > 0 {
+            eprintln!(
+                "Warning: {} DigitalOcean node(s) still have no public IP and remain unavailable.",
+                unresolved
+            );
+        }
+
         Ok(updated)
     }
 
@@ -458,12 +585,11 @@ impl DigitalOceanClient {
             anyhow::bail!("workers must be greater than 0");
         }
 
-        let tag = if all {
-            "kresko".to_string()
+        let droplets = if all {
+            self.list_droplets_by_tag("kresko").await?
         } else {
-            experiment_tag(&self.config.experiment)
+            self.list_config_droplets().await?
         };
-        let droplets = self.list_droplets_by_tag(&tag).await?;
 
         if droplets.is_empty() {
             if all {
@@ -505,8 +631,7 @@ impl DigitalOceanClient {
     }
 
     pub async fn list(&self) -> Result<()> {
-        let tag = experiment_tag(&self.config.experiment);
-        let droplets = self.list_droplets_by_tag(&tag).await?;
+        let droplets = self.list_config_droplets().await?;
 
         if droplets.is_empty() {
             println!(
@@ -578,6 +703,16 @@ fn normalize_ssh_public_key(raw: &str) -> Option<String> {
     Some(format!("{key_type} {key}"))
 }
 
+fn filter_droplets_by_target_names(
+    droplets: Vec<Droplet>,
+    target_names: &HashSet<&str>,
+) -> Vec<Droplet> {
+    droplets
+        .into_iter()
+        .filter(|droplet| target_names.contains(droplet.name.as_str()))
+        .collect()
+}
+
 fn droplet_ips(d: &Droplet) -> (String, String) {
     let mut public_ip = String::new();
     let mut private_ip = String::new();
@@ -591,4 +726,67 @@ fn droplet_ips(d: &Droplet) -> (String, String) {
     }
 
     (public_ip, private_ip)
+}
+
+fn should_refresh_ips(instance: &Instance, overwrite: bool) -> bool {
+    overwrite
+        || instance.public_ip.is_empty()
+        || instance.public_ip == "TBD"
+        || instance.private_ip.is_empty()
+        || instance.private_ip == "TBD"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Droplet, DropletNetworks, DropletRegion, NetworkV4, filter_droplets_by_target_names,
+    };
+    use std::collections::HashSet;
+
+    fn droplet(id: u64, name: &str) -> Droplet {
+        Droplet {
+            id,
+            name: name.to_string(),
+            status: "active".to_string(),
+            region: DropletRegion {
+                slug: "sfo2".to_string(),
+            },
+            networks: DropletNetworks {
+                v4: vec![NetworkV4 {
+                    ip_address: "127.0.0.1".to_string(),
+                    net_type: "public".to_string(),
+                }],
+            },
+            created_at: "2026-04-15T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn filters_droplets_by_exact_node_name() {
+        let target_names: HashSet<_> = [
+            "miner-0-6-tcp-pow-cubic-fq-no-restarts-v2-sfo2",
+            "miner-1-throughput-small-tuning-matrix-warm-ams3-syd1-syd1",
+        ]
+        .into_iter()
+        .collect();
+        let droplets = vec![
+            droplet(1, "miner-0-6-tcp-pow-cubic-fq-no-restarts-v2-sfo2"),
+            droplet(
+                2,
+                "miner-1-throughput-small-tuning-matrix-warm-ams3-syd1-syd1",
+            ),
+            droplet(3, "miner-9-unrelated-experiment"),
+        ];
+
+        let matched = filter_droplets_by_target_names(droplets, &target_names);
+        let matched_names: Vec<_> = matched.into_iter().map(|droplet| droplet.name).collect();
+
+        assert_eq!(
+            matched_names,
+            vec![
+                "miner-0-6-tcp-pow-cubic-fq-no-restarts-v2-sfo2".to_string(),
+                "miner-1-throughput-small-tuning-matrix-warm-ams3-syd1-syd1".to_string(),
+            ]
+        );
+    }
 }

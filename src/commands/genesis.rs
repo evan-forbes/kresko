@@ -6,26 +6,37 @@ use zebra_chain::{
     local_genesis::{LocalTestnetGenesisOptions, generate_local_testnet_with_funded_keys},
     parameters::NetworkUpgrade,
     serialization::ZcashSerialize,
-    transparent,
 };
 
-use crate::bootstrap::{BootstrapBundle, DEFAULT_POW_BOOTSTRAP_ARTIFACT_ID};
 use crate::config::{
-    Config, LocalGenesisActivationHeights, LocalGenesisBootstrapMode, LocalGenesisConfig,
-    LocalGenesisFundedKey, MiningMode, OrchardTxblastConfig,
+    Config, LocalGenesisActivationHeights, LocalGenesisConfig, LocalGenesisFundedKey, MiningMode,
+    OrchardTxblastConfig,
 };
+use crate::pow_tuning::{self, PowCalibration, PowTuningInputs};
+use crate::premine::{self, CalibrationSignature, ResolveOutcome};
 use crate::zebra_config::{self, LocalTestnetParameters};
+
+/// PoW calibration inputs sourced from CLI flags and forwarded into the
+/// genesis pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct PowCalibrationCli {
+    /// Fractional adjustment to the natural target. `+0.10` = ~10% looser
+    /// (faster initial blocks), `-0.10` = ~10% tighter. Usually 0.
+    pub adjust_fraction: f64,
+}
 
 pub fn run(
     zebrad_binary: &str,
     kresko_binary: Option<&str>,
     build_dir: &str,
     maturity_padding_blocks: u32,
-    bootstrap_mode: &str,
     orchard_lanes_per_miner: usize,
     orchard_lane_value_zats: u64,
     orchard_fanout_source_value_zats: u64,
     orchard_fanout_outputs: usize,
+    scripts_dir: &str,
+    pow_calibration: PowCalibrationCli,
+    premine_cache_key: &str,
     directory: &str,
 ) -> Result<()> {
     let dir = Path::new(directory);
@@ -53,12 +64,14 @@ pub fn run(
         anyhow::bail!("No miners configured. Run 'kresko add -t miner -c <N>' first.");
     }
 
-    let bootstrap_mode = resolve_bootstrap_mode(bootstrap_mode, config.mining_mode)?;
-    let prepared = match bootstrap_mode {
-        LocalGenesisBootstrapMode::Generated => {
-            prepare_generated_local_genesis(&config, &miner_names, maturity_padding_blocks)?
-        }
-        LocalGenesisBootstrapMode::Cached => prepare_cached_local_genesis(&config, &miner_names)?,
+    let prepared = match config.mining_mode {
+        MiningMode::Pow => prepare_premine_local_genesis(
+            &config,
+            &miner_names,
+            &pow_calibration,
+            premine_cache_key,
+        )?,
+        _ => prepare_generated_local_genesis(&config, &miner_names, maturity_padding_blocks)?,
     };
 
     config.local_genesis = Some(prepared.local_genesis.clone());
@@ -116,6 +129,7 @@ pub fn run(
             node_dir.join("funded_key.json"),
             serde_json::to_vec_pretty(funded_key)?,
         )?;
+        std::fs::write(node_dir.join("tier"), format!("{}\n", inst.tier))?;
 
         println!(
             "  {} -> {node_name}/zebrad.toml (runtime funded address: {})",
@@ -123,22 +137,27 @@ pub fn run(
         );
     }
 
-    let scripts_dir = dir.join("scripts");
-    if scripts_dir.exists() {
-        for entry in std::fs::read_dir(&scripts_dir)? {
+    let scripts_src = if Path::new(scripts_dir).is_absolute() {
+        std::path::PathBuf::from(scripts_dir)
+    } else {
+        dir.join(scripts_dir)
+    };
+    if scripts_src.exists() {
+        let payload_scripts_dir = payload_dir.join("scripts");
+        copy_dir_recursive(&scripts_src, &payload_scripts_dir).with_context(|| {
+            format!(
+                "failed to copy scripts tree from {} into {}",
+                scripts_src.display(),
+                payload_scripts_dir.display()
+            )
+        })?;
+        // Backwards compat: also flat-copy root-level files into payload/ so
+        // the existing `payload/node_init.sh` lookup keeps working.
+        for entry in std::fs::read_dir(&scripts_src)? {
             let entry = entry?;
-            let src = entry.path();
-            let file_type = entry.file_type()?;
-            if !file_type.is_file() {
-                eprintln!(
-                    "Skipping non-file script entry: {}",
-                    src.strip_prefix(dir).unwrap_or(&src).display()
-                );
-                continue;
+            if entry.file_type()?.is_file() {
+                std::fs::copy(entry.path(), payload_dir.join(entry.file_name()))?;
             }
-            let dest = payload_dir.join(entry.file_name());
-            std::fs::copy(&src, &dest)
-                .with_context(|| format!("failed to copy script {}", src.display()))?;
         }
     }
 
@@ -201,21 +220,33 @@ export KRESKO_LOCAL_GENESIS_DIR="/root/payload/local_genesis"
             "export KRESKO_BOOTSTRAP_MANIFEST_PATH=\"/root/payload/local_genesis/manifest.json\"\n",
         );
     }
-    if let Ok(trace_dir) = std::env::var("ZEBRA_P2P_TRACE_DIR") {
-        if !trace_dir.is_empty() {
-            vars_content.push_str(&format!("export ZEBRA_P2P_TRACE_DIR=\"{trace_dir}\"\n"));
-        }
-    }
+    let trace_dir = std::env::var("ZEBRA_P2P_TRACE_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "/root/.cache/zebra/traces".to_owned());
+    vars_content.push_str(&format!("export ZEBRA_P2P_TRACE_DIR=\"{trace_dir}\"\n"));
     if let Ok(trace_file) = std::env::var("ZEBRA_P2P_TRACE_FILE") {
         if !trace_file.is_empty() {
             vars_content.push_str(&format!("export ZEBRA_P2P_TRACE_FILE=\"{trace_file}\"\n"));
         }
     }
+    let fork_trace_dir = std::env::var("ZEBRA_TRACE_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "/root/.cache/zebra/traces".to_owned());
+    let fork_trace_enable = std::env::var("ZEBRA_FORK_TRACE_ENABLE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "1".to_owned());
+    vars_content.push_str(&format!(
+        "export ZEBRA_FORK_TRACE_ENABLE=\"{fork_trace_enable}\"\n"
+    ));
+    vars_content.push_str(&format!("export ZEBRA_TRACE_DIR=\"{fork_trace_dir}\"\n"));
     std::fs::write(payload_dir.join("vars.sh"), vars_content)?;
 
     println!(
-        "Local genesis prepared: mode={:?}, network={}, funding_blocks={}, maturity_padding_blocks={}, seeded_blocks={}, runtime_funded_keys={}, orchard_lanes_per_miner={}",
-        prepared.local_genesis.bootstrap_mode,
+        "Local genesis prepared: mining_mode={}, network={}, funding_blocks={}, maturity_padding_blocks={}, seeded_blocks={}, runtime_funded_keys={}, orchard_lanes_per_miner={}",
+        config.mining_mode,
         prepared.local_genesis.network_name,
         prepared.local_genesis.premine_block_count,
         prepared.local_genesis.maturity_padding_block_count,
@@ -223,8 +254,8 @@ export KRESKO_LOCAL_GENESIS_DIR="/root/payload/local_genesis"
         prepared.local_genesis.funded_keys.len(),
         config.orchard_txblast.lanes_per_miner,
     );
-    if let Some(artifact_id) = &prepared.local_genesis.bootstrap_artifact_id {
-        println!("Bootstrap artifact: {artifact_id}");
+    if let Some(cache_key) = &prepared.local_genesis.premine_cache_key {
+        println!("Premine cache key: {cache_key}");
     }
     println!("Genesis payload generated in {}", payload_dir.display());
     Ok(())
@@ -243,17 +274,18 @@ fn prepare_generated_local_genesis(
     miner_names: &[String],
     maturity_padding_blocks: u32,
 ) -> Result<PreparedLocalGenesis> {
-    let mut options = LocalTestnetGenesisOptions::default();
-    options.network_name = local_network_name(&config.chain_id);
-    options.latest_network_upgrade = NetworkUpgrade::Nu6;
-    options.maturity_padding_blocks = maturity_padding_blocks;
-
-    if config.mining_mode == MiningMode::Pow {
-        options.disable_pow = false;
-    }
-    if let Some(secs) = config.block_time_secs {
-        options.target_spacing_secs = Some(secs);
-    }
+    // Non-PoW path: zebra-chain's default disables PoW entirely, which skips
+    // Equihash solves and lets us seed any number of blocks cheaply. The
+    // regtest-easy 0x0f target the default options carry is fine here — PoW
+    // is off, so the target isn't enforced on incoming blocks.
+    let options = LocalTestnetGenesisOptions {
+        network_name: local_network_name(&config.chain_id),
+        latest_network_upgrade: NetworkUpgrade::Nu6,
+        target_spacing_secs: config.block_time_secs.unwrap_or(1),
+        seeded_tip_time: None,
+        maturity_padding_blocks,
+        ..LocalTestnetGenesisOptions::default()
+    };
 
     let generated = generate_local_testnet_with_funded_keys(miner_names.to_vec(), options)
         .map_err(|e| anyhow::anyhow!("failed to generate local genesis chain artifact: {e}"))?;
@@ -288,8 +320,7 @@ fn prepare_generated_local_genesis(
         .try_into()
         .context("pre_blossom_halving_interval does not fit in u32")?;
     let local_genesis = LocalGenesisConfig {
-        bootstrap_mode: LocalGenesisBootstrapMode::Generated,
-        bootstrap_artifact_id: None,
+        premine_cache_key: None,
         network_name: network_params.network_name().to_string(),
         network_magic: network_params.network_magic().0,
         target_difficulty_limit: network_params.target_difficulty_limit().to_string(),
@@ -335,7 +366,6 @@ fn prepare_generated_local_genesis(
             slow_start_interval: local_genesis.slow_start_interval,
             pre_blossom_halving_interval: local_genesis.pre_blossom_halving_interval,
             activation_height: local_genesis.activation_heights.overwinter,
-            target_spacing_secs: config.block_time_secs,
         },
         runtime_funded_keys: runtime_funded_keys.clone(),
         payload_local_genesis_files: vec![
@@ -357,21 +387,91 @@ fn prepare_generated_local_genesis(
     })
 }
 
-fn prepare_cached_local_genesis(
+fn prepare_premine_local_genesis(
     config: &Config,
     miner_names: &[String],
+    pow_calibration: &PowCalibrationCli,
+    premine_cache_key: &str,
 ) -> Result<PreparedLocalGenesis> {
-    let bundle = BootstrapBundle::load(DEFAULT_POW_BOOTSTRAP_ARTIFACT_ID)?;
-    let manifest = bundle.manifest();
-    let runtime_funded_keys = generate_runtime_funded_keys(miner_names)?;
+    // PoW mode requires an explicit target block spacing.
+    let block_time_secs = config.block_time_secs.context(
+        "block_time_secs must be set in config when mining_mode = pow; \
+         edit config.json or pass --block-time-secs to 'kresko add'",
+    )?;
+
+    let cache_root = premine::default_cache_root();
+
+    // Try to load by key first. On hit, we skip the (slow) Equihash benchmark
+    // entirely and read every parameter we need from the manifest. The whole
+    // point of the premine cache is "mine once, reuse forever"; running
+    // calibration just to compute a cache key defeats that.
+    let bundle = match premine::try_load_by_key(&cache_root, premine_cache_key)? {
+        Some(bundle) => {
+            let m = bundle.manifest();
+            if m.block_time_secs != block_time_secs {
+                anyhow::bail!(
+                    "premine cache entry '{}' was mined for block_time_secs={} but this \
+                     experiment is configured with block_time_secs={}. Pick a different \
+                     --premine-cache-key, or change the experiment's block_time_secs to match.",
+                    premine_cache_key,
+                    m.block_time_secs,
+                    block_time_secs,
+                );
+            }
+            println!(
+                "Premine cache HIT: key={} target={} block_time_secs={} funded_keys={} (no benchmark needed)",
+                premine_cache_key, m.target_difficulty_limit, m.block_time_secs, m.funded_key_count,
+            );
+            bundle
+        }
+        None => generate_premine_with_warning(
+            config,
+            pow_calibration,
+            block_time_secs,
+            premine_cache_key,
+            &cache_root,
+        )?,
+    };
+
+    // The premine bundle's funded_keys[0] is the bootstrap treasury; the
+    // remaining keys each received exactly one premine coinbase in blocks
+    // 1..=premine_block_count and are already mature at the seeded tip.
+    // Assigning them directly to each miner gives each node a premine-backed
+    // transparent bootstrap key. Shielded txblast can still fan funds out via
+    // a runtime funding transaction when it needs confirmed non-coinbase
+    // transparent inputs across the fleet.
+    let available_miner_keys = bundle.funded_keys().len().saturating_sub(1);
+    if miner_names.len() > available_miner_keys {
+        anyhow::bail!(
+            "experiment has {} miners but premine cache entry '{}' only provides {} \
+             non-treasury funded keys. Pick a premine with more funded keys \
+             (see src/premine.rs::FUNDED_KEY_COUNT).",
+            miner_names.len(),
+            premine_cache_key,
+            available_miner_keys,
+        );
+    }
+
+    let runtime_funded_keys: Vec<LocalGenesisFundedKey> = bundle
+        .funded_keys()
+        .iter()
+        .skip(1)
+        .zip(miner_names.iter())
+        .map(|(premine_key, miner_name)| LocalGenesisFundedKey {
+            name: miner_name.clone(),
+            secret_key_hex: premine_key.secret_key_hex.clone(),
+            public_key_hex: premine_key.public_key_hex.clone(),
+            address: premine_key.address.clone(),
+        })
+        .collect();
     let network_magic = rand::random::<[u8; 4]>();
     let network_name = local_network_name(&config.chain_id);
+    let manifest = bundle.manifest();
     let activation_heights = activation_heights(manifest.activation_height);
     let genesis_hex = bundle.read_text_file("genesis.hex")?;
 
     let local_genesis = LocalGenesisConfig {
-        bootstrap_mode: LocalGenesisBootstrapMode::Cached,
-        bootstrap_artifact_id: Some(manifest.artifact_id.clone()),
+        premine_cache_key: Some(manifest.cache_key.clone()),
         network_name: network_name.clone(),
         network_magic,
         target_difficulty_limit: manifest.target_difficulty_limit.clone(),
@@ -390,7 +490,7 @@ fn prepare_cached_local_genesis(
     };
 
     let mut payload_local_genesis_files = vec![(
-        "funded_keys.json".to_string(),
+        "runtime_funded_keys.json".to_string(),
         serde_json::to_vec_pretty(&runtime_funded_keys)?,
     )];
     bundle.copy_payload_files_to_vec(&mut payload_local_genesis_files)?;
@@ -406,7 +506,6 @@ fn prepare_cached_local_genesis(
             slow_start_interval: manifest.slow_start_interval,
             pre_blossom_halving_interval: manifest.pre_blossom_halving_interval,
             activation_height: manifest.activation_height,
-            target_spacing_secs: config.block_time_secs,
         },
         runtime_funded_keys,
         payload_local_genesis_files,
@@ -414,28 +513,56 @@ fn prepare_cached_local_genesis(
     })
 }
 
-fn resolve_bootstrap_mode(
-    mode: &str,
-    mining_mode: MiningMode,
-) -> Result<LocalGenesisBootstrapMode> {
-    let resolved = match mode.to_ascii_lowercase().as_str() {
-        "auto" => {
-            if mining_mode == MiningMode::Pow {
-                LocalGenesisBootstrapMode::Cached
-            } else {
-                LocalGenesisBootstrapMode::Generated
-            }
-        }
-        "generated" => LocalGenesisBootstrapMode::Generated,
-        "cached" => LocalGenesisBootstrapMode::Cached,
-        other => anyhow::bail!("unknown bootstrap mode: {other}. Use auto, generated, or cached."),
-    };
+/// Cache miss path. Loudly warns the operator (generating a fresh premine
+/// per experiment is the slow road we're trying to avoid), then runs the
+/// Equihash benchmark + calibration to derive a target, mines a fresh
+/// premine bundle, and stores it under `premine_cache_key` so subsequent
+/// runs hit the cache.
+fn generate_premine_with_warning(
+    config: &Config,
+    pow_calibration: &PowCalibrationCli,
+    block_time_secs: u32,
+    premine_cache_key: &str,
+    cache_root: &std::path::Path,
+) -> Result<premine::PremineBundle> {
+    eprintln!();
+    eprintln!("================================================================");
+    eprintln!("⚠️  WARNING: premine cache MISS for key '{premine_cache_key}'");
+    eprintln!("⚠️");
+    eprintln!(
+        "⚠️  No entry at {}",
+        cache_root.join(premine_cache_key).display()
+    );
+    eprintln!("⚠️  Falling back to fresh Equihash benchmark + premine generation.");
+    eprintln!("⚠️  This takes several minutes and is strongly discouraged per experiment.");
+    eprintln!("⚠️");
+    eprintln!("⚠️  Pre-warm the cache once with:");
+    eprintln!(
+        "⚠️    kresko premine --mining-cpus <N> --block-time-secs {} \\\n\
+         ⚠️      --premine-cache-key {}",
+        block_time_secs, premine_cache_key,
+    );
+    eprintln!("⚠️");
+    eprintln!("⚠️  Then every subsequent 'kresko genesis' will be instant.");
+    eprintln!("================================================================");
+    eprintln!();
 
-    if resolved == LocalGenesisBootstrapMode::Cached && mining_mode != MiningMode::Pow {
-        anyhow::bail!("cached bootstrap mode currently only supports --mining-mode pow");
-    }
+    let calibration = run_pow_calibration(config, pow_calibration, block_time_secs)?;
+    let signature = CalibrationSignature::new(
+        calibration.target_difficulty_limit_hex.clone(),
+        block_time_secs,
+    )?;
 
-    Ok(resolved)
+    let solver_threads = premine::default_solver_threads();
+    let (bundle, outcome) = premine::resolve_premine_with_key(
+        &signature,
+        premine_cache_key,
+        cache_root,
+        solver_threads,
+    )?;
+
+    report_calibration(&calibration, &signature, outcome);
+    Ok(bundle)
 }
 
 fn activation_heights(activation_height: u32) -> LocalGenesisActivationHeights {
@@ -449,38 +576,6 @@ fn activation_heights(activation_height: u32) -> LocalGenesisActivationHeights {
         nu6: activation_height,
         nu6_1: activation_height,
     }
-}
-
-fn generate_runtime_funded_keys(miner_names: &[String]) -> Result<Vec<LocalGenesisFundedKey>> {
-    miner_names
-        .iter()
-        .cloned()
-        .map(generate_transparent_key)
-        .collect()
-}
-
-fn generate_transparent_key(name: String) -> Result<LocalGenesisFundedKey> {
-    let secp = secp256k1::Secp256k1::new();
-    let secret_key = loop {
-        let secret_bytes = rand::random::<[u8; 32]>();
-        if let Ok(secret_key) = secp256k1::SecretKey::from_slice(&secret_bytes) {
-            break secret_key;
-        }
-    };
-    let public_key = secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
-    let pub_key_bytes = public_key.serialize();
-    let pub_key_hash = hash160(&pub_key_bytes);
-    let address = transparent::Address::from_pub_key_hash(
-        zebra_chain::parameters::NetworkKind::Testnet,
-        pub_key_hash,
-    );
-
-    Ok(LocalGenesisFundedKey {
-        name,
-        secret_key_hex: hex::encode(secret_key.secret_bytes()),
-        public_key_hex: hex::encode(pub_key_bytes),
-        address: address.to_string(),
-    })
 }
 
 fn validate_orchard_txblast_config(
@@ -530,6 +625,21 @@ fn activation_height(
         .with_context(|| format!("missing activation height for {upgrade:?}"))
 }
 
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let dst_path = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path)?;
+        } else if file_type.is_file() {
+            std::fs::copy(entry.path(), dst_path)?;
+        }
+    }
+    Ok(())
+}
+
 fn local_network_name(chain_id: &str) -> String {
     let cleaned: String = chain_id
         .chars()
@@ -565,12 +675,53 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn hash160(data: &[u8]) -> [u8; 20] {
-    use ripemd::Digest as _;
+fn run_pow_calibration(
+    config: &Config,
+    cli: &PowCalibrationCli,
+    block_time_secs: u32,
+) -> Result<PowCalibration> {
+    println!(
+        "Benchmarking local Equihash sol/s ({} samples)...",
+        pow_tuning::DEFAULT_BENCH_SAMPLES
+    );
+    let measured = pow_tuning::measure_local_sol_per_sec(pow_tuning::DEFAULT_BENCH_SAMPLES)
+        .context("local sol/s benchmark failed")?;
+    println!(
+        "  local={:.3} sol/s ({} solves in {:.1}s) → assumed fleet={:.3} sol/s (÷{:.1})",
+        measured.local_sol_per_sec,
+        measured.total_solves,
+        measured.elapsed_secs,
+        measured.assumed_fleet_sol_per_sec,
+        pow_tuning::LOCAL_TO_FLEET_DISCOUNT,
+    );
 
-    let sha_hash = sha2::Sha256::digest(data);
-    let ripemd_hash = ripemd::Ripemd160::digest(sha_hash);
-    let mut result = [0u8; 20];
-    result.copy_from_slice(&ripemd_hash);
-    result
+    let inputs = PowTuningInputs {
+        num_miners: config.miners.len(),
+        target_spacing_secs: block_time_secs,
+        target_adjust_fraction: cli.adjust_fraction,
+        sol_per_sec_override: Some(measured.assumed_fleet_sol_per_sec),
+        ..Default::default()
+    };
+
+    pow_tuning::calibrate(&inputs).context("PoW calibration failed")
+}
+
+fn report_calibration(
+    calibration: &PowCalibration,
+    signature: &CalibrationSignature,
+    outcome: ResolveOutcome,
+) {
+    println!(
+        "calibrated pow_limit={} miners={} sol/s={:.3} ({}) spacing={}s adjust={:+.3} \
+         natural_bits={}; premine {} key={}",
+        calibration.target_difficulty_limit_hex,
+        calibration.num_miners,
+        calibration.sol_per_sec_per_thread,
+        calibration.sol_rate_source,
+        calibration.target_spacing_secs,
+        calibration.target_adjust_fraction,
+        calibration.natural_target_bits,
+        outcome,
+        signature.cache_key(),
+    );
 }

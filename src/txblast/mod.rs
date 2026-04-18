@@ -4,10 +4,12 @@ pub mod shielded;
 pub mod transparent;
 
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::config::{OrchardTxblastConfig, TxType};
+use crate::config::OrchardTxblastConfig;
+
+const AUTO_RUNTIME_FUNDING_CONFIRM_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Clone, Debug)]
 pub struct OrchardBlastRuntimeConfig {
@@ -16,6 +18,7 @@ pub struct OrchardBlastRuntimeConfig {
     pub target_ready_lanes: usize,
     pub lane_low_watermark: usize,
     pub fanout_max_in_flight: usize,
+    pub proving_workers: usize,
     pub progress_interval: Duration,
 }
 
@@ -26,13 +29,13 @@ pub struct TxblastTraceConfig {
 }
 
 impl TxblastTraceConfig {
-    pub fn from_args(trace_enable: bool, trace_dir: Option<&str>) -> Self {
-        let enabled =
-            trace_enable || trace_dir.is_some() || env_flag_enabled("KRESKO_TXBLAST_TRACE_ENABLE");
+    pub fn from_args(trace_dir: Option<&str>) -> Self {
+        let enabled = !env_flag_enabled("KRESKO_TXBLAST_TRACE_DISABLE");
         let directory = trace_dir
             .filter(|dir| !dir.trim().is_empty())
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("KRESKO_TRACE_DIR").map(PathBuf::from));
+            .or_else(|| std::env::var_os("KRESKO_TRACE_DIR").map(PathBuf::from))
+            .or_else(|| Some(PathBuf::from("/root/.cache/kresko/txblast-traces")));
 
         Self { enabled, directory }
     }
@@ -45,6 +48,7 @@ impl OrchardBlastRuntimeConfig {
         target_ready_lanes: Option<usize>,
         lane_low_watermark: Option<usize>,
         fanout_max_in_flight: Option<usize>,
+        proving_workers: Option<usize>,
         progress_interval_secs: Option<u64>,
     ) -> Result<Self> {
         if premine.lanes_per_miner == 0 {
@@ -80,6 +84,11 @@ impl OrchardBlastRuntimeConfig {
             anyhow::bail!("orchard fanout max in flight must be greater than 0");
         }
 
+        let proving_workers = proving_workers.unwrap_or(5);
+        if proving_workers == 0 {
+            anyhow::bail!("orchard proving workers must be greater than 0");
+        }
+
         let progress_interval_secs = progress_interval_secs.unwrap_or(5);
         if progress_interval_secs == 0 {
             anyhow::bail!("orchard progress interval must be greater than 0");
@@ -91,6 +100,7 @@ impl OrchardBlastRuntimeConfig {
             target_ready_lanes,
             lane_low_watermark,
             fanout_max_in_flight,
+            proving_workers,
             progress_interval: Duration::from_secs(progress_interval_secs),
         })
     }
@@ -99,7 +109,6 @@ impl OrchardBlastRuntimeConfig {
 /// Run the transaction blaster locally (called on remote nodes).
 pub async fn run_local(
     rpc_endpoint: &str,
-    tx_type: TxType,
     rate: u64,
     amount: f64,
     orchard_lanes_per_miner: Option<usize>,
@@ -110,8 +119,9 @@ pub async fn run_local(
     orchard_target_ready_lanes: Option<usize>,
     orchard_lane_low_watermark: Option<usize>,
     orchard_fanout_max_in_flight: Option<usize>,
+    orchard_proving_workers: Option<usize>,
     orchard_progress_interval_secs: Option<u64>,
-    trace_enable: bool,
+    skip_funding: bool,
     trace_dir: Option<&str>,
     funded_key_path: Option<&str>,
     expected_runtime_funding_txid: Option<&str>,
@@ -132,13 +142,12 @@ pub async fn run_local(
         orchard_target_ready_lanes,
         orchard_lane_low_watermark,
         orchard_fanout_max_in_flight,
+        orchard_proving_workers,
         orchard_progress_interval_secs,
     )?;
-    let trace_config = TxblastTraceConfig::from_args(trace_enable, trace_dir);
+    let trace_config = TxblastTraceConfig::from_args(trace_dir);
 
-    println!(
-        "Starting txblast (endpoint={rpc_endpoint}, type={tx_type}, rate={rate}/s, amount={amount})"
-    );
+    println!("Starting txblast (endpoint={rpc_endpoint}, rate={rate}/s, amount={amount})");
 
     let client = rpc::ZebraRpcClient::new(rpc_endpoint);
 
@@ -150,6 +159,17 @@ pub async fn run_local(
         info["blocks"].as_u64().unwrap_or(0),
     );
 
+    if skip_funding {
+        println!("Skipping cached runtime funding verification before txblast start.");
+    } else {
+        maybe_prepare_cached_runtime_funding(
+            rpc_endpoint,
+            &orchard_runtime,
+            expected_runtime_funding_txid,
+        )
+        .await?;
+    }
+
     let (funded_key, key_path) = transparent::load_funded_key(funded_key_path)?;
     println!(
         "Loaded funded key '{}' (address={}) from {}",
@@ -158,39 +178,57 @@ pub async fn run_local(
         key_path.display()
     );
 
-    match tx_type {
-        TxType::Transparent => transparent::run(&client, &funded_key, rate, amount).await,
-        TxType::Shielded => {
-            shielded::run(
-                &client,
-                &funded_key,
-                rate,
-                amount,
-                &orchard_runtime,
-                &trace_config,
-                expected_runtime_funding_txid,
-            )
-            .await
-        }
-        TxType::Both => {
-            let client2 = rpc::ZebraRpcClient::new(rpc_endpoint);
-            let key2 = funded_key.clone();
-            let t_rate = std::cmp::max(rate / 2, 1);
-            let s_rate = std::cmp::max(rate / 2, 1);
-            tokio::try_join!(
-                transparent::run(&client, &funded_key, t_rate, amount),
-                shielded::run(
-                    &client2,
-                    &key2,
-                    s_rate,
-                    amount,
-                    &orchard_runtime,
-                    &trace_config,
-                    expected_runtime_funding_txid,
-                ),
-            )?;
-            Ok(())
-        }
+    shielded::run(
+        &client,
+        &funded_key,
+        rate,
+        amount,
+        &orchard_runtime,
+        &trace_config,
+        expected_runtime_funding_txid,
+    )
+    .await
+}
+
+async fn maybe_prepare_cached_runtime_funding(
+    rpc_endpoint: &str,
+    orchard_runtime: &OrchardBlastRuntimeConfig,
+    expected_runtime_funding_txid: Option<&str>,
+) -> Result<()> {
+    let Some(local_genesis_dir) = cached_bootstrap_local_genesis_dir() else {
+        return Ok(());
+    };
+
+    let minimum_recipient_zats = orchard::min_treasury_reseed_value(orchard_runtime);
+    println!(
+        "Cached bootstrap detected at {}; verifying runtime funding before shielded txblast (minimum per recipient: {} zats)",
+        local_genesis_dir, minimum_recipient_zats,
+    );
+    crate::commands::fund_runtime_keys::ensure_local_runtime_funding(
+        rpc_endpoint,
+        &local_genesis_dir,
+        minimum_recipient_zats,
+        AUTO_RUNTIME_FUNDING_CONFIRM_TIMEOUT_SECS,
+        expected_runtime_funding_txid,
+    )
+    .await
+}
+
+fn cached_bootstrap_local_genesis_dir() -> Option<String> {
+    let from_env = std::env::var("KRESKO_LOCAL_GENESIS_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty());
+    let candidate = from_env.or_else(|| {
+        let default = "/root/payload/local_genesis";
+        Path::new(default).exists().then(|| default.to_owned())
+    })?;
+    let candidate_path = Path::new(&candidate);
+    if candidate_path.join("treasury_key.json").exists()
+        && candidate_path.join("funded_keys.json").exists()
+    {
+        Some(candidate)
+    } else {
+        None
     }
 }
 

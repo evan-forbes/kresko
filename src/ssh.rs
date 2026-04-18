@@ -43,21 +43,20 @@ pub async fn ssh_exec_timeout(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Upload a file via SCP.
-pub async fn scp_upload(host: &str, key: &str, local_path: &str, remote_path: &str) -> Result<()> {
-    let output = Command::new("scp")
+/// Execute a command on a remote host via SSH, capturing the exit code rather
+/// than treating non-zero as an error. Returns Err only if the SSH transport
+/// itself fails (e.g. host unreachable).
+pub async fn ssh_exec_capture(host: &str, key: &str, command: &str) -> Result<(i32, String)> {
+    let output = Command::new("ssh")
         .args(SSH_OPTS)
-        .args(["-i", key, local_path, &format!("root@{host}:{remote_path}")])
+        .args(["-i", key, &format!("root@{host}"), command])
         .output()
         .await
-        .with_context(|| format!("SCP to {host} failed"))?;
+        .with_context(|| format!("SSH to {host} failed"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("SCP to {host} failed: {stderr}");
-    }
-
-    Ok(())
+    let code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok((code, stdout))
 }
 
 /// Download a file via SCP (sftp-like).

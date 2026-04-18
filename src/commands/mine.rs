@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zebra_chain::{
     block::{self, Block, Header},
     fmt::HexDebug,
+    parameters::Network,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
     work::{
         difficulty::CompactDifficulty,
@@ -26,7 +27,26 @@ struct MineLogEntry {
     block_hash: Option<String>,
     submit_result: Option<String>,
     transactions: Option<usize>,
+    transaction_bytes: Option<usize>,
+    template_prev_hash: Option<String>,
+    template_longpollid: Option<String>,
+    mempool_transactions: Option<usize>,
+    mempool_bytes: Option<u64>,
+    cancel_reason: Option<&'static str>,
+    next_height: Option<u64>,
+    next_transactions: Option<usize>,
+    next_transaction_bytes: Option<usize>,
+    next_prev_hash: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug)]
+struct TemplateSummary {
+    height: u64,
+    longpollid: Option<String>,
+    previous_block_hash: Option<String>,
+    transactions: usize,
+    transaction_bytes: usize,
 }
 
 pub async fn run(rpc_endpoint: &str) -> Result<()> {
@@ -41,6 +61,7 @@ pub async fn run(rpc_endpoint: &str) -> Result<()> {
     let chain = info["result"]["chain"].as_str().unwrap_or("unknown");
     let height = info["result"]["blocks"].as_u64().unwrap_or(0);
     println!("Connected: chain={chain}, height={height}");
+    let network = network_from_chain_name(chain)?;
 
     let mut log_file = OpenOptions::new()
         .create(true)
@@ -68,14 +89,21 @@ pub async fn run(rpc_endpoint: &str) -> Result<()> {
         };
 
         templates_received += 1;
-        let template_height = template["height"].as_u64().unwrap_or(0);
-        longpollid = template["longpollid"].as_str().map(String::from);
-        let tx_count = template["transactions"]
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0);
+        let template_summary = summarize_template(&template);
+        let template_height = template_summary.height;
+        let tx_count = template_summary.transactions;
+        let tx_bytes = template_summary.transaction_bytes;
+        longpollid = template_summary.longpollid.clone();
 
-        println!("Got template: height={template_height}, transactions={tx_count}");
+        let mempool_probe = get_mempool_info(&client, rpc_endpoint).await;
+        let (mempool_transactions, mempool_bytes, mempool_error) = match mempool_probe {
+            Ok((transactions, bytes)) => (Some(transactions), Some(bytes), None),
+            Err(err) => (None, None, Some(err.to_string())),
+        };
+
+        println!(
+            "Got template: height={template_height}, transactions={tx_count}, tx_bytes={tx_bytes}"
+        );
 
         log_entry(
             &mut log_file,
@@ -87,12 +115,22 @@ pub async fn run(rpc_endpoint: &str) -> Result<()> {
                 block_hash: None,
                 submit_result: None,
                 transactions: Some(tx_count),
-                error: None,
+                transaction_bytes: Some(tx_bytes),
+                template_prev_hash: template_summary.previous_block_hash.clone(),
+                template_longpollid: template_summary.longpollid.clone(),
+                mempool_transactions,
+                mempool_bytes,
+                cancel_reason: None,
+                next_height: None,
+                next_transactions: None,
+                next_transaction_bytes: None,
+                next_prev_hash: None,
+                error: mempool_error,
             },
         );
 
         // 2. Parse template into a Block
-        let block = match block_from_template(&template) {
+        let block = match block_from_template(&template, &network) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("Failed to parse block template: {e}");
@@ -110,12 +148,17 @@ pub async fn run(rpc_endpoint: &str) -> Result<()> {
         let poll_lpid = longpollid.clone();
         let poll_handle = tokio::spawn(async move {
             // Long-poll: this request blocks until the template changes
-            let _ = get_block_template(&poll_client, &poll_endpoint, poll_lpid.as_deref()).await;
+            let next_template =
+                get_block_template(&poll_client, &poll_endpoint, poll_lpid.as_deref()).await;
             let _ = cancel_tx.send(true);
+            next_template
+                .ok()
+                .map(|template| summarize_template(&template))
         });
 
         // 4. Solve in a blocking thread
         let solve_start = Instant::now();
+        let solve_network = network.clone();
         let solve_result = tokio::task::spawn_blocking(move || {
             let cancel_fn = move || {
                 if *cancel_rx.borrow() {
@@ -124,18 +167,16 @@ pub async fn run(rpc_endpoint: &str) -> Result<()> {
                     Ok(())
                 }
             };
-            Solution::solve(header, cancel_fn)
+            Solution::solve(header, &solve_network, cancel_fn)
         })
         .await
         .context("solver thread panicked")?;
-
-        // 5. Cancel the polling task
-        poll_handle.abort();
 
         let solve_time = solve_start.elapsed();
 
         match solve_result {
             Ok(solved_headers) => {
+                poll_handle.abort();
                 solutions_found += 1;
                 let solved_header = solved_headers.into_iter().next().unwrap();
                 println!(
@@ -193,6 +234,16 @@ pub async fn run(rpc_endpoint: &str) -> Result<()> {
                                 block_hash: Some(block_hash),
                                 submit_result: result_str,
                                 transactions: Some(tx_count),
+                                transaction_bytes: Some(tx_bytes),
+                                template_prev_hash: template_summary.previous_block_hash.clone(),
+                                template_longpollid: template_summary.longpollid.clone(),
+                                mempool_transactions,
+                                mempool_bytes,
+                                cancel_reason: None,
+                                next_height: None,
+                                next_transactions: None,
+                                next_transaction_bytes: None,
+                                next_prev_hash: None,
                                 error: None,
                             },
                         );
@@ -211,6 +262,16 @@ pub async fn run(rpc_endpoint: &str) -> Result<()> {
                                 block_hash: Some(block_hash),
                                 submit_result: None,
                                 transactions: Some(tx_count),
+                                transaction_bytes: Some(tx_bytes),
+                                template_prev_hash: template_summary.previous_block_hash.clone(),
+                                template_longpollid: template_summary.longpollid.clone(),
+                                mempool_transactions,
+                                mempool_bytes,
+                                cancel_reason: None,
+                                next_height: None,
+                                next_transactions: None,
+                                next_transaction_bytes: None,
+                                next_prev_hash: None,
                                 error: Some(format!("{e}")),
                             },
                         );
@@ -223,10 +284,21 @@ pub async fn run(rpc_endpoint: &str) -> Result<()> {
                 );
             }
             Err(SolverCancelled) => {
+                let next_template = match poll_handle.await {
+                    Ok(summary) => summary,
+                    Err(err) => {
+                        eprintln!("Long-poll task failed after cancellation: {err}");
+                        None
+                    }
+                };
+                let cancel_reason = next_template
+                    .as_ref()
+                    .map(|summary| classify_cancellation(&template_summary, summary));
                 stale_cancellations += 1;
                 println!(
-                    "Template changed after {:.1}s, restarting solver...",
-                    solve_time.as_secs_f64()
+                    "Template changed after {:.1}s, restarting solver... reason={}",
+                    solve_time.as_secs_f64(),
+                    cancel_reason.unwrap_or("unknown")
                 );
 
                 log_entry(
@@ -239,6 +311,22 @@ pub async fn run(rpc_endpoint: &str) -> Result<()> {
                         block_hash: None,
                         submit_result: None,
                         transactions: Some(tx_count),
+                        transaction_bytes: Some(tx_bytes),
+                        template_prev_hash: template_summary.previous_block_hash.clone(),
+                        template_longpollid: template_summary.longpollid.clone(),
+                        mempool_transactions,
+                        mempool_bytes,
+                        cancel_reason,
+                        next_height: next_template.as_ref().map(|summary| summary.height),
+                        next_transactions: next_template
+                            .as_ref()
+                            .map(|summary| summary.transactions),
+                        next_transaction_bytes: next_template
+                            .as_ref()
+                            .map(|summary| summary.transaction_bytes),
+                        next_prev_hash: next_template
+                            .as_ref()
+                            .and_then(|summary| summary.previous_block_hash.clone()),
                         error: None,
                     },
                 );
@@ -259,6 +347,43 @@ fn now_unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn summarize_template(template: &serde_json::Value) -> TemplateSummary {
+    let transactions = template["transactions"]
+        .as_array()
+        .map(|entries| entries.len())
+        .unwrap_or(0);
+    let transaction_bytes = template["transactions"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry["data"].as_str())
+                .map(|hex| hex.len() / 2)
+                .sum()
+        })
+        .unwrap_or(0);
+
+    TemplateSummary {
+        height: template["height"].as_u64().unwrap_or(0),
+        longpollid: template["longpollid"].as_str().map(String::from),
+        previous_block_hash: template["previousblockhash"].as_str().map(String::from),
+        transactions,
+        transaction_bytes,
+    }
+}
+
+fn classify_cancellation(current: &TemplateSummary, next: &TemplateSummary) -> &'static str {
+    if next.height != current.height || next.previous_block_hash != current.previous_block_hash {
+        "tip_changed"
+    } else if next.transactions != current.transactions
+        || next.transaction_bytes != current.transaction_bytes
+    {
+        "mempool_changed"
+    } else {
+        "template_changed"
+    }
 }
 
 async fn get_block_template(
@@ -340,6 +465,22 @@ async fn submit_block(
         .unwrap_or(serde_json::Value::Null))
 }
 
+async fn get_mempool_info(client: &reqwest::Client, endpoint: &str) -> Result<(usize, u64)> {
+    let payload = rpc_call(client, endpoint, "getmempoolinfo", &[]).await?;
+    let result = payload
+        .get("result")
+        .context("missing result in getmempoolinfo response")?;
+    let transactions = result
+        .get("size")
+        .and_then(serde_json::Value::as_u64)
+        .context("missing getmempoolinfo.result.size")? as usize;
+    let bytes = result
+        .get("bytes")
+        .and_then(serde_json::Value::as_u64)
+        .context("missing getmempoolinfo.result.bytes")?;
+    Ok((transactions, bytes))
+}
+
 async fn rpc_call(
     client: &reqwest::Client,
     endpoint: &str,
@@ -373,7 +514,7 @@ async fn rpc_call(
 ///
 /// This reimplements the logic from `zebra_rpc::proposal_block_from_template` using
 /// only `zebra-chain` types, avoiding the heavy `zebra-rpc` dependency tree.
-fn block_from_template(template: &serde_json::Value) -> Result<Block> {
+fn block_from_template(template: &serde_json::Value, network: &Network) -> Result<Block> {
     let version = template["version"].as_u64().context("missing version")? as u32;
 
     let prev_hash_hex = template["previousblockhash"]
@@ -439,7 +580,7 @@ fn block_from_template(template: &serde_json::Value) -> Result<Block> {
         time,
         difficulty_threshold,
         nonce: HexDebug([0; 32]),
-        solution: Solution::for_proposal(),
+        solution: Solution::for_proposal(network),
     };
 
     Ok(Block {
@@ -456,4 +597,14 @@ fn hex_to_32_bytes(hex_str: &str) -> Result<[u8; 32]> {
         <[u8; 32]>::from_hex(hex_str).map_err(|e| anyhow::anyhow!("hex decode error: {e}"))?;
     bytes.reverse();
     Ok(bytes)
+}
+
+fn network_from_chain_name(chain: &str) -> Result<Network> {
+    match chain.to_ascii_lowercase().as_str() {
+        "main" | "mainnet" => Ok(Network::Mainnet),
+        "test" | "testnet" => Ok(Network::new_default_testnet()),
+        other => anyhow::bail!(
+            "unsupported chain reported by getblockchaininfo: '{other}'. Expected main/test network."
+        ),
+    }
 }

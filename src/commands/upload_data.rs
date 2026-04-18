@@ -26,11 +26,13 @@ pub async fn run(directory: &str) -> Result<()> {
         let futs: Vec<_> = chunk
             .iter()
             .map(|entry| {
-                let relative = entry.strip_prefix(&data_dir).unwrap_or(entry);
+                let entry = entry.clone();
+                let relative = entry.strip_prefix(&data_dir).unwrap_or(&entry);
                 let s3_key = format!("{}/data/{}", config.experiment, relative.display());
                 let s3_client = &s3_client;
-                let bucket = &s3_cfg.bucket_name;
-                async move { s3::upload_file(s3_client, bucket, &s3_key, entry).await }
+                let s3_cfg = s3_cfg.clone();
+                let bucket = s3_cfg.bucket_name.clone();
+                async move { s3::upload_file(s3_client, &s3_cfg, &bucket, &s3_key, &entry).await }
             })
             .collect();
 

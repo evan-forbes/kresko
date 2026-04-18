@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use incrementalmerkletree::Position;
 use serde::Serialize;
 
@@ -116,12 +118,27 @@ impl PendingTxKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PendingRpcStatus {
+    #[default]
+    Unknown,
+    InMempool,
+    ConfirmedByRpc,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PendingTx {
     pub(crate) recovered_notes: Vec<RecoveredNote>,
     pub(crate) kind: PendingTxKind,
     pub(crate) spent_note_id: Option<String>,
+    pub(crate) spent_lane_id: Option<u64>,
+    pub(crate) spent_note_role: Option<NoteRole>,
+    pub(crate) spent_note_value: Option<u64>,
     pub(crate) spent_transparent_outpoint: Option<String>,
+    pub(crate) submitted_at: Instant,
+    pub(crate) submitted_height: u32,
+    pub(crate) last_rpc_status: PendingRpcStatus,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -129,6 +146,21 @@ pub(crate) struct PendingTxCounts {
     pub(crate) total: usize,
     pub(crate) expansion: usize,
     pub(crate) treasury_reseed: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PendingTraceSummary {
+    pub(crate) oldest_pending_ms: Option<u64>,
+    pub(crate) oldest_pending_blocks: Option<u32>,
+    pub(crate) rpc_pending_unknown: usize,
+    pub(crate) oldest_unknown_pending_ms: Option<u64>,
+    pub(crate) oldest_unknown_pending_blocks: Option<u32>,
+    pub(crate) rpc_pending_mempool: usize,
+    pub(crate) rpc_pending_confirmed: usize,
+    pub(crate) oldest_mempool_pending_ms: Option<u64>,
+    pub(crate) oldest_mempool_pending_blocks: Option<u32>,
+    pub(crate) oldest_confirmed_rpc_pending_ms: Option<u64>,
+    pub(crate) oldest_confirmed_rpc_pending_blocks: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

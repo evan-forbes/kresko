@@ -1,5 +1,7 @@
 pub mod digitalocean;
 pub mod google_cloud;
+pub mod google_cloud_quotas;
+pub mod linode;
 
 use anyhow::Result;
 
@@ -9,6 +11,7 @@ use crate::config::{Config, Instance, Provider};
 pub enum CloudClient {
     DigitalOcean(digitalocean::DigitalOceanClient),
     GoogleCloud(google_cloud::GoogleCloudClient),
+    Linode(linode::LinodeClient),
 }
 
 impl CloudClient {
@@ -16,6 +19,15 @@ impl CloudClient {
         match self {
             CloudClient::DigitalOcean(c) => c.up(workers).await,
             CloudClient::GoogleCloud(c) => c.up(workers).await,
+            CloudClient::Linode(c) => c.up(workers).await,
+        }
+    }
+
+    pub async fn sync_config_ips(&self, overwrite: bool) -> Result<Vec<Instance>> {
+        match self {
+            CloudClient::DigitalOcean(c) => c.sync_config_ips(overwrite).await,
+            CloudClient::GoogleCloud(c) => c.sync_config_ips(overwrite).await,
+            CloudClient::Linode(c) => c.sync_config_ips(overwrite).await,
         }
     }
 
@@ -23,6 +35,15 @@ impl CloudClient {
         match self {
             CloudClient::DigitalOcean(c) => c.down(workers, all).await,
             CloudClient::GoogleCloud(c) => c.down(workers, all).await,
+            CloudClient::Linode(c) => c.down(workers, all).await,
+        }
+    }
+
+    pub async fn matching_resource_names(&self, all: bool) -> Result<Vec<String>> {
+        match self {
+            CloudClient::DigitalOcean(c) => c.matching_resource_names(all).await,
+            CloudClient::GoogleCloud(c) => c.matching_resource_names(all).await,
+            CloudClient::Linode(c) => c.matching_resource_names(all).await,
         }
     }
 
@@ -30,6 +51,7 @@ impl CloudClient {
         match self {
             CloudClient::DigitalOcean(c) => c.list().await,
             CloudClient::GoogleCloud(c) => c.list().await,
+            CloudClient::Linode(c) => c.list().await,
         }
     }
 }
@@ -43,5 +65,6 @@ pub fn new_client(cfg: Config) -> Result<CloudClient> {
         Provider::GoogleCloud => Ok(CloudClient::GoogleCloud(
             google_cloud::GoogleCloudClient::new(cfg)?,
         )),
+        Provider::Linode => Ok(CloudClient::Linode(linode::LinodeClient::new(cfg)?)),
     }
 }

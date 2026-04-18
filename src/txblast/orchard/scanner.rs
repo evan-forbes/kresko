@@ -15,7 +15,7 @@ use crate::txblast::rpc::ZebraRpcClient;
 
 use super::{
     LaneRegistry, OrchardKeys, OrchardTxblastTracer, PendingTx, RuntimePhase, TrackedNote,
-    TreasuryInventory, decode_txblast_note_role, pending_counts,
+    TreasuryInventory, decode_txblast_note_role, pending_counts, pending_trace_summary,
 };
 
 pub(crate) type OrchardTree = ShardTree<MemoryShardStore<MerkleHashOrchard, u32>, 32, 16>;
@@ -169,6 +169,7 @@ pub(crate) async fn scan_block_range(
             registry,
             treasury,
             pending_counts(pending_txs),
+            pending_trace_summary(pending_txs, height),
             submit_credit,
             orchard_cfg,
             None,
@@ -360,6 +361,11 @@ async fn scan_block(
                 treasury: treasury.snapshot(),
                 reason: None,
                 error: None,
+                error_class: None,
+                build_duration_ms: None,
+                rpc_submit_duration_ms: None,
+                confirm_delay_ms: Some(duration_ms_u64(pending.submitted_at.elapsed().as_millis())),
+                confirm_delay_blocks: Some(height.saturating_sub(pending.submitted_height)),
             });
         }
     }
@@ -411,4 +417,8 @@ async fn scan_block(
     }
 
     Ok(true)
+}
+
+fn duration_ms_u64(duration_ms: u128) -> u64 {
+    duration_ms.min(u128::from(u64::MAX)) as u64
 }

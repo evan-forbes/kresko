@@ -31,6 +31,15 @@ rpc_has_result_and_no_error() {
     printf '%s' "$response" | jq -e '.error == null and .result != null' >/dev/null 2>&1
 }
 
+install_binary_atomic() {
+    local src="$1"
+    local dest="$2"
+    local tmp="${dest}.new"
+
+    install -m 0755 "$src" "$tmp"
+    mv -f "$tmp" "$dest"
+}
+
 echo "=== Installing dependencies ==="
 apt_retry update -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
 apt_retry install -y build-essential curl jq chrony tmux btop nethogs
@@ -42,14 +51,10 @@ echo "=== Configuring time sync ==="
 systemctl enable chrony
 systemctl start chrony
 
-echo "=== Configuring BBR congestion control ==="
-modprobe tcp_bbr || true
-sysctl -w net.core.default_qdisc=fq
-sysctl -w net.ipv4.tcp_congestion_control=bbr
-echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+echo "=== Leaving TCP sysctl defaults unchanged; experiments configure transport settings per run ==="
 
 echo "=== Extracting payload ==="
+rm -rf /root/payload
 tar -xzf /root/$ARCHIVE_NAME -C /root/
 source /root/payload/vars.sh
 
@@ -58,18 +63,17 @@ source /root/payload/vars.sh
 # They'll be re-exported just before launching zebrad.
 _SAVED_P2P_TRACE_DIR="${ZEBRA_P2P_TRACE_DIR:-}"
 _SAVED_P2P_TRACE_FILE="${ZEBRA_P2P_TRACE_FILE:-}"
-unset ZEBRA_P2P_TRACE_DIR ZEBRA_P2P_TRACE_FILE
+_SAVED_FORK_TRACE_ENABLE="${ZEBRA_FORK_TRACE_ENABLE:-}"
+_SAVED_TRACE_DIR="${ZEBRA_TRACE_DIR:-}"
+unset ZEBRA_P2P_TRACE_DIR ZEBRA_P2P_TRACE_FILE ZEBRA_FORK_TRACE_ENABLE ZEBRA_TRACE_DIR
 
 cd $HOME
 hostname=$(hostname)
 parsed_hostname=$(echo $hostname | awk -F'-' '{print $1 "-" $2}')
 
 echo "=== Installing binaries ==="
-cp payload/build/zebrad /usr/local/bin/zebrad
-chmod +x /usr/local/bin/zebrad
-
-cp payload/build/kresko /usr/local/bin/kresko
-chmod +x /usr/local/bin/kresko
+install_binary_atomic payload/build/zebrad /usr/local/bin/zebrad
+install_binary_atomic payload/build/kresko /usr/local/bin/kresko
 
 echo "=== Setting up zebra config ==="
 echo "=== Resetting zebra state cache ==="
@@ -422,12 +426,19 @@ fi
 echo "=== Starting zebrad ==="
 
 # Re-export tracing env vars now that config parsing is done.
-# zebra's p2p_tracing module reads these directly via std::env::var().
+# zebra's p2p_tracing and fork_tracing modules read these directly via std::env::var().
 if [ -n "$_SAVED_P2P_TRACE_DIR" ]; then
     export ZEBRA_P2P_TRACE_DIR="$_SAVED_P2P_TRACE_DIR"
 fi
 if [ -n "$_SAVED_P2P_TRACE_FILE" ]; then
     export ZEBRA_P2P_TRACE_FILE="$_SAVED_P2P_TRACE_FILE"
+fi
+if [ -n "$_SAVED_FORK_TRACE_ENABLE" ]; then
+    export ZEBRA_FORK_TRACE_ENABLE="$_SAVED_FORK_TRACE_ENABLE"
+fi
+if [ -n "$_SAVED_TRACE_DIR" ]; then
+    export ZEBRA_TRACE_DIR="$_SAVED_TRACE_DIR"
+    mkdir -p "$ZEBRA_TRACE_DIR"
 fi
 
 LOG_FILE="/root/logs"

@@ -1,22 +1,28 @@
 use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use tokio::task::JoinHandle;
 
 use super::orchard::{
-    LaneRegistry, OrchardChainCursor, OrchardKeys, OrchardNullifierIndex, OrchardTree,
-    OrchardTxblastTracer, PendingTx, PendingTxKind, RuntimePhase, ScheduledWork, TreasuryInventory,
-    build_and_send_lane_advance_tx, build_and_send_reservoir_expand_tx,
-    build_and_send_shielding_tx, build_and_send_treasury_reseed_tx, derive_orchard_keys,
-    detect_reorg_reason, latest_checkpoint_anchor, latest_witness, min_bootstrap_shield_value,
-    min_lane_value, min_reservoir_value, pending_counts, plan_next_work, plan_shielding_outputs,
-    poll_best_tip, refresh_treasury_inventory, scan_block_range, wait_for_tip_change,
+    BuiltTx, LaneRegistry, OrchardChainCursor, OrchardKeys, OrchardNullifierIndex, OrchardTree,
+    OrchardTxblastTracer, PendingRpcStatus, PendingTx, PendingTxKind, RuntimePhase, ScheduledWork,
+    TrackedNote, TreasuryInventory, build_and_send_shielding_tx, build_lane_advance_tx,
+    derive_orchard_keys, detect_reorg_reason, latest_checkpoint_anchor, latest_witness,
+    min_bootstrap_shield_value, min_lane_value, pending_counts, pending_trace_summary,
+    plan_next_work, plan_shielding_outputs, poll_best_tip, refresh_treasury_inventory,
+    scan_block_range, wait_for_tip_change,
 };
 use super::rpc::ZebraRpcClient;
 use super::transparent::FundedKey;
 use super::{OrchardBlastRuntimeConfig, TxblastTraceConfig};
 
 const LOOP_IDLE_SLEEP: Duration = Duration::from_millis(100);
+const BUILD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const TARGET_HEIGHT_OFFSET_BLOCKS: u32 = 100;
 
 fn is_unknown_orchard_anchor(error: &str) -> bool {
@@ -25,6 +31,184 @@ fn is_unknown_orchard_anchor(error: &str) -> bool {
 
 fn is_witness_rebuild_error(error: &str) -> bool {
     error.contains("witness_at_checkpoint_id") || error.contains("no witness for position")
+}
+
+fn duration_ms_u64(duration_ms: u128) -> u64 {
+    duration_ms.min(u128::from(u64::MAX)) as u64
+}
+
+fn classify_error(error: &str) -> Option<&'static str> {
+    if error.contains("unknown Orchard anchor") {
+        Some("unknown_orchard_anchor")
+    } else if error.contains("same effects as one already in the mempool") {
+        Some("same_effects_already_in_mempool")
+    } else if error.contains("duplicate nullifier") {
+        Some("duplicate_nullifier")
+    } else if error.contains("already spent in mempool") {
+        Some("already_spent_in_mempool")
+    } else if error.contains("verification cancelled") {
+        Some("verification_cancelled")
+    } else if error.contains("witness_at_checkpoint_id") {
+        Some("witness_at_checkpoint_missing")
+    } else if error.contains("no witness for position") {
+        Some("witness_position_missing")
+    } else if error.contains("transaction not found")
+        || error.contains("no such mempool or blockchain transaction")
+    {
+        Some("tx_not_found")
+    } else if error.contains("timeout") {
+        Some("rpc_timeout")
+    } else {
+        None
+    }
+}
+
+struct BuildHeartbeat {
+    stop: Arc<AtomicBool>,
+    task: JoinHandle<()>,
+}
+
+impl BuildHeartbeat {
+    fn start(
+        tracer: &OrchardTxblastTracer,
+        height: u32,
+        phase: RuntimePhase,
+        tx_kind: PendingTxKind,
+        lane_id: Option<u64>,
+        note_id: Option<&str>,
+        note_role: Option<super::orchard::NoteRole>,
+        note_value: Option<u64>,
+        pending: super::orchard::PendingTxCounts,
+        registry: super::orchard::state::RegistrySnapshot,
+        treasury: super::orchard::state::TreasurySnapshot,
+        reason: &'static str,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let task_stop = Arc::clone(&stop);
+        let tracer = tracer.clone();
+        let note_id = note_id.map(ToOwned::to_owned);
+        let started_at = Instant::now();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(BUILD_HEARTBEAT_INTERVAL).await;
+                if task_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                tracer.trace_event(super::orchard::tracing::EventContext {
+                    height: Some(height),
+                    phase,
+                    event: "build_heartbeat",
+                    tx_kind: Some(tx_kind),
+                    txid: None,
+                    lane_id,
+                    note_id: note_id.as_deref(),
+                    note_role,
+                    note_value,
+                    pending,
+                    registry,
+                    treasury,
+                    reason: Some(reason),
+                    error: None,
+                    error_class: None,
+                    build_duration_ms: Some(duration_ms_u64(started_at.elapsed().as_millis())),
+                    rpc_submit_duration_ms: None,
+                    confirm_delay_ms: None,
+                    confirm_delay_blocks: None,
+                });
+            }
+        });
+
+        Self { stop, task }
+    }
+
+    fn finish(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.task.abort();
+    }
+}
+
+async fn probe_submitted_tx_visibility(
+    client: &ZebraRpcClient,
+    tracer: &OrchardTxblastTracer,
+    registry: &LaneRegistry,
+    treasury: &TreasuryInventory,
+    pending_txs: &mut HashMap<String, PendingTx>,
+    height: u32,
+    phase: RuntimePhase,
+    txid: &str,
+) {
+    let pending_counts_snapshot = pending_counts(pending_txs);
+    let registry_snapshot = registry.snapshot();
+    let treasury_snapshot = treasury.snapshot();
+
+    let tx = match client.try_get_raw_transaction_verbose(txid).await {
+        Ok(tx) => tx,
+        Err(error) => {
+            if let Some(pending) = pending_txs.get(txid) {
+                let error_text = error.to_string();
+                tracer.trace_event(super::orchard::tracing::EventContext {
+                    height: Some(height),
+                    phase,
+                    event: "tx_post_submit_rpc_lookup_failed",
+                    tx_kind: Some(pending.kind),
+                    txid: Some(txid),
+                    lane_id: pending.spent_lane_id,
+                    note_id: pending.spent_note_id.as_deref(),
+                    note_role: pending.spent_note_role,
+                    note_value: pending.spent_note_value,
+                    pending: pending_counts_snapshot,
+                    registry: registry_snapshot,
+                    treasury: treasury_snapshot,
+                    reason: Some("post_submit_rpc_probe"),
+                    error: Some(error_text.clone()),
+                    error_class: classify_error(&error_text),
+                    build_duration_ms: None,
+                    rpc_submit_duration_ms: None,
+                    confirm_delay_ms: Some(0),
+                    confirm_delay_blocks: Some(0),
+                });
+            }
+            return;
+        }
+    };
+
+    let Some(pending) = pending_txs.get_mut(txid) else {
+        return;
+    };
+
+    let event = match tx {
+        None => "tx_post_submit_not_visible",
+        Some(tx) if tx.blockhash.is_some() || tx.confirmations.unwrap_or(0) > 0 => {
+            pending.last_rpc_status = PendingRpcStatus::ConfirmedByRpc;
+            "tx_post_submit_confirmed_rpc"
+        }
+        Some(_) => {
+            pending.last_rpc_status = PendingRpcStatus::InMempool;
+            "tx_post_submit_mempool_seen"
+        }
+    };
+
+    tracer.trace_event(super::orchard::tracing::EventContext {
+        height: Some(height),
+        phase,
+        event,
+        tx_kind: Some(pending.kind),
+        txid: Some(txid),
+        lane_id: pending.spent_lane_id,
+        note_id: pending.spent_note_id.as_deref(),
+        note_role: pending.spent_note_role,
+        note_value: pending.spent_note_value,
+        pending: pending_counts_snapshot,
+        registry: registry_snapshot,
+        treasury: treasury_snapshot,
+        reason: Some("post_submit_rpc_probe"),
+        error: None,
+        error_class: None,
+        build_duration_ms: None,
+        rpc_submit_duration_ms: None,
+        confirm_delay_ms: Some(duration_ms_u64(pending.submitted_at.elapsed().as_millis())),
+        confirm_delay_blocks: Some(height.saturating_sub(pending.submitted_height)),
+    });
 }
 
 async fn fetch_orchard_anchor(client: &ZebraRpcClient) -> Result<orchard::Anchor> {
@@ -80,6 +264,11 @@ fn transition_phase(
         treasury: treasury.snapshot(),
         reason: None,
         error: None,
+        error_class: None,
+        build_duration_ms: None,
+        rpc_submit_duration_ms: None,
+        confirm_delay_ms: None,
+        confirm_delay_blocks: None,
     });
 }
 
@@ -123,7 +312,12 @@ async fn rescan_orchard_state_from_chain(
         registry: registry.snapshot(),
         treasury: treasury.snapshot(),
         reason: Some(reason),
+        error_class: error.as_deref().and_then(classify_error),
         error,
+        build_duration_ms: None,
+        rpc_submit_duration_ms: None,
+        confirm_delay_ms: None,
+        confirm_delay_blocks: None,
     });
     tracer.trace_registry(
         Some(rebuild_height),
@@ -132,6 +326,7 @@ async fn rescan_orchard_state_from_chain(
         registry,
         treasury,
         pending_counts(pending_txs),
+        pending_trace_summary(pending_txs, rebuild_height),
         submit_credit,
         orchard_cfg,
         Some(reason),
@@ -175,6 +370,7 @@ async fn rescan_orchard_state_from_chain(
         registry,
         treasury,
         pending_counts(pending_txs),
+        pending_trace_summary(pending_txs, cursor.last_scanned_height()),
         submit_credit,
         orchard_cfg,
         Some(reason),
@@ -222,6 +418,7 @@ async fn refresh_and_trace_treasury(
         registry,
         treasury,
         pending_counts(pending_txs),
+        pending_trace_summary(pending_txs, current_height),
         submit_credit,
         orchard_cfg,
         reason,
@@ -237,38 +434,128 @@ async fn reconcile_pending_txs(
     treasury: &TreasuryInventory,
     pending_txs: &mut HashMap<String, PendingTx>,
     height: u32,
+    phase: RuntimePhase,
 ) -> Result<Option<&'static str>> {
     let txids = pending_txs.keys().cloned().collect::<Vec<_>>();
     let mut evicted_any = false;
 
     for txid in txids {
-        if client
-            .try_get_raw_transaction_verbose(&txid)
-            .await?
-            .is_some()
-        {
-            continue;
-        }
+        let tx = match client.try_get_raw_transaction_verbose(&txid).await {
+            Ok(tx) => tx,
+            Err(error) => {
+                if let Some(pending) = pending_txs.get(&txid) {
+                    tracer.trace_event(super::orchard::tracing::EventContext {
+                        height: Some(height),
+                        phase,
+                        event: "pending_tx_rpc_lookup_failed",
+                        tx_kind: Some(pending.kind),
+                        txid: Some(&txid),
+                        lane_id: pending.spent_lane_id,
+                        note_id: pending.spent_note_id.as_deref(),
+                        note_role: pending.spent_note_role,
+                        note_value: pending.spent_note_value,
+                        pending: pending_counts(pending_txs),
+                        registry: registry.snapshot(),
+                        treasury: treasury.snapshot(),
+                        reason: Some("pending_tx_rpc_lookup"),
+                        error_class: classify_error(&error.to_string()),
+                        error: Some(error.to_string()),
+                        build_duration_ms: None,
+                        rpc_submit_duration_ms: None,
+                        confirm_delay_ms: None,
+                        confirm_delay_blocks: Some(height.saturating_sub(pending.submitted_height)),
+                    });
+                }
+                return Err(error);
+            }
+        };
 
-        let Some(pending) = pending_txs.remove(&txid) else {
+        let Some(tx) = tx else {
+            let Some(pending) = pending_txs.remove(&txid) else {
+                continue;
+            };
+            evicted_any = true;
+            tracer.trace_event(super::orchard::tracing::EventContext {
+                height: Some(height),
+                phase,
+                event: "pending_tx_evicted",
+                tx_kind: Some(pending.kind),
+                txid: Some(&txid),
+                lane_id: pending.spent_lane_id,
+                note_id: pending.spent_note_id.as_deref(),
+                note_role: pending.spent_note_role,
+                note_value: pending.spent_note_value,
+                pending: pending_counts(pending_txs),
+                registry: registry.snapshot(),
+                treasury: treasury.snapshot(),
+                reason: Some("rebuilding_after_pending_eviction"),
+                error: None,
+                error_class: None,
+                build_duration_ms: None,
+                rpc_submit_duration_ms: None,
+                confirm_delay_ms: Some(duration_ms_u64(pending.submitted_at.elapsed().as_millis())),
+                confirm_delay_blocks: Some(height.saturating_sub(pending.submitted_height)),
+            });
             continue;
         };
-        evicted_any = true;
+
+        let rpc_status = if tx.blockhash.is_some() || tx.confirmations.unwrap_or(0) > 0 {
+            PendingRpcStatus::ConfirmedByRpc
+        } else {
+            PendingRpcStatus::InMempool
+        };
+
+        let Some((
+            kind,
+            lane_id,
+            note_id,
+            note_role,
+            note_value,
+            pending_age_ms,
+            pending_age_blocks,
+        )) = pending_txs.get_mut(&txid).and_then(|pending| {
+            if pending.last_rpc_status == rpc_status {
+                return None;
+            }
+
+            pending.last_rpc_status = rpc_status;
+            Some((
+                pending.kind,
+                pending.spent_lane_id,
+                pending.spent_note_id.clone(),
+                pending.spent_note_role,
+                pending.spent_note_value,
+                duration_ms_u64(pending.submitted_at.elapsed().as_millis()),
+                height.saturating_sub(pending.submitted_height),
+            ))
+        })
+        else {
+            continue;
+        };
         tracer.trace_event(super::orchard::tracing::EventContext {
             height: Some(height),
-            phase: RuntimePhase::Recovering,
-            event: "pending_tx_evicted",
-            tx_kind: Some(pending.kind),
+            phase,
+            event: match rpc_status {
+                PendingRpcStatus::Unknown => unreachable!("unknown is not an observed RPC state"),
+                PendingRpcStatus::InMempool => "pending_tx_mempool_seen",
+                PendingRpcStatus::ConfirmedByRpc => "pending_tx_confirmed_rpc",
+            },
+            tx_kind: Some(kind),
             txid: Some(&txid),
-            lane_id: None,
-            note_id: pending.spent_note_id.as_deref(),
-            note_role: None,
-            note_value: None,
+            lane_id: lane_id,
+            note_id: note_id.as_deref(),
+            note_role: note_role,
+            note_value: note_value,
             pending: pending_counts(pending_txs),
             registry: registry.snapshot(),
             treasury: treasury.snapshot(),
-            reason: Some("rebuilding_after_pending_eviction"),
+            reason: Some("pending_tx_rpc_state_changed"),
             error: None,
+            error_class: None,
+            build_duration_ms: None,
+            rpc_submit_duration_ms: None,
+            confirm_delay_ms: Some(pending_age_ms),
+            confirm_delay_blocks: Some(pending_age_blocks),
         });
     }
 
@@ -320,6 +607,7 @@ async fn sync_orchard_chain_state(
         treasury,
         pending_txs,
         cursor.last_scanned_height(),
+        phase,
     )
     .await?
     {
@@ -533,7 +821,33 @@ async fn run_bootstrap(
             .get_block_count()
             .await?
             .saturating_add(TARGET_HEIGHT_OFFSET_BLOCKS);
-        let (txid, pending) = build_and_send_shielding_tx(
+        tracer.trace_registry(
+            Some(cursor.last_scanned_height()),
+            phase,
+            "build_start",
+            registry,
+            treasury,
+            pending_counts(pending_txs),
+            pending_trace_summary(pending_txs, cursor.last_scanned_height()),
+            0.0,
+            orchard_cfg,
+            Some("proving_bootstrap_shield"),
+        );
+        let heartbeat = BuildHeartbeat::start(
+            tracer,
+            cursor.last_scanned_height(),
+            phase,
+            PendingTxKind::WarmupShielding,
+            None,
+            Some(&utxo.outpoint_id),
+            None,
+            Some(utxo.satoshis),
+            pending_counts(pending_txs),
+            registry.snapshot(),
+            treasury.snapshot(),
+            "proving_bootstrap_shield",
+        );
+        let submitted = build_and_send_shielding_tx(
             client,
             key,
             keys,
@@ -543,10 +857,14 @@ async fn run_bootstrap(
             utxo.satoshis,
             &planned_outputs,
             anchor,
+            cursor.last_scanned_height(),
             target_height,
             PendingTxKind::WarmupShielding,
         )
         .await?;
+        heartbeat.finish();
+        let txid = submitted.txid;
+        let pending = submitted.pending;
         tracer.trace_event(super::orchard::tracing::EventContext {
             height: Some(cursor.last_scanned_height()),
             phase,
@@ -566,6 +884,11 @@ async fn run_bootstrap(
             treasury: treasury.snapshot(),
             reason: Some("bootstrap_shield"),
             error: None,
+            error_class: None,
+            build_duration_ms: Some(submitted.build_duration_ms),
+            rpc_submit_duration_ms: Some(submitted.rpc_submit_duration_ms),
+            confirm_delay_ms: None,
+            confirm_delay_blocks: None,
         });
         for recovered in &pending.recovered_notes {
             tracer.trace_recovered_note(
@@ -577,6 +900,17 @@ async fn run_bootstrap(
             );
         }
         pending_txs.insert(txid.clone(), pending);
+        probe_submitted_tx_visibility(
+            client,
+            tracer,
+            registry,
+            treasury,
+            pending_txs,
+            cursor.last_scanned_height(),
+            phase,
+            &txid,
+        )
+        .await;
 
         let tip_before_wait = cursor
             .best_tip()
@@ -702,6 +1036,7 @@ pub async fn run(
         &registry,
         &treasury,
         pending_counts(&pending_txs),
+        pending_trace_summary(&pending_txs, best_tip.height),
         0.0,
         orchard_cfg,
         Some("starting_up"),
@@ -783,6 +1118,7 @@ pub async fn run(
         &registry,
         &treasury,
         pending_counts(&pending_txs),
+        pending_trace_summary(&pending_txs, cursor.last_scanned_height()),
         0.0,
         orchard_cfg,
         None,
@@ -813,6 +1149,27 @@ pub async fn run(
         )
         .await
         {
+            tracer.trace_event(super::orchard::tracing::EventContext {
+                height: Some(cursor.last_scanned_height()),
+                phase: RuntimePhase::SteadyState,
+                event: "chain_sync_failed",
+                tx_kind: None,
+                txid: None,
+                lane_id: None,
+                note_id: None,
+                note_role: None,
+                note_value: None,
+                pending: pending_counts(&pending_txs),
+                registry: registry.snapshot(),
+                treasury: treasury.snapshot(),
+                reason: Some("sync_orchard_chain_state"),
+                error: Some(error.to_string()),
+                error_class: classify_error(&error.to_string()),
+                build_duration_ms: None,
+                rpc_submit_duration_ms: None,
+                confirm_delay_ms: None,
+                confirm_delay_blocks: None,
+            });
             eprintln!(
                 "[shielded][warn] Orchard chain sync failed at height {}: {error}",
                 cursor.last_scanned_height()
@@ -839,6 +1196,27 @@ pub async fn run(
             )
             .await
             {
+                tracer.trace_event(super::orchard::tracing::EventContext {
+                    height: Some(current),
+                    phase: RuntimePhase::SteadyState,
+                    event: "treasury_refresh_failed",
+                    tx_kind: None,
+                    txid: None,
+                    lane_id: None,
+                    note_id: None,
+                    note_role: None,
+                    note_value: None,
+                    pending: pending_counts(&pending_txs),
+                    registry: registry.snapshot(),
+                    treasury: treasury.snapshot(),
+                    reason: Some("refresh_treasury_inventory"),
+                    error: Some(e.to_string()),
+                    error_class: classify_error(&e.to_string()),
+                    build_duration_ms: None,
+                    rpc_submit_duration_ms: None,
+                    confirm_delay_ms: None,
+                    confirm_delay_blocks: None,
+                });
                 eprintln!("[shielded][warn] treasury refresh failed at height {current}: {e}");
             } else {
                 last_treasury_refresh_height = Some(current);
@@ -851,9 +1229,21 @@ pub async fn run(
             (submit_credit + elapsed * rate as f64).min(orchard_cfg.max_in_flight as f64);
 
         let mut submitted_any = false;
-        while submit_credit >= 1.0 && pending_txs.len() < orchard_cfg.max_in_flight {
+
+        // --- Parallel batch proving for lane advances ---
+        //
+        // Phase 1: Validate checkpoint, compute anchor, batch up to
+        //          proving_workers work items with their merkle witnesses.
+        // Phase 2: Prove all items in parallel via spawn_blocking.
+        // Phase 3: Submit built txs serially, handle results.
+
+        if submit_credit >= 1.0 && pending_txs.len() < orchard_cfg.max_in_flight {
             let Some(checkpoint) = cursor.latest_checkpoint().cloned() else {
-                break;
+                // No checkpoint — nothing to do this iteration.
+                if !submitted_any {
+                    tokio::time::sleep(LOOP_IDLE_SLEEP).await;
+                }
+                continue;
             };
 
             match client.get_block_hash(checkpoint.height).await {
@@ -876,491 +1266,338 @@ pub async fn run(
                         None,
                     )
                     .await?;
-                    break;
+                    continue;
                 }
             }
 
             let anchor = latest_checkpoint_anchor(&tree, &checkpoint)?;
             let target_height = current.saturating_add(TARGET_HEIGHT_OFFSET_BLOCKS);
-            let Some(work) =
-                plan_next_work(&mut registry, &mut treasury, &pending_txs, orchard_cfg)
-            else {
-                break;
-            };
 
-            match work {
-                ScheduledWork::ReservoirExpand(tracked) => {
-                    if tracked.value() < min_reservoir_value(orchard_cfg) {
-                        if tracked.value() > super::orchard::ORCHARD_SPEND_FEE {
-                            let promoted = registry.promote_reservoir_to_lane(tracked);
-                            tracer.trace_tracked_note(
-                                Some(current),
-                                "note_promoted_to_lane",
-                                &promoted,
-                                None,
-                                Some("reservoir_below_expansion_floor"),
-                            );
-                        } else {
+            // Determine how many items we can batch.
+            let batch_capacity = std::cmp::min(
+                orchard_cfg.proving_workers,
+                std::cmp::min(
+                    orchard_cfg.max_in_flight.saturating_sub(pending_txs.len()),
+                    submit_credit as usize,
+                ),
+            );
+
+            // Phase 1: Plan work items and compute witnesses.
+            let mut lane_batch: Vec<(TrackedNote, orchard::tree::MerklePath)> = Vec::new();
+            let mut batch_aborted = false;
+
+            while lane_batch.len() < batch_capacity {
+                let Some(work) =
+                    plan_next_work(&mut registry, &mut treasury, &pending_txs, orchard_cfg)
+                else {
+                    break;
+                };
+
+                match work {
+                    ScheduledWork::LaneAdvance(tracked) => {
+                        if tracked.value() <= super::orchard::ORCHARD_SPEND_FEE {
                             registry.drain_note();
                             tracer.trace_tracked_note(
                                 Some(current),
                                 "note_drained",
                                 &tracked,
                                 None,
-                                Some("reservoir_below_spend_fee"),
+                                Some("lane_below_spend_fee"),
                             );
+                            continue;
                         }
-                        continue;
-                    }
 
-                    tracer.trace_tracked_note(
-                        Some(current),
-                        "note_selected",
-                        &tracked,
-                        None,
-                        Some("reservoir_expand"),
-                    );
-                    tracer.trace_registry(
-                        Some(current),
-                        RuntimePhase::SteadyState,
-                        "build_start",
-                        &registry,
-                        &treasury,
-                        pending_counts(&pending_txs),
-                        submit_credit,
-                        orchard_cfg,
-                        Some("proving_reservoir_expand"),
-                    );
-
-                    let merkle_path = match latest_witness(&tree, &tracked, &checkpoint) {
-                        Ok(path) => path,
-                        Err(e) => {
-                            let error = e.to_string();
-                            eprintln!("[shielded][warn] reservoir witness error: {error}");
-                            tracer.trace_event(super::orchard::tracing::EventContext {
-                                height: Some(current),
-                                phase: RuntimePhase::SteadyState,
-                                event: "witness_error",
-                                tx_kind: Some(PendingTxKind::ReservoirExpand),
-                                txid: None,
-                                lane_id: tracked.lane_id,
-                                note_id: Some(&tracked.note_id),
-                                note_role: Some(tracked.role),
-                                note_value: Some(tracked.value()),
-                                pending: pending_counts(&pending_txs),
-                                registry: registry.snapshot(),
-                                treasury: treasury.snapshot(),
-                                reason: Some("reservoir_expand"),
-                                error: Some(error.clone()),
-                            });
-                            if is_witness_rebuild_error(&error) {
-                                rescan_orchard_state_from_chain(
-                                    client,
-                                    &keys,
-                                    orchard_cfg,
-                                    &tracer,
-                                    &mut tree,
-                                    &mut next_position,
-                                    &mut nullifier_index,
-                                    &mut cursor,
-                                    &mut registry,
-                                    &mut treasury,
-                                    &mut pending_txs,
-                                    submit_credit,
-                                    "rebuilding_after_witness_error",
-                                    Some(error),
-                                )
-                                .await?;
-                            } else {
-                                registry.requeue(tracked.clone());
-                                tracer.trace_tracked_note(
-                                    Some(current),
-                                    "note_requeued",
-                                    &tracked,
-                                    None,
-                                    Some("witness_error"),
-                                );
-                            }
-                            break;
-                        }
-                    };
-
-                    match build_and_send_reservoir_expand_tx(
-                        client,
-                        &keys,
-                        &tracked,
-                        merkle_path,
-                        anchor,
-                        target_height,
-                        orchard_cfg,
-                    )
-                    .await
-                    {
-                        Ok((txid, pending)) => {
-                            tracer.trace_event(super::orchard::tracing::EventContext {
-                                height: Some(current),
-                                phase: RuntimePhase::SteadyState,
-                                event: "tx_submitted",
-                                tx_kind: Some(PendingTxKind::ReservoirExpand),
-                                txid: Some(&txid),
-                                lane_id: tracked.lane_id,
-                                note_id: Some(&tracked.note_id),
-                                note_role: Some(tracked.role),
-                                note_value: Some(tracked.value()),
-                                pending: {
-                                    let mut counts = pending_counts(&pending_txs);
-                                    counts.total += 1;
-                                    counts.expansion += 1;
-                                    counts
-                                },
-                                registry: registry.snapshot(),
-                                treasury: treasury.snapshot(),
-                                reason: None,
-                                error: None,
-                            });
-                            tracer.trace_tracked_note(
-                                Some(current),
-                                "note_submitted",
-                                &tracked,
-                                Some(&txid),
-                                Some("reservoir_expand"),
-                            );
-                            for recovered in &pending.recovered_notes {
-                                tracer.trace_recovered_note(
-                                    Some(current),
-                                    "note_submitted",
-                                    recovered,
-                                    Some(&txid),
-                                    Some("reservoir_expand_output"),
-                                );
-                            }
-                            pending_txs.insert(txid.clone(), pending);
-                            tx_count += 1;
-                            submit_credit -= 1.0;
-                            submitted_any = true;
-                        }
-                        Err(e) => {
-                            err_count += 1;
-                            let error = e.to_string();
-                            eprintln!("[shielded][warn] reservoir expansion failed: {error}");
-                            tracer.trace_event(super::orchard::tracing::EventContext {
-                                height: Some(current),
-                                phase: RuntimePhase::SteadyState,
-                                event: "tx_submit_failed",
-                                tx_kind: Some(PendingTxKind::ReservoirExpand),
-                                txid: None,
-                                lane_id: tracked.lane_id,
-                                note_id: Some(&tracked.note_id),
-                                note_role: Some(tracked.role),
-                                note_value: Some(tracked.value()),
-                                pending: pending_counts(&pending_txs),
-                                registry: registry.snapshot(),
-                                treasury: treasury.snapshot(),
-                                reason: Some("reservoir_expand"),
-                                error: Some(error.clone()),
-                            });
-                            if is_unknown_orchard_anchor(&error) {
-                                rescan_orchard_state_from_chain(
-                                    client,
-                                    &keys,
-                                    orchard_cfg,
-                                    &tracer,
-                                    &mut tree,
-                                    &mut next_position,
-                                    &mut nullifier_index,
-                                    &mut cursor,
-                                    &mut registry,
-                                    &mut treasury,
-                                    &mut pending_txs,
-                                    submit_credit,
-                                    "rebuilding_after_anchor_rejection",
-                                    Some(error),
-                                )
-                                .await?;
-                                break;
-                            }
-                            registry.requeue(tracked.clone());
-                            tracer.trace_tracked_note(
-                                Some(current),
-                                "note_requeued",
-                                &tracked,
-                                None,
-                                Some("submit_failed"),
-                            );
-                            break;
-                        }
-                    }
-                }
-                ScheduledWork::TreasuryReseed(utxo) => {
-                    tracer.trace_event(super::orchard::tracing::EventContext {
-                        height: Some(current),
-                        phase: RuntimePhase::SteadyState,
-                        event: "treasury_selected",
-                        tx_kind: Some(PendingTxKind::TreasuryReseed),
-                        txid: None,
-                        lane_id: None,
-                        note_id: Some(&utxo.outpoint_id),
-                        note_role: None,
-                        note_value: Some(utxo.satoshis),
-                        pending: pending_counts(&pending_txs),
-                        registry: registry.snapshot(),
-                        treasury: treasury.snapshot(),
-                        reason: Some("treasury_reseed"),
-                        error: None,
-                    });
-                    tracer.trace_registry(
-                        Some(current),
-                        RuntimePhase::SteadyState,
-                        "build_start",
-                        &registry,
-                        &treasury,
-                        pending_counts(&pending_txs),
-                        submit_credit,
-                        orchard_cfg,
-                        Some("proving_treasury_reseed"),
-                    );
-
-                    match build_and_send_treasury_reseed_tx(
-                        client,
-                        key,
-                        &keys,
-                        &utxo,
-                        anchor,
-                        target_height,
-                        orchard_cfg,
-                    )
-                    .await
-                    {
-                        Ok((txid, pending)) => {
-                            tracer.trace_event(super::orchard::tracing::EventContext {
-                                height: Some(current),
-                                phase: RuntimePhase::SteadyState,
-                                event: "tx_submitted",
-                                tx_kind: Some(PendingTxKind::TreasuryReseed),
-                                txid: Some(&txid),
-                                lane_id: None,
-                                note_id: Some(&utxo.outpoint_id),
-                                note_role: None,
-                                note_value: Some(utxo.satoshis),
-                                pending: {
-                                    let mut counts = pending_counts(&pending_txs);
-                                    counts.total += 1;
-                                    counts.treasury_reseed += 1;
-                                    counts
-                                },
-                                registry: registry.snapshot(),
-                                treasury: treasury.snapshot(),
-                                reason: None,
-                                error: None,
-                            });
-                            for recovered in &pending.recovered_notes {
-                                tracer.trace_recovered_note(
-                                    Some(current),
-                                    "note_submitted",
-                                    recovered,
-                                    Some(&txid),
-                                    Some("treasury_reseed_output"),
-                                );
-                            }
-                            pending_txs.insert(txid.clone(), pending);
-                            tx_count += 1;
-                            submit_credit -= 1.0;
-                            submitted_any = true;
-                        }
-                        Err(e) => {
-                            err_count += 1;
-                            let error = e.to_string();
-                            eprintln!("[shielded][warn] treasury reseed failed: {error}");
-                            tracer.trace_event(super::orchard::tracing::EventContext {
-                                height: Some(current),
-                                phase: RuntimePhase::SteadyState,
-                                event: "tx_submit_failed",
-                                tx_kind: Some(PendingTxKind::TreasuryReseed),
-                                txid: None,
-                                lane_id: None,
-                                note_id: Some(&utxo.outpoint_id),
-                                note_role: None,
-                                note_value: Some(utxo.satoshis),
-                                pending: pending_counts(&pending_txs),
-                                registry: registry.snapshot(),
-                                treasury: treasury.snapshot(),
-                                reason: Some("treasury_reseed"),
-                                error: Some(error.clone()),
-                            });
-                            if is_unknown_orchard_anchor(&error) {
-                                treasury.requeue(utxo);
-                                rescan_orchard_state_from_chain(
-                                    client,
-                                    &keys,
-                                    orchard_cfg,
-                                    &tracer,
-                                    &mut tree,
-                                    &mut next_position,
-                                    &mut nullifier_index,
-                                    &mut cursor,
-                                    &mut registry,
-                                    &mut treasury,
-                                    &mut pending_txs,
-                                    submit_credit,
-                                    "rebuilding_after_anchor_rejection",
-                                    Some(error),
-                                )
-                                .await?;
-                                break;
-                            }
-                            treasury.requeue(utxo);
-                            break;
-                        }
-                    }
-                }
-                ScheduledWork::LaneAdvance(tracked) => {
-                    if tracked.value() <= super::orchard::ORCHARD_SPEND_FEE {
-                        registry.drain_note();
                         tracer.trace_tracked_note(
                             Some(current),
-                            "note_drained",
+                            "note_selected",
                             &tracked,
                             None,
-                            Some("lane_below_spend_fee"),
+                            Some("lane_advance"),
                         );
-                        continue;
+
+                        let merkle_path = match latest_witness(&tree, &tracked, &checkpoint) {
+                            Ok(path) => path,
+                            Err(e) => {
+                                let error = e.to_string();
+                                eprintln!("[shielded][warn] lane witness error: {error}");
+                                tracer.trace_event(super::orchard::tracing::EventContext {
+                                    height: Some(current),
+                                    phase: RuntimePhase::SteadyState,
+                                    event: "witness_error",
+                                    tx_kind: Some(PendingTxKind::LaneAdvance),
+                                    txid: None,
+                                    lane_id: tracked.lane_id,
+                                    note_id: Some(&tracked.note_id),
+                                    note_role: Some(tracked.role),
+                                    note_value: Some(tracked.value()),
+                                    pending: pending_counts(&pending_txs),
+                                    registry: registry.snapshot(),
+                                    treasury: treasury.snapshot(),
+                                    reason: Some("lane_advance"),
+                                    error: Some(error.clone()),
+                                    error_class: classify_error(&error),
+                                    build_duration_ms: None,
+                                    rpc_submit_duration_ms: None,
+                                    confirm_delay_ms: None,
+                                    confirm_delay_blocks: None,
+                                });
+                                if is_witness_rebuild_error(&error) {
+                                    // Requeue already-batched items before rescan.
+                                    for (batched, _) in lane_batch.drain(..) {
+                                        registry.requeue(batched);
+                                    }
+                                    rescan_orchard_state_from_chain(
+                                        client,
+                                        &keys,
+                                        orchard_cfg,
+                                        &tracer,
+                                        &mut tree,
+                                        &mut next_position,
+                                        &mut nullifier_index,
+                                        &mut cursor,
+                                        &mut registry,
+                                        &mut treasury,
+                                        &mut pending_txs,
+                                        submit_credit,
+                                        "rebuilding_after_witness_error",
+                                        Some(error),
+                                    )
+                                    .await?;
+                                    batch_aborted = true;
+                                } else {
+                                    registry.requeue(tracked.clone());
+                                    tracer.trace_tracked_note(
+                                        Some(current),
+                                        "note_requeued",
+                                        &tracked,
+                                        None,
+                                        Some("witness_error"),
+                                    );
+                                }
+                                break;
+                            }
+                        };
+
+                        lane_batch.push((tracked, merkle_path));
                     }
+                    // ReservoirExpand / TreasuryReseed are currently unreachable
+                    // (plan_next_work only returns LaneAdvance). If they become
+                    // reachable, they'll be handled serially in a future iteration
+                    // after the batch is processed.
+                    ScheduledWork::ReservoirExpand(tracked) => {
+                        registry.requeue(tracked);
+                        break;
+                    }
+                    ScheduledWork::TreasuryReseed(utxo) => {
+                        treasury.requeue(utxo);
+                        break;
+                    }
+                }
+            }
 
-                    tracer.trace_tracked_note(
-                        Some(current),
-                        "note_selected",
-                        &tracked,
-                        None,
-                        Some("lane_advance"),
-                    );
-                    tracer.trace_registry(
-                        Some(current),
-                        RuntimePhase::SteadyState,
-                        "build_start",
-                        &registry,
-                        &treasury,
-                        pending_counts(&pending_txs),
-                        submit_credit,
-                        orchard_cfg,
-                        Some("proving_lane_advance"),
-                    );
+            if !batch_aborted && !lane_batch.is_empty() {
+                let batch_len = lane_batch.len();
+                tracer.trace_registry(
+                    Some(current),
+                    RuntimePhase::SteadyState,
+                    "build_start",
+                    &registry,
+                    &treasury,
+                    pending_counts(&pending_txs),
+                    pending_trace_summary(&pending_txs, current),
+                    submit_credit,
+                    orchard_cfg,
+                    Some("proving_lane_advance_batch"),
+                );
 
-                    let merkle_path = match latest_witness(&tree, &tracked, &checkpoint) {
-                        Ok(path) => path,
-                        Err(e) => {
-                            let error = e.to_string();
-                            eprintln!("[shielded][warn] lane witness error: {error}");
-                            tracer.trace_event(super::orchard::tracing::EventContext {
-                                height: Some(current),
-                                phase: RuntimePhase::SteadyState,
-                                event: "witness_error",
-                                tx_kind: Some(PendingTxKind::LaneAdvance),
-                                txid: None,
-                                lane_id: tracked.lane_id,
-                                note_id: Some(&tracked.note_id),
-                                note_role: Some(tracked.role),
-                                note_value: Some(tracked.value()),
-                                pending: pending_counts(&pending_txs),
-                                registry: registry.snapshot(),
-                                treasury: treasury.snapshot(),
-                                reason: Some("lane_advance"),
-                                error: Some(error.clone()),
-                            });
-                            if is_witness_rebuild_error(&error) {
-                                rescan_orchard_state_from_chain(
-                                    client,
-                                    &keys,
-                                    orchard_cfg,
-                                    &tracer,
-                                    &mut tree,
-                                    &mut next_position,
-                                    &mut nullifier_index,
-                                    &mut cursor,
-                                    &mut registry,
-                                    &mut treasury,
-                                    &mut pending_txs,
-                                    submit_credit,
-                                    "rebuilding_after_witness_error",
-                                    Some(error),
-                                )
-                                .await?;
-                            } else {
-                                registry.requeue(tracked.clone());
-                                tracer.trace_tracked_note(
-                                    Some(current),
-                                    "note_requeued",
-                                    &tracked,
-                                    None,
-                                    Some("witness_error"),
-                                );
-                            }
-                            break;
+                // Phase 2: Prove in parallel via spawn_blocking.
+                let mut tracked_notes: Vec<TrackedNote> = Vec::with_capacity(batch_len);
+                let mut build_handles: Vec<tokio::task::JoinHandle<anyhow::Result<BuiltTx>>> =
+                    Vec::with_capacity(batch_len);
+
+                for (tracked, merkle_path) in lane_batch {
+                    let keys_clone = keys.clone();
+                    let tracked_clone = tracked.clone();
+                    build_handles.push(tokio::task::spawn_blocking(move || {
+                        build_lane_advance_tx(
+                            &keys_clone,
+                            &tracked_clone,
+                            merkle_path,
+                            anchor,
+                            target_height,
+                        )
+                    }));
+                    tracked_notes.push(tracked);
+                }
+
+                // Collect all build results (awaiting each handle in order).
+                let mut built_results: Vec<(TrackedNote, Result<BuiltTx, String>)> =
+                    Vec::with_capacity(batch_len);
+                for (tracked, handle) in tracked_notes.into_iter().zip(build_handles) {
+                    match handle.await {
+                        Ok(Ok(built)) => built_results.push((tracked, Ok(built))),
+                        Ok(Err(e)) => built_results.push((tracked, Err(e.to_string()))),
+                        Err(join_err) => {
+                            eprintln!("[shielded][warn] proving task panicked: {join_err}");
+                            built_results.push((tracked, Err(join_err.to_string())));
                         }
-                    };
+                    }
+                }
 
-                    match build_and_send_lane_advance_tx(
-                        client,
-                        &keys,
-                        &tracked,
-                        merkle_path,
-                        anchor,
-                        target_height,
-                    )
-                    .await
-                    {
-                        Ok((txid, pending)) => {
-                            tracer.trace_event(super::orchard::tracing::EventContext {
-                                height: Some(current),
-                                phase: RuntimePhase::SteadyState,
-                                event: "tx_submitted",
-                                tx_kind: Some(PendingTxKind::LaneAdvance),
-                                txid: Some(&txid),
-                                lane_id: tracked.lane_id,
-                                note_id: Some(&tracked.note_id),
-                                note_role: Some(tracked.role),
-                                note_value: Some(tracked.value()),
-                                pending: {
-                                    let mut counts = pending_counts(&pending_txs);
-                                    counts.total += 1;
-                                    counts
-                                },
-                                registry: registry.snapshot(),
-                                treasury: treasury.snapshot(),
-                                reason: None,
-                                error: None,
-                            });
-                            tracer.trace_tracked_note(
-                                Some(current),
-                                "note_submitted",
-                                &tracked,
-                                Some(&txid),
-                                Some("lane_advance"),
-                            );
-                            for recovered in &pending.recovered_notes {
-                                tracer.trace_recovered_note(
-                                    Some(current),
-                                    "note_submitted",
-                                    recovered,
-                                    Some(&txid),
-                                    Some("lane_advance_output"),
-                                );
+                // Phase 3: Submit built txs and handle results.
+                let mut needs_rescan = false;
+                let mut rescan_error: Option<String> = None;
+
+                for (tracked, result) in built_results {
+                    match result {
+                        Ok(built) => {
+                            if needs_rescan {
+                                // Anchor is stale; skip submission, requeue.
+                                registry.requeue(tracked);
+                                continue;
                             }
-                            pending_txs.insert(txid.clone(), pending);
-                            tx_count += 1;
-                            submit_credit -= 1.0;
-                            submitted_any = true;
+
+                            let submit_start = Instant::now();
+                            match client.send_raw_transaction(&built.tx_hex).await {
+                                Ok(txid) => {
+                                    let rpc_submit_duration_ms =
+                                        duration_ms_u64(submit_start.elapsed().as_millis());
+                                    let submitted_at = Instant::now();
+                                    let recovered_notes = built
+                                        .recovered_notes
+                                        .into_iter()
+                                        .map(|note| {
+                                            note.with_origin(&txid, Some(tracked.note_id.clone()))
+                                        })
+                                        .collect();
+
+                                    let pending = PendingTx {
+                                        recovered_notes,
+                                        kind: PendingTxKind::LaneAdvance,
+                                        spent_note_id: Some(tracked.note_id.clone()),
+                                        spent_lane_id: tracked.lane_id,
+                                        spent_note_role: Some(tracked.role),
+                                        spent_note_value: Some(tracked.value()),
+                                        spent_transparent_outpoint: None,
+                                        submitted_at,
+                                        submitted_height: current,
+                                        last_rpc_status: PendingRpcStatus::Unknown,
+                                    };
+
+                                    tracer.trace_event(super::orchard::tracing::EventContext {
+                                        height: Some(current),
+                                        phase: RuntimePhase::SteadyState,
+                                        event: "tx_submitted",
+                                        tx_kind: Some(PendingTxKind::LaneAdvance),
+                                        txid: Some(&txid),
+                                        lane_id: tracked.lane_id,
+                                        note_id: Some(&tracked.note_id),
+                                        note_role: Some(tracked.role),
+                                        note_value: Some(tracked.value()),
+                                        pending: {
+                                            let mut counts = pending_counts(&pending_txs);
+                                            counts.total += 1;
+                                            counts
+                                        },
+                                        registry: registry.snapshot(),
+                                        treasury: treasury.snapshot(),
+                                        reason: None,
+                                        error: None,
+                                        error_class: None,
+                                        build_duration_ms: Some(built.build_duration_ms),
+                                        rpc_submit_duration_ms: Some(rpc_submit_duration_ms),
+                                        confirm_delay_ms: None,
+                                        confirm_delay_blocks: None,
+                                    });
+                                    tracer.trace_tracked_note(
+                                        Some(current),
+                                        "note_submitted",
+                                        &tracked,
+                                        Some(&txid),
+                                        Some("lane_advance"),
+                                    );
+                                    for recovered in &pending.recovered_notes {
+                                        tracer.trace_recovered_note(
+                                            Some(current),
+                                            "note_submitted",
+                                            recovered,
+                                            Some(&txid),
+                                            Some("lane_advance_output"),
+                                        );
+                                    }
+                                    pending_txs.insert(txid.clone(), pending);
+                                    probe_submitted_tx_visibility(
+                                        client,
+                                        &tracer,
+                                        &registry,
+                                        &treasury,
+                                        &mut pending_txs,
+                                        current,
+                                        RuntimePhase::SteadyState,
+                                        &txid,
+                                    )
+                                    .await;
+                                    tx_count += 1;
+                                    submit_credit -= 1.0;
+                                    submitted_any = true;
+                                }
+                                Err(e) => {
+                                    err_count += 1;
+                                    let error = e.to_string();
+                                    eprintln!(
+                                        "[shielded][warn] lane advance submit failed for lane {:?}: {error}",
+                                        tracked.lane_id
+                                    );
+                                    tracer.trace_event(super::orchard::tracing::EventContext {
+                                        height: Some(current),
+                                        phase: RuntimePhase::SteadyState,
+                                        event: "tx_submit_failed",
+                                        tx_kind: Some(PendingTxKind::LaneAdvance),
+                                        txid: None,
+                                        lane_id: tracked.lane_id,
+                                        note_id: Some(&tracked.note_id),
+                                        note_role: Some(tracked.role),
+                                        note_value: Some(tracked.value()),
+                                        pending: pending_counts(&pending_txs),
+                                        registry: registry.snapshot(),
+                                        treasury: treasury.snapshot(),
+                                        reason: Some("lane_advance"),
+                                        error: Some(error.clone()),
+                                        error_class: classify_error(&error),
+                                        build_duration_ms: Some(built.build_duration_ms),
+                                        rpc_submit_duration_ms: None,
+                                        confirm_delay_ms: None,
+                                        confirm_delay_blocks: None,
+                                    });
+                                    if is_unknown_orchard_anchor(&error) {
+                                        needs_rescan = true;
+                                        rescan_error = Some(error);
+                                    }
+                                    registry.requeue(tracked.clone());
+                                    tracer.trace_tracked_note(
+                                        Some(current),
+                                        "note_requeued",
+                                        &tracked,
+                                        None,
+                                        Some("submit_failed"),
+                                    );
+                                }
+                            }
                         }
-                        Err(e) => {
+                        Err(error) => {
+                            if needs_rescan {
+                                registry.requeue(tracked);
+                                continue;
+                            }
                             err_count += 1;
-                            let error = e.to_string();
                             eprintln!(
-                                "[shielded][warn] lane advance failed for lane {:?}: {error}",
+                                "[shielded][warn] lane advance build failed for lane {:?}: {error}",
                                 tracked.lane_id
                             );
                             tracer.trace_event(super::orchard::tracing::EventContext {
                                 height: Some(current),
                                 phase: RuntimePhase::SteadyState,
-                                event: "tx_submit_failed",
+                                event: "tx_build_failed",
                                 tx_kind: Some(PendingTxKind::LaneAdvance),
                                 txid: None,
                                 lane_id: tracked.lane_id,
@@ -1372,26 +1609,15 @@ pub async fn run(
                                 treasury: treasury.snapshot(),
                                 reason: Some("lane_advance"),
                                 error: Some(error.clone()),
+                                error_class: classify_error(&error),
+                                build_duration_ms: None,
+                                rpc_submit_duration_ms: None,
+                                confirm_delay_ms: None,
+                                confirm_delay_blocks: None,
                             });
                             if is_unknown_orchard_anchor(&error) {
-                                rescan_orchard_state_from_chain(
-                                    client,
-                                    &keys,
-                                    orchard_cfg,
-                                    &tracer,
-                                    &mut tree,
-                                    &mut next_position,
-                                    &mut nullifier_index,
-                                    &mut cursor,
-                                    &mut registry,
-                                    &mut treasury,
-                                    &mut pending_txs,
-                                    submit_credit,
-                                    "rebuilding_after_anchor_rejection",
-                                    Some(error),
-                                )
-                                .await?;
-                                break;
+                                needs_rescan = true;
+                                rescan_error = Some(error);
                             }
                             registry.requeue(tracked.clone());
                             tracer.trace_tracked_note(
@@ -1399,11 +1625,30 @@ pub async fn run(
                                 "note_requeued",
                                 &tracked,
                                 None,
-                                Some("submit_failed"),
+                                Some("build_failed"),
                             );
-                            break;
                         }
                     }
+                }
+
+                if needs_rescan {
+                    rescan_orchard_state_from_chain(
+                        client,
+                        &keys,
+                        orchard_cfg,
+                        &tracer,
+                        &mut tree,
+                        &mut next_position,
+                        &mut nullifier_index,
+                        &mut cursor,
+                        &mut registry,
+                        &mut treasury,
+                        &mut pending_txs,
+                        submit_credit,
+                        "rebuilding_after_anchor_rejection",
+                        rescan_error,
+                    )
+                    .await?;
                 }
             }
         }
@@ -1428,6 +1673,7 @@ pub async fn run(
                 &registry,
                 &treasury,
                 pending_counts(&pending_txs),
+                pending_trace_summary(&pending_txs, current),
                 submit_credit,
                 orchard_cfg,
                 None,
