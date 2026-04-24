@@ -1,0 +1,4 @@
+Equihash benchmark: params=common (200,9), elapsed=120.970s
+  nonce_trials=187 (1.546/s)
+  equihash_solutions=362 (2.992 sol/s)
+  matrix input: --sol-per-sec common=2.992480350

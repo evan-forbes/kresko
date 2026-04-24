@@ -1,0 +1,4 @@
+Equihash benchmark: params=regtest (48,5), elapsed=120.000s
+  nonce_trials=1595921 (13299.335/s)
+  equihash_solutions=908744 (7572.863 sol/s)
+  matrix input: --sol-per-sec regtest=7572.862991367

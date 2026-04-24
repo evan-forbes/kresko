@@ -12,7 +12,6 @@ pub mod init;
 pub mod kill_session;
 pub mod list;
 pub mod mine;
-pub mod premine;
 pub mod progress;
 pub mod prune;
 pub mod queue;

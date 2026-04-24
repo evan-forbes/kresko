@@ -3,13 +3,14 @@ use hex::FromHex;
 use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::Write as IoWrite;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zebra_chain::{
     block::{self, Block, Header},
     fmt::HexDebug,
-    parameters::Network,
+    parameters::{EquihashParams, Network, testnet},
     serialization::{ZcashDeserializeInto, ZcashSerialize},
     work::{
         difficulty::CompactDifficulty,
@@ -49,7 +50,7 @@ struct TemplateSummary {
     transaction_bytes: usize,
 }
 
-pub async fn run(rpc_endpoint: &str) -> Result<()> {
+pub async fn run(rpc_endpoint: &str, zebrad_config: &Path) -> Result<()> {
     println!("Starting PoW miner against {rpc_endpoint}");
 
     // Verify connection
@@ -61,7 +62,17 @@ pub async fn run(rpc_endpoint: &str) -> Result<()> {
     let chain = info["result"]["chain"].as_str().unwrap_or("unknown");
     let height = info["result"]["blocks"].as_u64().unwrap_or(0);
     println!("Connected: chain={chain}, height={height}");
-    let network = network_from_chain_name(chain)?;
+    let rpc_network = network_from_chain_name(chain)?;
+    let network = match load_equihash_params(zebrad_config)? {
+        Some(equihash_params) if is_test_chain_name(chain) => {
+            configured_testnet_network(equihash_params)?
+        }
+        _ => rpc_network,
+    };
+    println!(
+        "Mining with Equihash parameters: {:?}",
+        network.equihash_params()
+    );
 
     let mut log_file = OpenOptions::new()
         .create(true)
@@ -78,13 +89,22 @@ pub async fn run(rpc_endpoint: &str) -> Result<()> {
 
     loop {
         // 1. Get block template
-        let template = match get_block_template(&client, rpc_endpoint, longpollid.as_deref()).await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("Failed to get block template: {e}");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
+        let template = loop {
+            match get_block_template(&client, rpc_endpoint, longpollid.as_deref()).await {
+                Ok(template) => break template,
+                Err(err) => {
+                    if longpollid.is_some() {
+                        eprintln!(
+                            "Failed to get block template with longpollid: {err}; clearing \
+                             longpoll state and retrying immediately"
+                        );
+                        longpollid = None;
+                        continue;
+                    }
+
+                    eprintln!("Failed to get block template: {err}");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
             }
         };
 
@@ -607,4 +627,53 @@ fn network_from_chain_name(chain: &str) -> Result<Network> {
             "unsupported chain reported by getblockchaininfo: '{other}'. Expected main/test network."
         ),
     }
+}
+
+fn is_test_chain_name(chain: &str) -> bool {
+    matches!(chain.to_ascii_lowercase().as_str(), "test" | "testnet")
+}
+
+fn configured_testnet_network(equihash_params: EquihashParams) -> Result<Network> {
+    testnet::Parameters::build()
+        .with_equihash_params(equihash_params)
+        .to_network()
+        .map_err(|err| anyhow::anyhow!("failed to build mining network parameters: {err}"))
+}
+
+fn load_equihash_params(config_path: &Path) -> Result<Option<EquihashParams>> {
+    if !config_path.exists() {
+        eprintln!(
+            "zebrad config {} not found; falling back to RPC chain defaults",
+            config_path.display()
+        );
+        return Ok(None);
+    }
+
+    let config = std::fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read zebrad config {}", config_path.display()))?;
+    let parsed: toml::Value = toml::from_str(&config)
+        .with_context(|| format!("failed to parse zebrad config {}", config_path.display()))?;
+    let Some(value) = parsed
+        .get("network")
+        .and_then(|network| network.get("testnet_parameters"))
+        .and_then(|params| params.get("equihash_params"))
+        .and_then(toml::Value::as_str)
+    else {
+        return Ok(None);
+    };
+
+    let equihash_params = match value {
+        "common" => EquihashParams::Common,
+        "regtest" => EquihashParams::Regtest,
+        other => anyhow::bail!(
+            "unsupported network.testnet_parameters.equihash_params in {}: {other}",
+            config_path.display(),
+        ),
+    };
+    println!(
+        "Loaded Equihash parameters {:?} from {}",
+        equihash_params,
+        config_path.display()
+    );
+    Ok(Some(equihash_params))
 }

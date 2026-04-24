@@ -35,7 +35,9 @@ pub async fn kill_known_sessions(miners: &str, workers: usize, directory: &str) 
     let owned_targets: Vec<_> = targets.iter().map(|&inst| inst.clone()).collect();
     for session in KNOWN_SESSIONS {
         println!("  Killing {session} sessions...");
-        tmux::stop_tmux_session(&owned_targets, &key, session, Duration::from_secs(30)).await;
+        for chunk in owned_targets.chunks(workers) {
+            tmux::stop_tmux_session(chunk, &key, session, Duration::from_secs(30)).await;
+        }
     }
     Ok(())
 }
@@ -64,7 +66,9 @@ pub async fn run(miners: &str, workers: usize, directory: &str) -> Result<()> {
     let owned_targets: Vec<_> = targets.iter().map(|&inst| inst.clone()).collect();
     for session in KNOWN_SESSIONS {
         println!("  Killing {session} sessions...");
-        tmux::stop_tmux_session(&owned_targets, &key, session, Duration::from_secs(30)).await;
+        for chunk in owned_targets.chunks(workers) {
+            tmux::stop_tmux_session(chunk, &key, session, Duration::from_secs(30)).await;
+        }
     }
 
     // Clean up remote state in worker-sized chunks.

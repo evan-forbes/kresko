@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 const SSH_OPTS: &[&str] = &[
@@ -66,17 +69,78 @@ pub async fn sftp_download(
     remote_path: &str,
     local_path: &str,
 ) -> Result<()> {
-    let output = Command::new("scp")
+    let status = Command::new("scp")
         .args(SSH_OPTS)
         .args(["-i", key, &format!("root@{host}:{remote_path}"), local_path])
-        .output()
+        .status()
         .await
         .with_context(|| format!("SFTP download from {host} failed"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("SFTP download from {host} failed: {stderr}");
+    if !status.success() {
+        anyhow::bail!("SFTP download from {host} failed with status {status}");
     }
 
     Ok(())
+}
+
+/// Execute a command on a remote host via SSH and stream stdout into a local file.
+pub async fn ssh_exec_to_file(
+    host: &str,
+    key: &str,
+    command: &str,
+    local_path: &str,
+) -> Result<u64> {
+    let mut child = Command::new("ssh")
+        .args(SSH_OPTS)
+        .args(["-i", key, &format!("root@{host}"), command])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("SSH to {host} failed"))?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .with_context(|| format!("SSH to {host} did not expose stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .with_context(|| format!("SSH to {host} did not expose stderr"))?;
+
+    let mut file = File::create(local_path)
+        .await
+        .with_context(|| format!("failed to create {local_path}"))?;
+
+    let stdout_task = tokio::spawn(async move {
+        let copied = tokio::io::copy(&mut stdout, &mut file).await?;
+        file.flush().await?;
+        Ok::<u64, std::io::Error>(copied)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        stderr.read_to_end(&mut buf).await?;
+        Ok::<Vec<u8>, std::io::Error>(buf)
+    });
+
+    let status = child
+        .wait()
+        .await
+        .with_context(|| format!("SSH to {host} failed"))?;
+    let copied = stdout_task
+        .await
+        .with_context(|| format!("SSH stdout task for {host} failed"))??;
+    let stderr = stderr_task
+        .await
+        .with_context(|| format!("SSH stderr task for {host} failed"))??;
+
+    if !status.success() {
+        let _ = tokio::fs::remove_file(local_path).await;
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
+        if stderr.is_empty() {
+            anyhow::bail!("SSH command on {host} failed with status {status}");
+        }
+        anyhow::bail!("SSH command on {host} failed: {stderr}");
+    }
+
+    Ok(copied)
 }

@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, MiningMode, OrchardTxblastConfig, Provider, resolve_value};
+use crate::config::{
+    Config, EquihashParameterSet, MiningMode, OrchardTxblastConfig, Provider, resolve_value,
+};
 use crate::zebra_config;
 
 const DEFAULT_TARGET_SPACING_SECS: u32 = 75;
@@ -15,6 +17,7 @@ pub fn run(
     ssh_key_name: Option<String>,
     mining_mode: MiningMode,
     block_time_secs: Option<u32>,
+    equihash_params: EquihashParameterSet,
     env_source: Option<&str>,
 ) -> Result<()> {
     let provider: Provider = provider.parse()?;
@@ -59,6 +62,7 @@ pub fn run(
         provider,
         mining_mode,
         block_time_secs,
+        equihash_params,
         orchard_txblast: OrchardTxblastConfig::default(),
         local_genesis: None,
     };

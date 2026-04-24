@@ -81,7 +81,7 @@ cd exp-nyc-sfo
 ../target/release/kresko add --node-type miner --count 1 --region random --low-resource
 
 # 4) Create cloud instances
-../target/release/kresko up --workers 8
+../target/release/kresko up -w 16
 
 # 5) Build payload (point to your local zebrad binary)
 ../target/release/kresko genesis \
@@ -92,7 +92,7 @@ cd exp-nyc-sfo
   --orchard-fanout-outputs 4
 
 # 6) Deploy and start remote nodes (tmux session: app)
-../target/release/kresko deploy --workers 8
+../target/release/kresko deploy -w 16
 
 # 7) Check RPC health/sync
 ../target/release/kresko status
@@ -139,22 +139,26 @@ kresko kill-session --session app
 kresko kill-session --session txblast
 
 # Download logs from all nodes into ./data/
-kresko download -n all -w 8
+kresko download -n all -w 16
 
 # Download only peer_message structured traces
-kresko download -n all -w 8 traces --tables peer_message
+kresko download -n all -w 16 traces -t peer_message
 
 # Download every file from each node's discovered trace directories
-kresko download -n all -w 8 traces
+kresko download -n all -w 16 traces
 
 # Download a canonical block height/time/size trace from selected miners,
-# using up to 4 concurrent RPC block fetches, 16-height batches,
+# using up to 16 concurrent RPC block fetches, 16-height batches,
 # async tip probing, failover between miners, and resume from any
-# existing data/heights.jsonl unless --force is set
-kresko download -n 0,1,2 -w 4 heights --batch-size 16
+# existing data/heights.jsonl unless -f/--force is set
+kresko download -n 0,1,2 -w 16 heights -b 16
 ```
 
 `scripts/network_diag.sh` is included for per-node RPC/network checks and can be run directly on a node.
+
+Structured trace table reference:
+
+- [`docs/trace-tables.md`](docs/trace-tables.md)
 
 ## Command Reference
 

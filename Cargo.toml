@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 aws-config = "1"
-equihash = "0.2.2"
+equihash = { git = "https://github.com/evan-forbes/librustzcash.git", rev = "08a1d4b6f3185ca9ff9a799d815ab4985c3ae41e", version = "0.3" }
 aws-sdk-s3 = "1"
 aws-smithy-types = "1"
 base64 = "0.22"

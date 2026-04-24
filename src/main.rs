@@ -14,6 +14,8 @@ mod zebra_config;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+const DEFAULT_WORKERS: usize = 16;
+
 #[derive(Parser)]
 #[command(name = "kresko", about = "Zcash experimental network deployer")]
 struct Cli {
@@ -34,27 +36,31 @@ enum Commands {
         experiment: String,
 
         /// Cloud provider
-        #[arg(long, default_value = "digitalocean")]
+        #[arg(short = 'p', long, default_value = "digitalocean")]
         provider: String,
 
         /// Path to SSH public key
-        #[arg(long)]
+        #[arg(short = 'k', long)]
         ssh_pub_key_path: Option<String>,
 
         /// SSH key name in cloud provider
-        #[arg(long)]
+        #[arg(short = 'K', long)]
         ssh_key_name: Option<String>,
 
         /// Mining mode: "generate" (default, PoW disabled) or "pow" (real PoW mining)
-        #[arg(long, default_value = "generate")]
+        #[arg(short = 'm', long, default_value = "generate")]
         mining_mode: String,
 
         /// Target block time in seconds (default: 75, post-Blossom)
-        #[arg(long)]
+        #[arg(short = 't', long)]
         block_time: Option<u32>,
 
+        /// Equihash parameter set for configured testnets: regtest/easy (48,5) or common (200,9)
+        #[arg(long, default_value = "regtest")]
+        equihash_params: String,
+
         /// Optional shared env file to seed the generated experiment .env
-        #[arg(long)]
+        #[arg(short = 's', long)]
         env_source: Option<String>,
     },
 
@@ -69,15 +75,15 @@ enum Commands {
         count: usize,
 
         /// Cloud provider
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         provider: Option<String>,
 
         /// Use a low-resource instance size (for proving small nodes can keep up)
-        #[arg(long, default_value = "false")]
+        #[arg(short = 'l', long, default_value = "false")]
         low_resource: bool,
 
         /// Region (or "random")
-        #[arg(long, default_value = "random")]
+        #[arg(short = 'r', long, default_value = "random")]
         region: String,
 
         /// Experiment directory
@@ -88,15 +94,15 @@ enum Commands {
     /// Spin up cloud instances
     Up {
         /// Number of parallel workers
-        #[arg(short = 'w', long, default_value = "4")]
+        #[arg(short = 'w', long, default_value_t = DEFAULT_WORKERS)]
         workers: usize,
 
         /// Path to SSH public key
-        #[arg(long)]
+        #[arg(short = 'k', long)]
         ssh_pub_key_path: Option<String>,
 
         /// SSH key name in cloud provider
-        #[arg(long)]
+        #[arg(short = 'K', long)]
         ssh_key_name: Option<String>,
 
         /// Experiment directory
@@ -107,7 +113,7 @@ enum Commands {
     /// Sync instance IPs from cloud provider state back into config.json
     SyncIps {
         /// Refresh already-populated IP fields instead of only filling missing values
-        #[arg(long, default_value_t = false)]
+        #[arg(short = 'o', long, default_value_t = false)]
         overwrite: bool,
 
         /// Experiment directory
@@ -148,7 +154,7 @@ enum Commands {
         orchard_fanout_source_value_zats: u64,
 
         /// Number of child lane notes created by each fanout transaction
-        #[arg(long, default_value_t = 4)]
+        #[arg(long, default_value_t = 1)]
         orchard_fanout_outputs: usize,
 
         /// Directory whose contents are baked into the payload under `scripts/`.
@@ -159,82 +165,19 @@ enum Commands {
         /// Fractional adjustment to the natural calibrated target.
         /// `+0.10` = ~10% looser target (faster initial blocks); `-0.10` =
         /// ~10% tighter. Leave at 0 unless observed block times on your
-        /// fleet need a nudge. Only applied when `mining_mode = pow` AND
-        /// the cache misses (the hit path doesn't recalibrate).
+        /// fleet need a nudge.
         #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         pow_adjust: f64,
-
-        /// Premine cache entry to load (directory under `bootstrap/cache/`).
-        /// On HIT, the slow Equihash benchmark + calibration is skipped
-        /// entirely — every parameter is read from the entry's manifest.
-        /// On MISS, kresko prints a loud warning and falls back to
-        /// benchmarking + mining a fresh premine, storing the result under
-        /// this same key so subsequent runs hit. The default key encodes
-        /// `<block_time_secs>-<funded_key_count>` of the canonical premine
-        /// bundle that ships with the repo.
-        #[arg(long, default_value_t = premine::DEFAULT_CACHE_KEY.to_string())]
-        premine_cache_key: String,
 
         /// Experiment directory
         #[arg(short = 'd', long, default_value = ".")]
         directory: String,
     },
 
-    /// Resolve (or generate) the premine cache entry for a calibration.
-    ///
-    /// Use this to warm the cache ahead of an experiment so the slow Equihash
-    /// mining step is paid down before launch. The command:
-    ///
-    ///   1. Benchmarks Equihash sol/s on this machine (single-threaded).
-    ///   2. Divides by a conservative discount (4×) to estimate fleet sol/s.
-    ///   3. Calibrates a target_difficulty_limit from
-    ///      `(mining_cpus, block_time_secs, assumed_fleet_sol_per_sec)`.
-    ///   4. Resolves the matching cache entry, mining a fresh premine if missing.
-    ///
-    /// `kresko genesis` runs the same algorithm, so the entry warmed here will
-    /// be a cache hit when genesis fires with matching `--mining-cpus` and
-    /// `block_time_secs` (assuming similar local sol/s — different operator
-    /// machines may compute slightly different targets).
-    ///
-    /// A new cache entry is generated whenever the inputs above produce a
-    /// different target_difficulty_limit or block_time_secs. Tighter targets
-    /// (more miners, faster spacing) cost proportionally more mining time on
-    /// first generation.
-    Premine {
-        /// Total mining CPUs in the experiment fleet (one Equihash thread per
-        /// CPU). The calibrated target scales inversely with this count.
-        #[arg(long)]
-        mining_cpus: usize,
-
-        /// Target block spacing in seconds (post-Blossom). Must match the
-        /// experiment's `block_time_secs` config value.
-        #[arg(long)]
-        block_time_secs: u32,
-
-        /// Fractional adjustment to the natural calibrated target. `+0.10` =
-        /// ~10% looser target (faster initial blocks); `-0.10` = ~10% tighter.
-        /// Mirror of `kresko genesis --pow-adjust`. Leave at 0 unless
-        /// observed block times need a nudge.
-        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
-        pow_adjust: f64,
-
-        /// Override the cache root directory. Defaults to the repo-local
-        /// `bootstrap/cache/` (gitignored).
-        #[arg(long)]
-        cache_dir: Option<std::path::PathBuf>,
-
-        /// Number of OS threads to run the Equihash solver in parallel. Each
-        /// thread searches a disjoint nonce partition; the first to find a
-        /// valid solution wins. Default auto-detects available CPUs and caps
-        /// at 8 (Equihash uses ~144 MB per thread).
-        #[arg(long)]
-        solver_threads: Option<usize>,
-    },
-
     /// Deploy payload to cloud instances and start nodes
     Deploy {
         /// Path to SSH private key
-        #[arg(long)]
+        #[arg(short = 'k', long)]
         ssh_key_path: Option<String>,
 
         /// Comma-separated miner indices, "all", or wildcard patterns
@@ -242,19 +185,24 @@ enum Commands {
         nodes: String,
 
         /// Number of parallel workers
-        #[arg(short = 'w', long, default_value = "4")]
+        #[arg(short = 'w', long, default_value_t = DEFAULT_WORKERS)]
         workers: usize,
 
         /// Continue even if some miners fail
-        #[arg(long)]
+        #[arg(short = 'i', long)]
         ignore_failed_miners: bool,
 
         /// Reuse an existing healthy `app` tmux session instead of failing.
-        #[arg(long, default_value_t = false)]
+        #[arg(short = 'r', long, default_value_t = false)]
         reuse_app_session: bool,
 
         /// Kill any existing `app` tmux session before starting the payload.
-        #[arg(long, default_value_t = false, conflicts_with = "reuse_app_session")]
+        #[arg(
+            short = 'x',
+            long,
+            default_value_t = false,
+            conflicts_with = "reuse_app_session"
+        )]
         restart_app_session: bool,
 
         /// Experiment directory
@@ -265,19 +213,19 @@ enum Commands {
     /// Query node status (block heights, sync progress)
     Status {
         /// Output as JSON
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
 
         /// Aggregate node heights into a compact summary
-        #[arg(long, default_value_t = false)]
+        #[arg(short = 's', long, default_value_t = false)]
         summary: bool,
 
         /// Include SSH / tmux / loopback RPC diagnostics
-        #[arg(long, default_value_t = false)]
+        #[arg(short = 'p', long, default_value_t = false)]
         deep: bool,
 
         /// Path to SSH private key for deep status checks
-        #[arg(long)]
+        #[arg(short = 'k', long)]
         ssh_key_path: Option<String>,
 
         /// Experiment directory
@@ -289,7 +237,7 @@ enum Commands {
     /// Exits with code 1 if unhealthy.
     Check {
         /// Output as JSON
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
 
         /// Experiment directory
@@ -307,7 +255,7 @@ enum Commands {
     /// Remove instances with public_ip="TBD" (failed provisioning) from config
     Prune {
         /// Print what would be removed without modifying config
-        #[arg(long)]
+        #[arg(short = 'n', long)]
         dry_run: bool,
 
         /// Experiment directory
@@ -322,7 +270,7 @@ enum Commands {
         block_time: u64,
 
         /// Pick miners randomly each interval instead of rotating
-        #[arg(long)]
+        #[arg(short = 'r', long)]
         random: bool,
 
         /// Number of miners to ping concurrently each interval
@@ -330,7 +278,7 @@ enum Commands {
         concurrent: usize,
 
         /// Subdirectory under data/ for progress.log.jsonl
-        #[arg(long)]
+        #[arg(short = 's', long)]
         data_subdir: Option<String>,
 
         /// Experiment directory
@@ -428,6 +376,10 @@ enum Commands {
         /// RPC endpoint
         #[arg(long, default_value = "http://localhost:18232")]
         rpc_endpoint: String,
+
+        /// Path to the zebrad.toml whose network parameters should be used for mining
+        #[arg(long, default_value = "/root/.config/zebrad.toml")]
+        zebrad_config: String,
     },
 
     /// Monte Carlo-simulate PoW block production for calibration validation
@@ -478,6 +430,63 @@ enum Commands {
         /// Optional path to write a per-block CSV.
         #[arg(long)]
         csv: Option<String>,
+    },
+
+    /// Benchmark the compiled Equihash solver used by live mining
+    PowBench {
+        /// Equihash parameter set to benchmark: common (200,9) or regtest (48,5).
+        #[arg(long, default_value = "common")]
+        equihash_params: String,
+
+        /// Minimum benchmark duration in seconds. A run may exceed this
+        /// because a single solver call is not interrupted.
+        #[arg(long, default_value_t = 10.0)]
+        min_seconds: f64,
+    },
+
+    /// Run a Monte Carlo matrix and write one aggregate CSV row per run
+    PowSimulateMatrix {
+        /// Comma-separated Equihash labels to compare.
+        #[arg(long, default_value = "common,regtest")]
+        equihash_params: String,
+
+        /// Per-thread sol/s values. Use either one value for all params,
+        /// positional values matching `--equihash-params`, or keyed values
+        /// like `common=1.0,regtest=500.0`.
+        #[arg(long)]
+        sol_per_sec: String,
+
+        /// Comma-separated single-thread miner counts.
+        #[arg(long, default_value = "10,20,40,60,80")]
+        miners: String,
+
+        /// Target block spacing in seconds.
+        #[arg(long, default_value_t = 75)]
+        target_spacing: u32,
+
+        /// Number of canonical blocks to simulate per run.
+        #[arg(long, default_value_t = 10000)]
+        blocks: u32,
+
+        /// Comma-separated mean inter-miner block-propagation delays.
+        #[arg(long, default_value = "0.5,1,2,5,10")]
+        propagation_delays: String,
+
+        /// DAA round-tuning preset.
+        #[arg(long, default_value = "mainnet")]
+        pow_profile: String,
+
+        /// Headroom bits used during calibration (see `kresko genesis`).
+        #[arg(long, default_value_t = 0)]
+        pow_headroom_bits: u8,
+
+        /// Seeds as comma-separated values or an inclusive range like `1..100`.
+        #[arg(long, default_value = "1..100")]
+        seeds: String,
+
+        /// Path to write aggregate CSV output.
+        #[arg(long, default_value = "pow-sim-matrix.csv")]
+        csv: String,
     },
 
     /// Start PoW mining on remote nodes
@@ -619,7 +628,7 @@ enum Commands {
         session: String,
 
         /// Timeout in seconds for graceful shutdown
-        #[arg(long, default_value = "30")]
+        #[arg(short = 't', long, default_value = "30")]
         timeout: u64,
 
         /// Experiment directory
@@ -634,16 +643,16 @@ enum Commands {
         file: String,
 
         /// Resume from .kresko-queue-state.json if present.
-        #[arg(long, default_value = "false")]
+        #[arg(short = 'r', long, default_value = "false")]
         resume: bool,
 
         /// Stop the queue on a catastrophic failure (per-node init failures
         /// never halt the queue).
-        #[arg(long, default_value = "false")]
+        #[arg(short = 'x', long, default_value = "false")]
         halt_on_failure: bool,
 
         /// Number of parallel workers
-        #[arg(short = 'w', long, default_value = "8")]
+        #[arg(short = 'w', long, default_value_t = DEFAULT_WORKERS)]
         workers: usize,
 
         /// Experiment directory
@@ -658,7 +667,7 @@ enum Commands {
         manifest: String,
 
         /// Number of parallel workers
-        #[arg(short = 'w', long, default_value = "8")]
+        #[arg(short = 'w', long, default_value_t = DEFAULT_WORKERS)]
         workers: usize,
 
         /// Experiment directory
@@ -677,11 +686,11 @@ enum Commands {
         command: Option<String>,
 
         /// Only re-run on nodes that failed the last exec in this directory.
-        #[arg(long, default_value = "false")]
+        #[arg(short = 'r', long, default_value = "false")]
         on_failed: bool,
 
         /// After all nodes finish, print each node's captured stdout/stderr.
-        #[arg(long, default_value = "false")]
+        #[arg(short = 'o', long, default_value = "false")]
         with_output: bool,
 
         /// Comma-separated miner indices, "all", or wildcard patterns.
@@ -689,7 +698,7 @@ enum Commands {
         miners: String,
 
         /// Number of parallel workers
-        #[arg(short = 'w', long, default_value = "8")]
+        #[arg(short = 'w', long, default_value_t = DEFAULT_WORKERS)]
         workers: usize,
 
         /// Experiment directory
@@ -707,15 +716,15 @@ enum Commands {
         nodes: String,
 
         /// Number of parallel workers
-        #[arg(short = 'w', long, default_value = "4")]
+        #[arg(short = 'w', long, default_value_t = DEFAULT_WORKERS)]
         workers: usize,
 
         /// Skip remote compression before download
-        #[arg(long)]
+        #[arg(short = 'c', long)]
         no_compress: bool,
 
         /// Subdirectory under data/ for downloaded artifacts
-        #[arg(long)]
+        #[arg(short = 's', long)]
         data_subdir: Option<String>,
 
         /// Experiment directory
@@ -730,15 +739,15 @@ enum Commands {
         nodes: String,
 
         /// Number of parallel workers
-        #[arg(short = 'w', long, default_value = "4")]
+        #[arg(short = 'w', long, default_value_t = DEFAULT_WORKERS)]
         workers: usize,
 
         /// `all` downloads every file from discovered trace directories; otherwise pass a comma-separated table list
-        #[arg(long, default_value = "all")]
+        #[arg(short = 't', long, default_value = "all")]
         trace_tables: String,
 
         /// Subdirectory under data/ for downloaded artifacts
-        #[arg(long)]
+        #[arg(short = 's', long)]
         data_subdir: Option<String>,
 
         /// Experiment directory
@@ -756,11 +765,11 @@ enum Commands {
     /// Stop services and clean up remote nodes
     Reset {
         /// Comma-separated miner indices or "all"
-        #[arg(long, default_value = "all")]
+        #[arg(short = 'm', long, default_value = "all")]
         miners: String,
 
         /// Number of parallel workers
-        #[arg(short = 'w', long, default_value = "4")]
+        #[arg(short = 'w', long, default_value_t = DEFAULT_WORKERS)]
         workers: usize,
 
         /// Experiment directory
@@ -771,19 +780,19 @@ enum Commands {
     /// Destroy cloud instances
     Down {
         /// Destroy all kresko instances across all experiments
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         all: bool,
 
         /// Number of parallel workers
-        #[arg(short = 'w', long, default_value = "4")]
+        #[arg(short = 'w', long, default_value_t = DEFAULT_WORKERS)]
         workers: usize,
 
         /// Return after delete requests are sent without polling for provider cleanup
-        #[arg(long, default_value_t = false)]
+        #[arg(short = 'n', long, default_value_t = false)]
         no_wait: bool,
 
         /// Maximum time to wait for provider-side deletion confirmation
-        #[arg(long, default_value_t = 300)]
+        #[arg(short = 't', long, default_value_t = 300)]
         timeout_secs: u64,
 
         /// Experiment directory
@@ -796,15 +805,15 @@ enum Commands {
     /// DigitalOcean tag `kresko`, GCP label `kresko=true`, Linode group/tag `kresko`.
     ForceDown {
         /// Number of parallel workers
-        #[arg(short = 'w', long, default_value = "4")]
+        #[arg(short = 'w', long, default_value_t = DEFAULT_WORKERS)]
         workers: usize,
 
         /// Return after delete requests are sent without polling for provider cleanup
-        #[arg(long, default_value_t = false)]
+        #[arg(short = 'n', long, default_value_t = false)]
         no_wait: bool,
 
         /// Maximum time to wait for provider-side deletion confirmation
-        #[arg(long, default_value_t = 300)]
+        #[arg(short = 't', long, default_value_t = 300)]
         timeout_secs: u64,
 
         /// Directory used to discover `.env` credentials
@@ -818,17 +827,17 @@ enum DownloadTarget {
     /// Download block height/time/size traces via node RPC and store JSONL locally
     Heights {
         /// Number of heights to request from a node at a time before checking for failures
-        #[arg(long)]
+        #[arg(short = 'b', long)]
         batch_size: Option<usize>,
 
         /// Ignore existing heights.jsonl and redownload every height from scratch
-        #[arg(long, default_value_t = false)]
+        #[arg(short = 'f', long, default_value_t = false)]
         force: bool,
     },
     /// Download every file from remote trace directories, or a selected trace table subset
     Traces {
         /// `all` downloads every file from discovered trace directories; otherwise pass a comma-separated table list
-        #[arg(long, default_value = "all")]
+        #[arg(short = 't', long, default_value = "all")]
         tables: String,
     },
 }
@@ -842,7 +851,8 @@ impl Commands {
             | Commands::TxblastStatusLocal { .. }
             | Commands::Mine { .. }
             | Commands::PowSimulate { .. }
-            | Commands::Premine { .. } => None,
+            | Commands::PowBench { .. }
+            | Commands::PowSimulateMatrix { .. } => None,
             Commands::Add { directory, .. }
             | Commands::Up { directory, .. }
             | Commands::SyncIps { directory, .. }
@@ -930,9 +940,11 @@ async fn main() -> Result<()> {
             ssh_key_name,
             mining_mode,
             block_time,
+            equihash_params,
             env_source,
         } => {
             let mining_mode: config::MiningMode = mining_mode.parse()?;
+            let equihash_params: config::EquihashParameterSet = equihash_params.parse()?;
             commands::init::run(
                 &chain_id,
                 &experiment,
@@ -941,6 +953,7 @@ async fn main() -> Result<()> {
                 ssh_key_name,
                 mining_mode,
                 block_time,
+                equihash_params,
                 env_source.as_deref(),
             )?;
         }
@@ -987,7 +1000,6 @@ async fn main() -> Result<()> {
             orchard_fanout_outputs,
             scripts_dir,
             pow_adjust,
-            premine_cache_key,
             directory,
         } => {
             let pow_calibration = commands::genesis::PowCalibrationCli {
@@ -1004,23 +1016,7 @@ async fn main() -> Result<()> {
                 orchard_fanout_outputs,
                 &scripts_dir,
                 pow_calibration,
-                &premine_cache_key,
                 &directory,
-            )?;
-        }
-        Commands::Premine {
-            mining_cpus,
-            block_time_secs,
-            pow_adjust,
-            cache_dir,
-            solver_threads,
-        } => {
-            commands::premine::run(
-                mining_cpus,
-                block_time_secs,
-                pow_adjust,
-                cache_dir,
-                solver_threads,
             )?;
         }
         Commands::Deploy {
@@ -1077,8 +1073,11 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Commands::Mine { rpc_endpoint } => {
-            commands::mine::run(&rpc_endpoint).await?;
+        Commands::Mine {
+            rpc_endpoint,
+            zebrad_config,
+        } => {
+            commands::mine::run(&rpc_endpoint, std::path::Path::new(&zebrad_config)).await?;
         }
         Commands::PowSimulate {
             miners,
@@ -1105,6 +1104,62 @@ async fn main() -> Result<()> {
                 csv_path: csv,
             };
             pow_sim::run(cli)?;
+        }
+        Commands::PowBench {
+            equihash_params,
+            min_seconds,
+        } => {
+            let equihash_params: config::EquihashParameterSet = equihash_params.parse()?;
+            let result = pow_tuning::benchmark_equihash_solver(pow_tuning::PowBenchInputs {
+                equihash_params,
+                min_seconds,
+            })?;
+            let (n, k) = match result.equihash_params {
+                config::EquihashParameterSet::Common => (200, 9),
+                config::EquihashParameterSet::Regtest => (48, 5),
+            };
+            println!(
+                "Equihash benchmark: params={} ({n},{k}), elapsed={:.3}s",
+                result.equihash_params, result.elapsed_secs,
+            );
+            println!(
+                "  nonce_trials={} ({:.3}/s)",
+                result.nonce_trials, result.nonce_trials_per_sec,
+            );
+            println!(
+                "  equihash_solutions={} ({:.3} sol/s)",
+                result.equihash_solutions, result.sol_per_sec,
+            );
+            println!(
+                "  matrix input: --sol-per-sec {}={:.9}",
+                result.equihash_params, result.sol_per_sec,
+            );
+        }
+        Commands::PowSimulateMatrix {
+            equihash_params,
+            sol_per_sec,
+            miners,
+            target_spacing,
+            blocks,
+            propagation_delays,
+            pow_profile,
+            pow_headroom_bits,
+            seeds,
+            csv,
+        } => {
+            let cli = pow_sim::PowSimulateMatrixCli {
+                equihash_params,
+                sol_per_sec,
+                miners,
+                target_spacing_secs: target_spacing,
+                blocks,
+                propagation_delays,
+                pow_profile: pow_profile.parse()?,
+                headroom_bits: pow_headroom_bits,
+                seeds,
+                csv_path: csv,
+            };
+            pow_sim::run_matrix(cli)?;
         }
         Commands::StartMiners {
             instances,

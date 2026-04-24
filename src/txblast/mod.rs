@@ -84,7 +84,7 @@ impl OrchardBlastRuntimeConfig {
             anyhow::bail!("orchard fanout max in flight must be greater than 0");
         }
 
-        let proving_workers = proving_workers.unwrap_or(5);
+        let proving_workers = proving_workers.unwrap_or(1);
         if proving_workers == 0 {
             anyhow::bail!("orchard proving workers must be greater than 0");
         }

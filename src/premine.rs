@@ -1,45 +1,34 @@
-//! Premine generation, caching, and loading.
+//! Premine generation for PoW experiments.
 //!
-//! When `mining_mode == Pow`, kresko seeds the live network with a precomputed
-//! chain of genesis + premine + maturity-padding blocks. That chain must be
-//! mined against the exact `pow_limit` the live zebrad config will advertise,
-//! otherwise zebrad rejects the chain at height 0 (see
-//! `art/inbox/refactor_pre_mine_generation.md`).
+//! When `mining_mode == Pow`, kresko seeds the live network with a chain of
+//! genesis + premine + maturity-padding blocks. That chain is generated with
+//! `disable_pow: true`, anchored to `SystemTime::now()`, and live PoW
+//! enforcement starts at the seeded tip via zebra's `pow_start_height`.
 //!
-//! This module is the **only** path by which a premine enters the PoW genesis
-//! flow. There is no flag, mode, or env var that produces a premine by another
-//! route. The core of the design is:
+//! Premine generation is cheap (V1 transparent coinbases, no shielded proofs,
+//! no Equihash) — roughly ~13 ms for 256 blocks on a single core — so every
+//! call regenerates from scratch. That keeps every seeded block's timestamp
+//! close to wall-clock-now, so the first live-mined block has no multi-
+//! thousand-second gap at the seeded→live boundary.
 //!
-//! - [`CalibrationSignature`] is the cache key: `(target_hex, block_time_secs)`.
-//!   `target_hex` determines the chain bytes; `block_time_secs` is a correctness
-//!   fence so we never reuse a premine across experiments whose live networks
-//!   advertise different target spacing.
-//! - [`resolve_premine`] returns a [`PremineBundle`] that is guaranteed to
-//!   match the signature (verified by reading the written manifest back). On
-//!   cache miss or any mismatch, it regenerates.
-//! - [`generate`] mines the chain in-process and writes a fully-populated cache
-//!   entry (genesis, premine blocks, checkpoints, manifest, funded keys).
-//!
-//! The generated premine has a *fixed* number of funded keys
-//! ([`FUNDED_KEY_COUNT`]) followed by [`MATURITY_PADDING_BLOCKS`] empty blocks;
-//! the fixed size means the signature does not need to vary with the experiment's
-//! miner count. Any experiment up to `FUNDED_KEY_COUNT` miners can share the
-//! same cache entry.
+//! The premine has a *fixed* number of funded keys ([`FUNDED_KEY_COUNT`])
+//! followed by [`MATURITY_PADDING_BLOCKS`] empty blocks; `funded_keys[0]` is
+//! the treasury. Any experiment up to `FUNDED_KEY_COUNT` miners can share the
+//! same signature.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 
 use zebra_chain::{
     block::Block,
     local_genesis::{LocalTestnetGenesisOptions, generate_local_testnet_with_funded_keys},
     parameters::NetworkUpgrade,
-    serialization::{ZcashDeserialize, ZcashSerialize},
+    serialization::ZcashSerialize,
 };
 
 use crate::config::LocalGenesisFundedKey;
 
-/// Number of funded premine keys produced by every cache entry.
+/// Number of funded premine keys produced by every premine bundle.
 pub const FUNDED_KEY_COUNT: usize = 128;
 
 /// Empty blocks appended after the funded premine so every premine coinbase
@@ -47,28 +36,13 @@ pub const FUNDED_KEY_COUNT: usize = 128;
 /// 100 blocks; 128 leaves a comfortable margin.
 pub const MATURITY_PADDING_BLOCKS: u32 = 128;
 
-/// Default premine cache key used by `kresko genesis` when the caller does
-/// not pass `--premine-cache-key`. Encodes `<block_time_secs>-<funded_key_count>`
-/// of the canonical premine bundle shipped with the repo.
-///
-/// Generating a fresh premine for every experiment is prohibitively slow
-/// (Equihash mines hundreds of blocks against a tight target); the workflow
-/// is "pre-mine once, reuse many times". The default lets the common case
-/// (block_time_secs=25, 128 funded keys) work without any flag.
-pub const DEFAULT_CACHE_KEY: &str = "25-128";
-
-/// The inputs that determine which premine a PoW experiment needs. Two
-/// experiments with the same signature share the same cache entry; two with
-/// different signatures get different cache entries.
+/// The inputs that determine which premine a PoW experiment needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalibrationSignature {
     /// Big-endian `pow_limit` as 64 lowercase hex characters (no `0x`). This
-    /// is the loosest target allowed by the generated network and every
-    /// premine block is mined against it.
+    /// is the loosest target allowed by the generated network.
     pub target_hex: String,
     /// Target block spacing the live network will advertise, in seconds.
-    /// Not baked into chain bytes, but part of the cache key so mismatched
-    /// spacing cannot silently reuse a premine.
     pub block_time_secs: u32,
 }
 
@@ -96,30 +70,12 @@ impl CalibrationSignature {
             .expect("target_hex validated by CalibrationSignature::new");
         bytes
     }
-
-    /// Stable hex key derived from the signature fields. First 16 hex chars of
-    /// SHA-256; short enough to be a readable directory name.
-    pub fn cache_key(&self) -> String {
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(self.target_hex.as_bytes());
-        hasher.update(b"|");
-        hasher.update(self.block_time_secs.to_string().as_bytes());
-        let digest = hasher.finalize();
-        hex::encode(&digest[..8])
-    }
-
-    pub fn cache_dir(&self, root: &Path) -> PathBuf {
-        root.join(self.cache_key())
-    }
 }
 
-/// On-disk description of a single cache entry. Written next to the premine
-/// artifacts so the bundle can be loaded and cross-validated against the
-/// signature that generated it.
+/// Diagnostic description of the generated premine. Serialized into the
+/// payload as `manifest.json` for operator inspection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PremineManifest {
-    pub cache_key: String,
     pub target_difficulty_limit: String,
     pub block_time_secs: u32,
     pub target_spacing_secs: u32,
@@ -127,6 +83,7 @@ pub struct PremineManifest {
     pub premine_block_count: u32,
     pub maturity_padding_block_count: u32,
     pub disable_pow: bool,
+    pub pow_start_height: Option<u32>,
     pub genesis_hash: String,
     pub seeded_tip_hash: String,
     pub seeded_genesis_time: i64,
@@ -142,16 +99,18 @@ pub struct PremineManifest {
     pub treasury_address: String,
     pub treasury_public_key_hex: String,
     pub funded_key_count: u32,
-    pub notes: String,
 }
 
-/// An in-memory view of a loaded premine cache entry.
+/// An in-memory premine bundle. Generated fresh on every call to
+/// [`generate`]; never loaded from disk.
 #[derive(Debug, Clone)]
 pub struct PremineBundle {
-    root_dir: PathBuf,
     manifest: PremineManifest,
     treasury_key: LocalGenesisFundedKey,
     funded_keys: Vec<LocalGenesisFundedKey>,
+    genesis_hex: String,
+    premine_blocks_hex: String,
+    checkpoints_content: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,40 +120,6 @@ struct SeededTimeSummary {
     seeded_tip_time: i64,
     observed_min_spacing_secs: u32,
     observed_max_spacing_secs: u32,
-}
-
-fn decode_hex_block(hex_str: &str, context: &str) -> Result<Block> {
-    let block_bytes = hex::decode(hex_str.trim())
-        .with_context(|| format!("failed to decode hex block for {context}"))?;
-    Block::zcash_deserialize(&block_bytes[..])
-        .with_context(|| format!("failed to deserialize block for {context}"))
-}
-
-fn load_seeded_blocks_from_dir(cache_dir: &Path) -> Result<Vec<Block>> {
-    let genesis_hex_path = cache_dir.join("genesis.hex");
-    let premine_hex_path = cache_dir.join("premine_blocks.hex");
-
-    let genesis_hex = std::fs::read_to_string(&genesis_hex_path)
-        .with_context(|| format!("failed to read {}", genesis_hex_path.display()))?;
-    let premine_hex = std::fs::read_to_string(&premine_hex_path)
-        .with_context(|| format!("failed to read {}", premine_hex_path.display()))?;
-
-    let mut blocks = vec![decode_hex_block(
-        &genesis_hex,
-        &genesis_hex_path.display().to_string(),
-    )?];
-    for (line_idx, line) in premine_hex.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        blocks.push(decode_hex_block(
-            trimmed,
-            &format!("{} line {}", premine_hex_path.display(), line_idx + 1),
-        )?);
-    }
-
-    Ok(blocks)
 }
 
 fn summarize_seeded_block_times(
@@ -244,121 +169,7 @@ fn summarize_seeded_block_times(
     })
 }
 
-fn validate_manifest_timestamps(
-    manifest: &PremineManifest,
-    blocks: &[Block],
-) -> Result<SeededTimeSummary> {
-    if manifest.block_time_secs != manifest.target_spacing_secs {
-        anyhow::bail!(
-            "premine manifest spacing mismatch: block_time_secs={} target_spacing_secs={}",
-            manifest.block_time_secs,
-            manifest.target_spacing_secs,
-        );
-    }
-
-    let summary = summarize_seeded_block_times(blocks, manifest.target_spacing_secs)?;
-
-    if summary.seeded_block_count != manifest.seeded_block_count {
-        anyhow::bail!(
-            "premine manifest seeded_block_count {} disagrees with serialized chain {}",
-            manifest.seeded_block_count,
-            summary.seeded_block_count,
-        );
-    }
-    if summary.seeded_genesis_time != manifest.seeded_genesis_time {
-        anyhow::bail!(
-            "premine manifest seeded_genesis_time {} disagrees with serialized chain {}",
-            manifest.seeded_genesis_time,
-            summary.seeded_genesis_time,
-        );
-    }
-    if summary.seeded_tip_time != manifest.seeded_tip_time {
-        anyhow::bail!(
-            "premine manifest seeded_tip_time {} disagrees with serialized chain {}",
-            manifest.seeded_tip_time,
-            summary.seeded_tip_time,
-        );
-    }
-    if summary.observed_min_spacing_secs != manifest.observed_min_spacing_secs
-        || summary.observed_max_spacing_secs != manifest.observed_max_spacing_secs
-    {
-        anyhow::bail!(
-            "premine manifest observed spacing [{}, {}] disagrees with serialized chain [{}, {}]",
-            manifest.observed_min_spacing_secs,
-            manifest.observed_max_spacing_secs,
-            summary.observed_min_spacing_secs,
-            summary.observed_max_spacing_secs,
-        );
-    }
-
-    Ok(summary)
-}
-
 impl PremineBundle {
-    pub fn load_from_dir(cache_dir: &Path) -> Result<Self> {
-        let manifest_path = cache_dir.join("manifest.json");
-        let treasury_key_path = cache_dir.join("treasury_key.json");
-        let funded_keys_path = cache_dir.join("funded_keys.json");
-
-        let manifest: PremineManifest = serde_json::from_slice(
-            &std::fs::read(&manifest_path)
-                .with_context(|| format!("failed to read {}", manifest_path.display()))?,
-        )
-        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
-
-        let treasury_key: LocalGenesisFundedKey = serde_json::from_slice(
-            &std::fs::read(&treasury_key_path)
-                .with_context(|| format!("failed to read {}", treasury_key_path.display()))?,
-        )
-        .with_context(|| format!("failed to parse {}", treasury_key_path.display()))?;
-
-        let funded_keys: Vec<LocalGenesisFundedKey> = serde_json::from_slice(
-            &std::fs::read(&funded_keys_path)
-                .with_context(|| format!("failed to read {}", funded_keys_path.display()))?,
-        )
-        .with_context(|| format!("failed to parse {}", funded_keys_path.display()))?;
-
-        if manifest.treasury_address != treasury_key.address {
-            anyhow::bail!(
-                "premine treasury address mismatch between manifest and treasury_key.json in {}",
-                cache_dir.display()
-            );
-        }
-        if manifest.treasury_public_key_hex != treasury_key.public_key_hex {
-            anyhow::bail!(
-                "premine treasury public key mismatch between manifest and treasury_key.json in {}",
-                cache_dir.display()
-            );
-        }
-        if funded_keys.is_empty() || funded_keys[0].address != treasury_key.address {
-            anyhow::bail!(
-                "premine funded_keys[0] must equal treasury_key in {}",
-                cache_dir.display()
-            );
-        }
-        if (funded_keys.len() as u32) != manifest.funded_key_count {
-            anyhow::bail!(
-                "premine funded_keys.json length {} disagrees with manifest.funded_key_count {}",
-                funded_keys.len(),
-                manifest.funded_key_count
-            );
-        }
-        let blocks = load_seeded_blocks_from_dir(cache_dir)?;
-        validate_manifest_timestamps(&manifest, &blocks).with_context(|| {
-            format!(
-                "premine cache entry at {} failed timestamp validation",
-                cache_dir.display()
-            )
-        })?;
-
-        Ok(Self {
-            root_dir: cache_dir.to_path_buf(),
-            manifest,
-            treasury_key,
-            funded_keys,
-        })
-    }
-
     pub fn manifest(&self) -> &PremineManifest {
         &self.manifest
     }
@@ -371,165 +182,47 @@ impl PremineBundle {
         &self.funded_keys
     }
 
-    pub fn read_text_file(&self, file_name: &str) -> Result<String> {
-        let path = self.root_dir.join(file_name);
-        std::fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))
+    pub fn genesis_hex(&self) -> &str {
+        &self.genesis_hex
     }
 
-    pub fn copy_payload_files_to_vec(
-        &self,
-        destination: &mut Vec<(String, Vec<u8>)>,
-    ) -> Result<()> {
-        for file_name in [
-            "genesis.hex",
-            "premine_blocks.hex",
-            "checkpoints.txt",
-            "manifest.json",
-            "treasury_key.json",
-            "funded_keys.json",
-        ] {
-            let path = self.root_dir.join(file_name);
-            destination.push((
-                file_name.to_string(),
-                std::fs::read(&path)
-                    .with_context(|| format!("failed to read {}", path.display()))?,
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Outcome of a [`resolve_premine`] call. Useful for the caller's log line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResolveOutcome {
-    /// An existing cache entry matched the signature and was loaded.
-    Hit,
-    /// The cache missed (or held a corrupt / mismatched entry), so a premine
-    /// was generated.
-    Miss,
-}
-
-impl std::fmt::Display for ResolveOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ResolveOutcome::Hit => f.write_str("hit"),
-            ResolveOutcome::Miss => f.write_str("miss"),
-        }
+    /// Files to be copied verbatim into `payload/local_genesis/` so live nodes
+    /// and downstream tooling (`fund_runtime_keys`) can consume the premine.
+    pub fn payload_files(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        Ok(vec![
+            (
+                "genesis.hex".to_string(),
+                self.genesis_hex.as_bytes().to_vec(),
+            ),
+            (
+                "premine_blocks.hex".to_string(),
+                self.premine_blocks_hex.as_bytes().to_vec(),
+            ),
+            (
+                "checkpoints.txt".to_string(),
+                self.checkpoints_content.as_bytes().to_vec(),
+            ),
+            (
+                "manifest.json".to_string(),
+                serde_json::to_vec_pretty(&self.manifest)?,
+            ),
+            (
+                "treasury_key.json".to_string(),
+                serde_json::to_vec_pretty(&self.treasury_key)?,
+            ),
+            (
+                "funded_keys.json".to_string(),
+                serde_json::to_vec_pretty(&self.funded_keys)?,
+            ),
+        ])
     }
 }
 
-/// Try to load an existing cache entry by name. Returns `Ok(None)` if no
-/// entry exists at `cache_root/key/`; returns `Err` if an entry exists but
-/// fails to parse (callers should treat that as fatal — silently regenerating
-/// over a corrupt entry hides bugs).
-pub fn try_load_by_key(cache_root: &Path, key: &str) -> Result<Option<PremineBundle>> {
-    let cache_dir = cache_root.join(key);
-    if !cache_dir.join("manifest.json").exists() {
-        return Ok(None);
-    }
-    let bundle = PremineBundle::load_from_dir(&cache_dir).with_context(|| {
-        format!(
-            "premine cache entry at {} exists but failed to load",
-            cache_dir.display()
-        )
-    })?;
-    Ok(Some(bundle))
-}
-
-/// Get a [`PremineBundle`] matching `sig`, generating it if necessary, under
-/// the cache directory named `key` (typically the signature's hash key, but
-/// callers may supply a stable human-readable name like `"25-128"`).
-///
-/// Guarantees: the returned bundle's manifest has `target_difficulty_limit`
-/// equal to `sig.target_hex` and `block_time_secs` equal to `sig.block_time_secs`.
-/// Any other state on disk under `cache_root/key/` is deleted and regenerated.
-pub fn resolve_premine_with_key(
-    sig: &CalibrationSignature,
-    key: &str,
-    cache_root: &Path,
-    num_solver_threads: usize,
-) -> Result<(PremineBundle, ResolveOutcome)> {
-    let cache_dir = cache_root.join(key);
-    let manifest_path = cache_dir.join("manifest.json");
-
-    if manifest_path.exists() {
-        match PremineBundle::load_from_dir(&cache_dir) {
-            Ok(bundle) => {
-                let m = bundle.manifest();
-                if m.target_difficulty_limit == sig.target_hex
-                    && m.block_time_secs == sig.block_time_secs
-                    && m.target_spacing_secs == sig.block_time_secs
-                {
-                    return Ok((bundle, ResolveOutcome::Hit));
-                }
-                eprintln!(
-                    "premine cache entry at {} disagrees with signature (\
-                     manifest target={}, block_time_secs={}; sig target={}, block_time_secs={}); regenerating",
-                    cache_dir.display(),
-                    m.target_difficulty_limit,
-                    m.block_time_secs,
-                    sig.target_hex,
-                    sig.block_time_secs,
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "premine cache entry at {} failed to load ({e}); regenerating",
-                    cache_dir.display()
-                );
-            }
-        }
-    }
-
-    if cache_dir.exists() {
-        std::fs::remove_dir_all(&cache_dir).with_context(|| {
-            format!(
-                "failed to clear stale cache entry at {}",
-                cache_dir.display()
-            )
-        })?;
-    }
-    std::fs::create_dir_all(&cache_dir)
-        .with_context(|| format!("failed to create cache dir at {}", cache_dir.display()))?;
-
-    generate(sig, key, &cache_dir, num_solver_threads)?;
-    let bundle = PremineBundle::load_from_dir(&cache_dir)?;
-    if bundle.manifest().target_difficulty_limit != sig.target_hex {
-        anyhow::bail!(
-            "internal error: freshly generated premine at {} has target {} but signature demanded {}",
-            cache_dir.display(),
-            bundle.manifest().target_difficulty_limit,
-            sig.target_hex,
-        );
-    }
-    Ok((bundle, ResolveOutcome::Miss))
-}
-
-/// Backwards-compatible variant of [`resolve_premine_with_key`] that uses
-/// the signature's hash-derived cache key.
-pub fn resolve_premine(
-    sig: &CalibrationSignature,
-    cache_root: &Path,
-    num_solver_threads: usize,
-) -> Result<(PremineBundle, ResolveOutcome)> {
-    let key = sig.cache_key();
-    resolve_premine_with_key(sig, &key, cache_root, num_solver_threads)
-}
-
-/// Mine a fresh premine for `sig` and write the full cache layout into
-/// `output_dir`. The directory must already exist and should be empty; the
-/// caller is responsible for creating and clearing it (see [`resolve_premine`]).
-///
-/// `num_solver_threads` controls how many OS threads search disjoint nonce
-/// partitions per block. `1` mines single-threaded; higher counts cut wallclock
-/// roughly linearly until Equihash's ~144 MB-per-thread memory footprint
-/// saturates RAM bandwidth (typically around 8–16 threads).
-pub fn generate(
-    sig: &CalibrationSignature,
-    cache_key: &str,
-    output_dir: &Path,
-    num_solver_threads: usize,
-) -> Result<()> {
+/// Generate a fresh premine bundle for `sig`. PoW is disabled during
+/// generation (every block header is unsolved), so this is cheap — no
+/// Equihash, no shielded proofs. Live nodes enforce PoW at `pow_start_height`,
+/// which equals the total seeded block count (genesis + premine + padding).
+pub fn generate(sig: &CalibrationSignature) -> Result<PremineBundle> {
     let miner_names: Vec<String> = (0..FUNDED_KEY_COUNT)
         .map(|i| format!("funded-key-{i:03}"))
         .collect();
@@ -537,12 +230,12 @@ pub fn generate(
     let options = LocalTestnetGenesisOptions {
         network_name: "KreskoPremine".to_string(),
         latest_network_upgrade: NetworkUpgrade::Nu6,
-        disable_pow: false,
+        disable_pow: true,
         target_spacing_secs: sig.block_time_secs,
         seeded_tip_time: None,
         maturity_padding_blocks: MATURITY_PADDING_BLOCKS,
         target_difficulty_limit: sig.target_bytes(),
-        num_solver_threads,
+        num_solver_threads: 1,
     };
 
     let generated = generate_local_testnet_with_funded_keys(miner_names, options)
@@ -607,7 +300,6 @@ pub fn generate(
         .context("generated premine has invalid seeded timestamps")?;
 
     let manifest = PremineManifest {
-        cache_key: cache_key.to_string(),
         target_difficulty_limit: sig.target_hex.clone(),
         block_time_secs: sig.block_time_secs,
         target_spacing_secs: sig.block_time_secs,
@@ -615,6 +307,7 @@ pub fn generate(
         premine_block_count: FUNDED_KEY_COUNT as u32,
         maturity_padding_block_count: MATURITY_PADDING_BLOCKS,
         disable_pow: network_params.disable_pow(),
+        pow_start_height: network_params.pow_start_height().map(|h| h.0),
         genesis_hash: network_params.genesis_hash().to_string(),
         seeded_tip_hash,
         seeded_genesis_time: timing_summary.seeded_genesis_time,
@@ -627,48 +320,16 @@ pub fn generate(
         treasury_address: treasury.address.clone(),
         treasury_public_key_hex: treasury.public_key_hex.clone(),
         funded_key_count: funded_keys.len() as u32,
-        notes: format!(
-            "Kresko premine for target={}, block_time_secs={}, tip_anchored=true. {} funded keys, {} maturity padding blocks.",
-            sig.target_hex,
-            sig.block_time_secs,
-            funded_keys.len(),
-            MATURITY_PADDING_BLOCKS,
-        ),
     };
 
-    std::fs::write(output_dir.join("genesis.hex"), &genesis_hex)?;
-    std::fs::write(output_dir.join("premine_blocks.hex"), &premine_blocks_hex)?;
-    std::fs::write(output_dir.join("checkpoints.txt"), &checkpoints_content)?;
-    std::fs::write(
-        output_dir.join("treasury_key.json"),
-        serde_json::to_vec_pretty(&treasury)?,
-    )?;
-    std::fs::write(
-        output_dir.join("funded_keys.json"),
-        serde_json::to_vec_pretty(&funded_keys)?,
-    )?;
-    std::fs::write(
-        output_dir.join("manifest.json"),
-        serde_json::to_vec_pretty(&manifest)?,
-    )?;
-
-    Ok(())
-}
-
-/// Sensible default for `num_solver_threads`: detect available CPUs, cap at 8.
-/// Equihash (200, 9) needs ~144 MB per thread, so 8 threads is roughly the
-/// point where additional cores stop helping due to RAM bandwidth saturation.
-pub fn default_solver_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
-        .unwrap_or(1)
-}
-
-/// Default cache root for resolve_premine: repo-local, gitignored.
-pub fn default_cache_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("bootstrap")
-        .join("cache")
+    Ok(PremineBundle {
+        manifest,
+        treasury_key: treasury,
+        funded_keys,
+        genesis_hex,
+        premine_blocks_hex,
+        checkpoints_content,
+    })
 }
 
 #[cfg(test)]
@@ -694,17 +355,6 @@ mod tests {
     fn signature_normalizes_case_and_whitespace() {
         let sig = CalibrationSignature::new(format!("  {}  ", "0F".repeat(32)), 75).unwrap();
         assert_eq!(sig.target_hex, "0f".repeat(32));
-    }
-
-    #[test]
-    fn cache_key_stable_and_differs_across_inputs() {
-        let a = CalibrationSignature::new("0f".repeat(32), 75).unwrap();
-        let b = CalibrationSignature::new("0f".repeat(32), 75).unwrap();
-        let c = CalibrationSignature::new("0f".repeat(32), 60).unwrap();
-        let d = CalibrationSignature::new("08".repeat(32), 75).unwrap();
-        assert_eq!(a.cache_key(), b.cache_key());
-        assert_ne!(a.cache_key(), c.cache_key());
-        assert_ne!(a.cache_key(), d.cache_key());
     }
 
     #[test]
@@ -736,43 +386,40 @@ mod tests {
         assert_eq!(summary.observed_max_spacing_secs, 25);
     }
 
+    /// Generating a fresh premine should produce exactly-uniform spacing and
+    /// a tip time close to wall-clock-now. This is the regression test for
+    /// the seeded-tip drift bug.
     #[test]
-    fn manifest_timestamp_validation_fails_if_spacing_disagrees() {
-        let generated = generate_local_testnet_with_funded_keys(
-            vec!["alice".to_string()],
-            LocalTestnetGenesisOptions {
-                target_spacing_secs: 25,
-                maturity_padding_blocks: 1,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let summary = summarize_seeded_block_times(&generated.blocks, 25).unwrap();
-        let manifest = PremineManifest {
-            cache_key: "test".to_string(),
-            target_difficulty_limit: "0f".repeat(32),
-            block_time_secs: 24,
-            target_spacing_secs: 24,
-            seeded_block_count: summary.seeded_block_count,
-            premine_block_count: 1,
-            maturity_padding_block_count: 1,
-            disable_pow: true,
-            genesis_hash: "00".repeat(32),
-            seeded_tip_hash: "11".repeat(32),
-            seeded_genesis_time: summary.seeded_genesis_time,
-            seeded_tip_time: summary.seeded_tip_time,
-            observed_min_spacing_secs: 24,
-            observed_max_spacing_secs: 24,
-            slow_start_interval: 0,
-            pre_blossom_halving_interval: 144,
-            activation_height: 3,
-            treasury_address: "tmTest".to_string(),
-            treasury_public_key_hex: "02".repeat(33),
-            funded_key_count: 1,
-            notes: "test".to_string(),
-        };
+    fn generated_bundle_has_uniform_spacing_anchored_to_now() {
+        let target = "0f".repeat(32);
+        let sig = CalibrationSignature::new(target, 25).unwrap();
 
-        let err = validate_manifest_timestamps(&manifest, &generated.blocks).unwrap_err();
-        assert!(err.to_string().contains("target spacing"));
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let bundle = generate(&sig).expect("premine should generate");
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let m = bundle.manifest();
+        assert_eq!(m.observed_min_spacing_secs, 25);
+        assert_eq!(m.observed_max_spacing_secs, 25);
+        assert_eq!(m.block_time_secs, 25);
+        assert!(m.disable_pow);
+        assert_eq!(
+            m.pow_start_height,
+            Some(m.seeded_block_count + 1),
+            "pow_start_height must equal total block count (genesis + premine + padding)",
+        );
+        assert!(
+            m.seeded_tip_time >= before && m.seeded_tip_time <= after,
+            "seeded tip time {} should fall within [{}, {}]",
+            m.seeded_tip_time,
+            before,
+            after,
+        );
     }
 }

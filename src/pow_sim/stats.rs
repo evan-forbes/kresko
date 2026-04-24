@@ -10,6 +10,7 @@ pub struct BlockTimeStats {
     pub median_secs: f64,
     pub mean_secs: f64,
     pub p90_secs: f64,
+    pub p99_secs: f64,
     pub max_secs: f64,
     pub stddev_secs: f64,
     /// Fraction of blocks whose block_time lies within ±20% of target_spacing.
@@ -48,6 +49,7 @@ impl BlockTimeStats {
             median_secs: p(0.50),
             mean_secs: mean,
             p90_secs: p(0.90),
+            p99_secs: p(0.99),
             max_secs: times.last().copied().unwrap_or(0.0),
             stddev_secs: stddev,
             pct_within_20pct: pct_within_20,

@@ -1,11 +1,9 @@
 use anyhow::Result;
-use futures::future::join_all;
+use futures::stream::{self, StreamExt};
 use std::path::Path;
 
 use crate::config::{Config, resolve_value, select_instances, shellexpand};
 use crate::ssh;
-
-const REMOTE_TRACE_ARCHIVE_PATH: &str = "/tmp/kresko-traces.tar.gz";
 
 const TRACE_MISSING_MARKER: &str = "KRESKO_TRACE_MISSING";
 const TRACE_TABLE_MISSING_MARKER: &str = "KRESKO_TRACE_TABLE_MISSING";
@@ -100,31 +98,23 @@ pub async fn run_logs(
 
     println!("Downloading logs from {} nodes...", targets.len());
 
-    for chunk in targets.chunks(workers) {
-        let futs: Vec<_> = chunk
-            .iter()
-            .map(|inst| {
-                let ip = inst.public_ip.clone();
-                let name = inst.name.clone();
-                let key = key.clone();
-                let node_dir = data_dir.join(&name);
-                let no_compress = no_compress;
+    let mut results = stream::iter(targets.into_iter().map(|inst| {
+        let ip = inst.public_ip;
+        let name = inst.name;
+        let key = key.clone();
+        let node_dir = data_dir.join(&name);
 
-                async move {
-                    std::fs::create_dir_all(&node_dir)?;
+        async move {
+            std::fs::create_dir_all(&node_dir)?;
+            download_logs(&ip, &key, &node_dir, &name, no_compress).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+    }))
+    .buffer_unordered(workers);
 
-                    download_logs(&ip, &key, &node_dir, &name, no_compress).await?;
-
-                    Ok::<_, anyhow::Error>(())
-                }
-            })
-            .collect();
-
-        let results = join_all(futs).await;
-        for r in results {
-            if let Err(e) = r {
-                eprintln!("  Warning: {e}");
-            }
+    while let Some(result) = results.next().await {
+        if let Err(e) = result {
+            eprintln!("  Warning: {e}");
         }
     }
 
@@ -169,30 +159,24 @@ pub async fn run_traces(
         }
     }
 
-    for chunk in targets.chunks(workers) {
-        let futs: Vec<_> = chunk
-            .iter()
-            .map(|inst| {
-                let ip = inst.public_ip.clone();
-                let name = inst.name.clone();
-                let key = key.clone();
-                let node_dir = data_dir.join(&name);
-                let trace_selection = trace_selection.clone();
+    let mut results = stream::iter(targets.into_iter().map(|inst| {
+        let ip = inst.public_ip;
+        let name = inst.name;
+        let key = key.clone();
+        let node_dir = data_dir.join(&name);
+        let trace_selection = trace_selection.clone();
 
-                async move {
-                    std::fs::create_dir_all(&node_dir)?;
-                    download_structured_traces(&ip, &key, &node_dir, &name, &trace_selection)
-                        .await?;
-                    Ok::<_, anyhow::Error>(())
-                }
-            })
-            .collect();
+        async move {
+            std::fs::create_dir_all(&node_dir)?;
+            download_structured_traces(&ip, &key, &node_dir, &name, &trace_selection).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+    }))
+    .buffer_unordered(workers);
 
-        let results = join_all(futs).await;
-        for r in results {
-            if let Err(e) = r {
-                eprintln!("  Warning: {e}");
-            }
+    while let Some(result) = results.next().await {
+        if let Err(e) = result {
+            eprintln!("  Warning: {e}");
         }
     }
 
@@ -281,23 +265,15 @@ async fn download_structured_traces(
     let trace_archive = node_dir.join("traces.tar.gz");
     let trace_script = build_trace_download_script(selection);
 
-    match ssh::ssh_exec(ip, key, &trace_script).await {
-        Ok(trace_dir) => {
-            ssh::sftp_download(
-                ip,
-                key,
-                REMOTE_TRACE_ARCHIVE_PATH,
-                trace_archive.to_str().unwrap(),
-            )
-            .await?;
+    println!("  {name}: downloading structured traces...");
+    match ssh::ssh_exec_to_file(ip, key, &trace_script, trace_archive.to_str().unwrap()).await {
+        Ok(bytes) => {
             unpack_trace_archive(&trace_archive, &node_dir.join("traces"))?;
             let _ = std::fs::remove_file(&trace_archive);
-            let remote_trace_dir = trace_dir.trim();
-            if remote_trace_dir.is_empty() {
-                println!("  {name}: downloaded structured traces");
-            } else {
-                println!("  {name}: downloaded structured traces from {remote_trace_dir}");
-            }
+            println!(
+                "  {name}: downloaded structured traces ({:.1} MiB compressed)",
+                bytes as f64 / (1024.0 * 1024.0)
+            );
         }
         Err(err) if remote_trace_dir_missing(&err) => {
             println!("  {name}: no structured traces found");
@@ -387,21 +363,41 @@ if [ -f /root/payload/vars.sh ]; then
     . /root/payload/vars.sh
 fi
 
-trace_dir=""
+set -o pipefail
 request_mode="{request_mode}"
-stage_dir="$(mktemp -d /tmp/kresko-trace-stage.XXXXXX)"
 found_any=0
 
+declare -a selected_paths=()
+declare -A selected_names=()
+
+add_selected_path() {{
+    path="$1"
+    file="$(basename "$path")"
+    if [ -n "${{selected_names[$file]+x}}" ]; then
+        return
+    fi
+    selected_paths+=("$path")
+    selected_names["$file"]=1
+    found_any=1
+}}
+
 candidate_dirs=()
-if [ -n "${{ZEBRA_P2P_TRACE_DIR:-}}" ]; then
-    candidate_dirs+=("$ZEBRA_P2P_TRACE_DIR")
-fi
-if [ -n "${{ZEBRA_P2P_TRACE_FILE:-}}" ]; then
-    candidate_dirs+=("$(dirname "$ZEBRA_P2P_TRACE_FILE")/traces")
-fi
-if [ -n "${{ZEBRA_TRACE_DIR:-}}" ]; then
-    candidate_dirs+=("$ZEBRA_TRACE_DIR")
-fi
+for var_name in ${{!ZEBRA@}}; do
+    case "$var_name" in
+        ZEBRA_*TRACE*_DIR|ZEBRA_*TRACING*_DIR)
+            dir="${{!var_name}}"
+            if [ -n "$dir" ]; then
+                candidate_dirs+=("$dir")
+            fi
+            ;;
+        ZEBRA_*TRACE*_FILE|ZEBRA_*TRACING*_FILE)
+            file="${{!var_name}}"
+            if [ -n "$file" ]; then
+                candidate_dirs+=("$(dirname "$file")/traces")
+            fi
+            ;;
+    esac
+done
 if [ -n "${{KRESKO_TRACE_DIR:-}}" ]; then
     candidate_dirs+=("$KRESKO_TRACE_DIR")
 fi
@@ -415,40 +411,33 @@ fi
 if [ "$request_mode" = "all" ]; then
     for dir in "${{candidate_dirs[@]}}"; do
         [ -d "$dir" ] || continue
-        while IFS= read -r path; do
-            file="$(basename "$path")"
-            if [ ! -e "$stage_dir/$file" ]; then
-                cp "$path" "$stage_dir/$file"
-                found_any=1
-            fi
-        done < <(find "$dir" -maxdepth 1 -type f | sort)
+        while IFS= read -r -d '' path; do
+            add_selected_path "$path"
+        done < <(find "$dir" -maxdepth 1 -type f -print0 | sort -z)
     done
 else
     for file in "${{requested_files[@]}}"; do
-        copied=0
+        found_path=""
         for dir in "${{candidate_dirs[@]}}"; do
             if [ -f "$dir/$file" ]; then
-                cp "$dir/$file" "$stage_dir/$file"
-                found_any=1
-                copied=1
+                found_path="$dir/$file"
                 break
             fi
         done
 
-        if [ "$copied" -eq 1 ]; then
+        if [ -n "$found_path" ]; then
+            add_selected_path "$found_path"
             continue
         fi
 
         trace_file="$(find /root /tmp -maxdepth 6 -type f -name "$file" -print -quit 2>/dev/null || true)"
         if [ -n "$trace_file" ]; then
-            cp "$trace_file" "$stage_dir/$file"
-            found_any=1
+            add_selected_path "$trace_file"
         fi
     done
 fi
 
 if [ "$found_any" -eq 0 ]; then
-    rm -rf "$stage_dir"
     if [ "${{#candidate_dirs[@]}}" -eq 0 ]; then
         echo "{trace_missing}" >&2
         exit 3
@@ -457,14 +446,45 @@ if [ "$found_any" -eq 0 ]; then
     exit 4
 fi
 
-rm -f {archive_path}
-tar -C "$stage_dir" -czf {archive_path} .
-printf '%s\n' "$stage_dir"
-rm -rf "$stage_dir"
+manifest="$(mktemp /tmp/kresko-trace-files.XXXXXX)"
+tar_stderr="$(mktemp /tmp/kresko-trace-tar-stderr.XXXXXX)"
+trap 'rm -f "$manifest" "$tar_stderr"' EXIT
+printf '%s\0' "${{selected_paths[@]}}" > "$manifest"
+
+set +e
+tar --ignore-failed-read --null -T "$manifest" --transform='flags=r;s|.*/||' -cf - 2>"$tar_stderr" | gzip -1
+pipeline_status=("${{PIPESTATUS[@]}}")
+set -e
+
+tar_status="${{pipeline_status[0]}}"
+gzip_status="${{pipeline_status[1]}}"
+tar_ok=0
+if [ "$tar_status" -eq 0 ]; then
+    tar_ok=1
+elif [ "$tar_status" -eq 1 ] && [ -s "$tar_stderr" ] && ! grep -Eqv '^tar: .*: file changed as we read it$' "$tar_stderr"; then
+    tar_ok=1
+fi
+
+if [ "$tar_ok" -eq 1 ] && [ "$gzip_status" -eq 0 ]; then
+    exit 0
+fi
+
+# Active JSONL trace files can grow while tar is streaming them. The archive is
+# still usable, so only downgrade tar's warning status for that exact warning.
+if [ "$tar_ok" -ne 1 ]; then
+    cat "$tar_stderr" >&2
+fi
+if [ "$gzip_status" -ne 0 ]; then
+    echo "gzip failed with status $gzip_status" >&2
+fi
+
+if [ "$tar_ok" -ne 1 ]; then
+    exit "$tar_status"
+fi
+exit "$gzip_status"
 "#,
         trace_missing = TRACE_MISSING_MARKER,
         trace_table_missing = TRACE_TABLE_MISSING_MARKER,
-        archive_path = REMOTE_TRACE_ARCHIVE_PATH,
         request_mode = request_mode,
     )
 }
@@ -482,6 +502,11 @@ mod tests {
     fn all_trace_script_walks_candidate_directories() {
         let script = build_trace_download_script(&TraceSelection::All);
         assert!(script.contains("request_mode=\"all\""));
-        assert!(script.contains("find \"$dir\" -maxdepth 1 -type f | sort"));
+        assert!(script.contains("for var_name in ${!ZEBRA@}; do"));
+        assert!(script.contains("ZEBRA_*TRACE*_DIR|ZEBRA_*TRACING*_DIR"));
+        assert!(script.contains("find \"$dir\" -maxdepth 1 -type f -print0 | sort -z"));
+        assert!(script.contains("tar --ignore-failed-read --null -T \"$manifest\""));
+        assert!(script.contains("| gzip -1"));
+        assert!(script.contains("file changed as we read it"));
     }
 }

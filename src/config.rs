@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use zebra_chain::parameters::EquihashParams;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -26,6 +27,48 @@ impl std::str::FromStr for MiningMode {
             "generate" => Ok(MiningMode::Generate),
             "pow" => Ok(MiningMode::Pow),
             other => anyhow::bail!("unknown mining mode: {other}. Use generate or pow."),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EquihashParameterSet {
+    Common,
+    #[default]
+    Regtest,
+}
+
+impl std::fmt::Display for EquihashParameterSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EquihashParameterSet::Common => write!(f, "common"),
+            EquihashParameterSet::Regtest => write!(f, "regtest"),
+        }
+    }
+}
+
+impl std::str::FromStr for EquihashParameterSet {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "common" | "mainnet" | "testnet" | "200_9" | "200,9" => {
+                Ok(EquihashParameterSet::Common)
+            }
+            "regtest" | "easy" | "48_5" | "48,5" => Ok(EquihashParameterSet::Regtest),
+            other => {
+                anyhow::bail!("unknown equihash parameter set: {other}. Use common or regtest.")
+            }
+        }
+    }
+}
+
+impl From<EquihashParameterSet> for EquihashParams {
+    fn from(value: EquihashParameterSet) -> Self {
+        match value {
+            EquihashParameterSet::Common => EquihashParams::Common,
+            EquihashParameterSet::Regtest => EquihashParams::Regtest,
         }
     }
 }
@@ -175,6 +218,8 @@ pub struct Config {
     #[serde(default)]
     pub block_time_secs: Option<u32>,
     #[serde(default)]
+    pub equihash_params: EquihashParameterSet,
+    #[serde(default)]
     pub orchard_txblast: OrchardTxblastConfig,
     pub local_genesis: Option<LocalGenesisConfig>,
 }
@@ -193,15 +238,13 @@ impl Default for OrchardTxblastConfig {
             lanes_per_miner: 100,
             lane_value_zats: 30_000,
             fanout_source_value_zats: 500_000,
-            fanout_outputs: 4,
+            fanout_outputs: 1,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalGenesisConfig {
-    #[serde(default)]
-    pub premine_cache_key: Option<String>,
     pub network_name: String,
     pub network_magic: [u8; 4],
     pub target_difficulty_limit: String,

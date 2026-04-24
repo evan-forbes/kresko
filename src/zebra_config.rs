@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::config::Instance;
+use zebra_chain::parameters::EquihashParams;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -14,6 +15,16 @@ pub struct LocalTestnetParameters {
     pub slow_start_interval: u32,
     pub pre_blossom_halving_interval: u32,
     pub activation_height: u32,
+    /// Custom post-Blossom spacing for experiment networks. If omitted, Zebra
+    /// falls back to its public Testnet/Mainnet default of 75 seconds.
+    pub post_blossom_pow_target_spacing: Option<u32>,
+    /// Equihash parameter set used by live PoW solving and validation.
+    pub equihash_params: EquihashParams,
+    /// If `Some(h)`, live nodes skip Equihash and difficulty checks for
+    /// blocks below height `h`. Set to one past the seeded tip so the
+    /// cached pre-mined blocks pass validation but every live-mined block
+    /// must solve PoW.
+    pub pow_start_height: Option<u32>,
 }
 
 /// Default zebrad.toml template.
@@ -32,6 +43,9 @@ miner_address = "auto"
 [network]
 network = "Testnet"
 listen_addr = "0.0.0.0:18233"
+# Zebra's default target initial peer set size. Increase or decrease this in
+# an initialized experiment's zebrad.toml before running `kresko genesis`.
+peerset_initial_target_size = 25
 initial_testnet_peers = []
 
 [network.testnet_parameters.activation_heights]
@@ -131,6 +145,9 @@ pub fn apply_local_testnet_parameters(config: &str, params: &LocalTestnetParamet
         params.target_difficulty_limit
     ));
     result.push_str(&format!("disable_pow = {}\n", params.disable_pow));
+    if let Some(h) = params.pow_start_height {
+        result.push_str(&format!("pow_start_height = {h}\n"));
+    }
     result.push_str(&format!("genesis_hash = \"{}\"\n", params.genesis_hash));
     result.push_str(&format!(
         "slow_start_interval = {}\n",
@@ -139,6 +156,16 @@ pub fn apply_local_testnet_parameters(config: &str, params: &LocalTestnetParamet
     result.push_str(&format!(
         "pre_blossom_halving_interval = {}\n",
         params.pre_blossom_halving_interval
+    ));
+    if let Some(spacing_secs) = params.post_blossom_pow_target_spacing {
+        result.push_str(&format!(
+            "post_blossom_pow_target_spacing = {}\n",
+            spacing_secs
+        ));
+    }
+    result.push_str(&format!(
+        "equihash_params = \"{}\"\n",
+        equihash_params_name(params.equihash_params)
     ));
     result.push_str("lockbox_disbursements = []\n");
     // Local genesis generation clears funding streams; mirror that here to avoid
@@ -157,6 +184,86 @@ pub fn apply_local_testnet_parameters(config: &str, params: &LocalTestnetParamet
     result.push_str(&format!("NU6 = {}\n", params.activation_height));
 
     result
+}
+
+/// Parse and validate the rendered config so experiment-specific testnet
+/// parameters cannot be silently dropped during templating.
+pub fn verify_local_testnet_parameters(
+    config: &str,
+    params: &LocalTestnetParameters,
+) -> Result<()> {
+    let parsed: toml::Value =
+        toml::from_str(config).context("failed to parse rendered zebrad.toml")?;
+    let testnet_params = parsed
+        .get("network")
+        .and_then(|network| network.get("testnet_parameters"))
+        .context("missing [network.testnet_parameters] section in rendered zebrad.toml")?;
+
+    let actual_target = testnet_params
+        .get("target_difficulty_limit")
+        .and_then(toml::Value::as_str)
+        .context("missing network.testnet_parameters.target_difficulty_limit")?;
+    if actual_target != params.target_difficulty_limit {
+        anyhow::bail!(
+            "rendered target_difficulty_limit mismatch: expected {}, got {}",
+            params.target_difficulty_limit,
+            actual_target,
+        );
+    }
+
+    if let Some(expected_spacing) = params.post_blossom_pow_target_spacing {
+        let actual_spacing = testnet_params
+            .get("post_blossom_pow_target_spacing")
+            .and_then(toml::Value::as_integer)
+            .context("missing network.testnet_parameters.post_blossom_pow_target_spacing")?;
+        let actual_spacing = u32::try_from(actual_spacing)
+            .context("post_blossom_pow_target_spacing does not fit in u32")?;
+        if actual_spacing != expected_spacing {
+            anyhow::bail!(
+                "rendered post_blossom_pow_target_spacing mismatch: expected {}, got {}",
+                expected_spacing,
+                actual_spacing,
+            );
+        }
+    }
+
+    if let Some(expected_pow_start_height) = params.pow_start_height {
+        let actual_pow_start_height = testnet_params
+            .get("pow_start_height")
+            .and_then(toml::Value::as_integer)
+            .context("missing network.testnet_parameters.pow_start_height")?;
+        let actual_pow_start_height = u32::try_from(actual_pow_start_height)
+            .context("pow_start_height does not fit in u32")?;
+        if actual_pow_start_height != expected_pow_start_height {
+            anyhow::bail!(
+                "rendered pow_start_height mismatch: expected {}, got {}",
+                expected_pow_start_height,
+                actual_pow_start_height,
+            );
+        }
+    }
+
+    let actual_equihash_params = testnet_params
+        .get("equihash_params")
+        .and_then(toml::Value::as_str)
+        .context("missing network.testnet_parameters.equihash_params")?;
+    let expected_equihash_params = equihash_params_name(params.equihash_params);
+    if actual_equihash_params != expected_equihash_params {
+        anyhow::bail!(
+            "rendered equihash_params mismatch: expected {}, got {}",
+            expected_equihash_params,
+            actual_equihash_params,
+        );
+    }
+
+    Ok(())
+}
+
+fn equihash_params_name(params: EquihashParams) -> &'static str {
+    match params {
+        EquihashParams::Common => "common",
+        EquihashParams::Regtest => "regtest",
+    }
 }
 
 /// Ensure the template has a non-empty mining.miner_address value.
@@ -244,8 +351,10 @@ mod tests {
     use super::{
         DEFAULT_ZEBRAD_TOML, LocalTestnetParameters, apply_local_testnet_parameters,
         ensure_miner_address_is_set, generate_node_config, set_miner_address,
+        verify_local_testnet_parameters,
     };
     use crate::config::{Instance, NodeType, Provider};
+    use zebra_chain::parameters::EquihashParams;
 
     fn miner(name: &str, ip: &str) -> Instance {
         Instance {
@@ -290,6 +399,7 @@ mod tests {
 
         let generated =
             generate_node_config(&config, &miners[0], &miners).expect("config generation");
+        assert!(generated.contains("peerset_initial_target_size = 25"));
         assert!(generated.contains("initial_testnet_peers = [\"2.2.2.2:18233\"]"));
     }
 
@@ -320,11 +430,17 @@ mod tests {
             slow_start_interval: 0,
             pre_blossom_halving_interval: 144,
             activation_height: 1,
+            post_blossom_pow_target_spacing: Some(25),
+            equihash_params: EquihashParams::Regtest,
+            pow_start_height: Some(257),
         };
 
         let generated = apply_local_testnet_parameters(DEFAULT_ZEBRAD_TOML, &params);
         assert!(generated.contains("[network.testnet_parameters]"));
         assert!(generated.contains("network_name = \"LocalGenesisNet\""));
+        assert!(generated.contains("pow_start_height = 257"));
+        assert!(generated.contains("post_blossom_pow_target_spacing = 25"));
+        assert!(generated.contains("equihash_params = \"regtest\""));
         assert!(!generated.contains("genesis_block_path"));
         assert!(
             generated.contains("checkpoints = \"/root/payload/local_genesis/checkpoints.txt\"")
@@ -332,8 +448,8 @@ mod tests {
         assert!(generated.contains("pre_nu6_funding_streams = { recipients = [] }"));
         assert!(generated.contains("post_nu6_funding_streams = { recipients = [] }"));
         assert!(generated.contains("NU6 = 1"));
-        // Zebra no longer accepts these tuning keys; make sure we don't emit them.
-        assert!(!generated.contains("post_blossom_pow_target_spacing"));
+        verify_local_testnet_parameters(&generated, &params)
+            .expect("rendered config should preserve local testnet parameters");
         assert!(!generated.contains("pre_blossom_pow_target_spacing"));
         assert!(!generated.contains("pow_averaging_window"));
         assert!(!generated.contains("pow_damping_factor"));

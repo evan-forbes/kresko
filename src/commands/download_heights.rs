@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -416,14 +416,21 @@ async fn fetch_height_batch(
     workers: usize,
 ) -> (Vec<HeightTraceEntry>, Vec<u64>, Vec<anyhow::Error>) {
     let url = format!("http://{}:18232", source.ip);
-    let results: Vec<_> = stream::iter(heights.iter().copied())
-        .map(|height| {
+    let max_in_flight = workers.max(1).min(heights.len().max(1));
+    let mut pending = heights.iter().copied();
+    let mut in_flight = FuturesUnordered::new();
+    let mut successes = Vec::with_capacity(heights.len());
+    let mut errors = Vec::new();
+    let mut failed_at = None;
+
+    let mut schedule_next = |in_flight: &mut FuturesUnordered<_>| {
+        if let Some(height) = pending.next() {
             let client = client.clone();
             let node = source.name.clone();
             let ip = source.ip.clone();
             let url = url.clone();
 
-            async move {
+            in_flight.push(async move {
                 let block = rpc_call(&client, &url, "getblock", json!([height.to_string(), 2]))
                     .await
                     .with_context(|| format!("{node}: getblock failed at height {height}"))?;
@@ -453,34 +460,50 @@ async fn fetch_height_batch(
                         size,
                     },
                 ))
-            }
-        })
-        .buffer_unordered(workers.max(1))
-        .collect()
-        .await;
+            });
+            true
+        } else {
+            false
+        }
+    };
 
-    let mut successes = Vec::with_capacity(results.len());
-    let mut failed = Vec::new();
-    let mut errors = Vec::new();
-    for result in results {
+    for _ in 0..max_in_flight {
+        if !schedule_next(&mut in_flight) {
+            break;
+        }
+    }
+
+    while let Some(result) = in_flight.next().await {
         match result {
-            Ok((_, entry)) => successes.push(entry),
+            Ok((_, entry)) => {
+                successes.push(entry);
+                schedule_next(&mut in_flight);
+            }
             Err(err) => {
                 eprintln!("  Warning: {err:#}");
                 errors.push(err);
+                failed_at = Some(successes.len());
+                break;
             }
         }
     }
 
+    drop(in_flight);
+
     let success_heights: HashSet<u64> = successes.iter().map(|entry| entry.height).collect();
-    for height in heights {
-        if !success_heights.contains(height) {
-            failed.push(*height);
-        }
-    }
+    let failed = if failed_at.is_some() {
+        heights
+            .iter()
+            .copied()
+            .filter(|height| !success_heights.contains(height))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     successes.sort_unstable_by_key(|entry| entry.height);
+    let mut failed = failed;
     failed.sort_unstable();
-    failed.dedup();
     (successes, failed, errors)
 }
 

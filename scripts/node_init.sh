@@ -51,7 +51,15 @@ echo "=== Configuring time sync ==="
 systemctl enable chrony
 systemctl start chrony
 
-echo "=== Leaving TCP sysctl defaults unchanged; experiments configure transport settings per run ==="
+KRESKO_SYSCTL_FILE="/etc/sysctl.d/60-kresko-network-defaults.conf"
+echo "=== Configuring default TCP and qdisc sysctls ==="
+cat >"$KRESKO_SYSCTL_FILE" <<'EOF'
+# Kresko node transport defaults.
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_congestion_control=cubic
+net.core.default_qdisc=fq_codel
+EOF
+sysctl --load "$KRESKO_SYSCTL_FILE"
 
 echo "=== Extracting payload ==="
 rm -rf /root/payload
@@ -59,13 +67,19 @@ tar -xzf /root/$ARCHIVE_NAME -C /root/
 source /root/payload/vars.sh
 
 # Zebra's config parser reads all ZEBRA_* env vars and rejects unknown ones.
-# Save tracing env vars and unset them so config parsing succeeds.
+# Save all tracing env vars and unset them so config parsing succeeds.
 # They'll be re-exported just before launching zebrad.
-_SAVED_P2P_TRACE_DIR="${ZEBRA_P2P_TRACE_DIR:-}"
-_SAVED_P2P_TRACE_FILE="${ZEBRA_P2P_TRACE_FILE:-}"
-_SAVED_FORK_TRACE_ENABLE="${ZEBRA_FORK_TRACE_ENABLE:-}"
-_SAVED_TRACE_DIR="${ZEBRA_TRACE_DIR:-}"
-unset ZEBRA_P2P_TRACE_DIR ZEBRA_P2P_TRACE_FILE ZEBRA_FORK_TRACE_ENABLE ZEBRA_TRACE_DIR
+declare -a _SAVED_ZEBRA_TRACE_NAMES=()
+declare -a _SAVED_ZEBRA_TRACE_VALUES=()
+for _kresko_var_name in ${!ZEBRA@}; do
+    case "$_kresko_var_name" in
+        ZEBRA_*TRACE*|ZEBRA_*TRACING*)
+            _SAVED_ZEBRA_TRACE_NAMES+=("$_kresko_var_name")
+            _SAVED_ZEBRA_TRACE_VALUES+=("${!_kresko_var_name}")
+            unset "$_kresko_var_name"
+            ;;
+    esac
+done
 
 cd $HOME
 hostname=$(hostname)
@@ -426,20 +440,25 @@ fi
 echo "=== Starting zebrad ==="
 
 # Re-export tracing env vars now that config parsing is done.
-# zebra's p2p_tracing and fork_tracing modules read these directly via std::env::var().
-if [ -n "$_SAVED_P2P_TRACE_DIR" ]; then
-    export ZEBRA_P2P_TRACE_DIR="$_SAVED_P2P_TRACE_DIR"
-fi
-if [ -n "$_SAVED_P2P_TRACE_FILE" ]; then
-    export ZEBRA_P2P_TRACE_FILE="$_SAVED_P2P_TRACE_FILE"
-fi
-if [ -n "$_SAVED_FORK_TRACE_ENABLE" ]; then
-    export ZEBRA_FORK_TRACE_ENABLE="$_SAVED_FORK_TRACE_ENABLE"
-fi
-if [ -n "$_SAVED_TRACE_DIR" ]; then
-    export ZEBRA_TRACE_DIR="$_SAVED_TRACE_DIR"
-    mkdir -p "$ZEBRA_TRACE_DIR"
-fi
+# zebra tracing modules read these directly via std::env::var().
+for _kresko_idx in "${!_SAVED_ZEBRA_TRACE_NAMES[@]}"; do
+    _kresko_var_name="${_SAVED_ZEBRA_TRACE_NAMES[$_kresko_idx]}"
+    _kresko_var_value="${_SAVED_ZEBRA_TRACE_VALUES[$_kresko_idx]}"
+    export "$_kresko_var_name=$_kresko_var_value"
+
+    case "$_kresko_var_name" in
+        ZEBRA_*TRACE*_DIR|ZEBRA_*TRACING*_DIR)
+            if [ -n "$_kresko_var_value" ]; then
+                mkdir -p "$_kresko_var_value"
+            fi
+            ;;
+        ZEBRA_*TRACE*_FILE|ZEBRA_*TRACING*_FILE)
+            if [ -n "$_kresko_var_value" ]; then
+                mkdir -p "$(dirname "$_kresko_var_value")/traces"
+            fi
+            ;;
+    esac
+done
 
 LOG_FILE="/root/logs"
 zebrad -c /root/.config/zebrad.toml start 2>&1 | tee -a "$LOG_FILE"
