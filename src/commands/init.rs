@@ -3,11 +3,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    Config, EquihashParameterSet, MiningMode, OrchardTxblastConfig, Provider, resolve_value,
+    Config, DaaConfig, EquihashParameterSet, MiningMode, NetworkKind, OrchardTxblastConfig,
+    Provider, resolve_value,
 };
 use crate::zebra_config;
 
-const DEFAULT_TARGET_SPACING_SECS: u32 = 75;
+const DEFAULT_TARGET_SPACING_SECS: u32 = 25;
 
 pub fn run(
     chain_id: &str,
@@ -16,11 +17,27 @@ pub fn run(
     ssh_pub_key_path: Option<String>,
     ssh_key_name: Option<String>,
     mining_mode: MiningMode,
+    network_kind: NetworkKind,
     block_time_secs: Option<u32>,
     equihash_params: EquihashParameterSet,
     env_source: Option<&str>,
 ) -> Result<()> {
     let provider: Provider = provider.parse()?;
+    if network_kind.is_public_network() && mining_mode == MiningMode::Pow {
+        anyhow::bail!("--mining-mode pow is not supported for public networks");
+    }
+    if network_kind.is_public_network() {
+        if block_time_secs.is_some() {
+            eprintln!(
+                "Warning: --block-time is ignored for public networks; Zebra uses public consensus parameters."
+            );
+        }
+        if equihash_params != EquihashParameterSet::Regtest {
+            eprintln!(
+                "Warning: --equihash-params is ignored for public networks; Zebra uses public consensus parameters."
+            );
+        }
+    }
     let dir = Path::new(experiment);
     if dir.exists() {
         anyhow::bail!("Experiment directory '{}' already exists", experiment);
@@ -34,7 +51,17 @@ pub fn run(
     std::fs::create_dir_all(dir.join("scripts/steps"))?;
     std::fs::create_dir_all(dir.join("state"))?;
 
-    std::fs::write(dir.join("zebrad.toml"), zebra_config::DEFAULT_ZEBRAD_TOML)?;
+    let template = zebra_config::template_for(network_kind);
+    let zebrad_toml = if network_kind == NetworkKind::LocalGenesis {
+        if let Some(block_time_secs) = block_time_secs {
+            zebra_config::set_post_blossom_pow_target_spacing(template, block_time_secs)?
+        } else {
+            template.to_string()
+        }
+    } else {
+        template.to_string()
+    };
+    std::fs::write(dir.join("zebrad.toml"), zebrad_toml)?;
     std::fs::write(dir.join("scripts/node_init.sh"), NODE_INIT_SH)?;
     std::fs::write(dir.join("scripts/vars.sh"), VARS_SH_TEMPLATE)?;
     std::fs::write(dir.join("scripts/common.sh"), render_common_sh())?;
@@ -60,9 +87,15 @@ pub fn run(
         ssh_key_name: ssh_key_name_val.clone(),
         ssh_key_path: ssh_key_path_val.clone(),
         provider,
+        network_kind,
         mining_mode,
-        block_time_secs,
+        block_time_secs: if network_kind == NetworkKind::LocalGenesis {
+            block_time_secs
+        } else {
+            None
+        },
         equihash_params,
+        daa: DaaConfig::default(),
         orchard_txblast: OrchardTxblastConfig::default(),
         local_genesis: None,
     };
@@ -95,18 +128,25 @@ pub fn run(
         render_agents(experiment, target_spacing_secs),
     )?;
     std::fs::write(dir.join("flups.md"), FLUPS_TEMPLATE)?;
-    std::fs::write(
-        dir.join("runs/01_bounded_pow.env"),
-        RUN_BOUNDED_POW_MANIFEST_TEMPLATE,
-    )?;
-    std::fs::write(
-        dir.join("runs/examples/01_bounded_generate.env.example"),
-        RUN_BOUNDED_GENERATE_MANIFEST_TEMPLATE,
-    )?;
-    std::fs::write(
-        dir.join("runs/examples/02_txblast_shielded.env.example"),
-        RUN_TXBLAST_MANIFEST_TEMPLATE,
-    )?;
+    if network_kind == NetworkKind::LocalGenesis {
+        std::fs::write(
+            dir.join("runs/01_bounded_pow.env"),
+            RUN_BOUNDED_POW_MANIFEST_TEMPLATE,
+        )?;
+        std::fs::write(
+            dir.join("runs/examples/01_bounded_generate.env.example"),
+            RUN_BOUNDED_GENERATE_MANIFEST_TEMPLATE,
+        )?;
+        std::fs::write(
+            dir.join("runs/examples/02_txblast_shielded.env.example"),
+            RUN_TXBLAST_MANIFEST_TEMPLATE,
+        )?;
+    } else {
+        std::fs::write(
+            dir.join("runs/README.md"),
+            "Public-network experiments do not get a default local mining workload.\n",
+        )?;
+    }
     std::fs::write(dir.join("scripts/init.sh"), render_init_script())?;
     std::fs::write(
         dir.join("scripts/collect_artifacts.sh"),
@@ -128,31 +168,62 @@ pub fn run(
         dir.join("scripts/start_campaign.sh"),
         START_CAMPAIGN_COMPAT_SH,
     )?;
-    std::fs::write(
-        dir.join("scripts/steps/01_build_binaries.sh"),
-        render_step_build_binaries(),
-    )?;
-    std::fs::write(
-        dir.join("scripts/steps/02_generate_genesis.sh"),
-        render_step_generate_genesis(),
-    )?;
-    std::fs::write(dir.join("scripts/steps/03_deploy.sh"), render_step_deploy())?;
-    std::fs::write(
-        dir.join("scripts/steps/04_validate.sh"),
-        render_step_validate(),
-    )?;
-    std::fs::write(
-        dir.join("scripts/steps/05_run_experiment.sh"),
-        render_step_run_experiment(),
-    )?;
-    std::fs::write(
-        dir.join("scripts/steps/06_collect_artifacts.sh"),
-        render_step_collect_artifacts(),
-    )?;
-    std::fs::write(
-        dir.join("scripts/steps/07_teardown.sh"),
-        render_step_teardown(),
-    )?;
+    if network_kind == NetworkKind::LocalGenesis {
+        std::fs::write(
+            dir.join("scripts/steps/01_build_binaries.sh"),
+            render_step_build_binaries(),
+        )?;
+        std::fs::write(
+            dir.join("scripts/steps/02_generate_genesis.sh"),
+            render_step_generate_genesis(),
+        )?;
+        std::fs::write(dir.join("scripts/steps/03_deploy.sh"), render_step_deploy())?;
+        std::fs::write(
+            dir.join("scripts/steps/04_validate.sh"),
+            render_step_validate(),
+        )?;
+        std::fs::write(
+            dir.join("scripts/steps/05_run_experiment.sh"),
+            render_step_run_experiment(),
+        )?;
+        std::fs::write(
+            dir.join("scripts/steps/06_collect_artifacts.sh"),
+            render_step_collect_artifacts(),
+        )?;
+        std::fs::write(
+            dir.join("scripts/steps/07_teardown.sh"),
+            render_step_teardown(),
+        )?;
+    } else {
+        std::fs::write(
+            dir.join("scripts/steps/01_build_binaries.sh"),
+            render_step_build_binaries(),
+        )?;
+        std::fs::write(
+            dir.join("scripts/steps/02_provision_nodes.sh"),
+            render_public_step_provision_nodes(),
+        )?;
+        std::fs::write(
+            dir.join("scripts/steps/03_sync_ips.sh"),
+            render_public_step_sync_ips(),
+        )?;
+        std::fs::write(
+            dir.join("scripts/steps/04_generate_public_payload.sh"),
+            render_public_step_generate_payload(),
+        )?;
+        std::fs::write(
+            dir.join("scripts/steps/05_deploy.sh"),
+            render_public_step_deploy(),
+        )?;
+        std::fs::write(
+            dir.join("scripts/steps/06_validate.sh"),
+            render_public_step_validate(),
+        )?;
+        std::fs::write(
+            dir.join("scripts/steps/07_teardown.sh"),
+            render_step_teardown(),
+        )?;
+    }
 
     make_executable(&dir.join("scripts/node_init.sh"))?;
     make_executable(&dir.join("scripts/common.sh"))?;
@@ -164,11 +235,19 @@ pub fn run(
     make_executable(&dir.join("scripts/run_txblast_sample.sh"))?;
     make_executable(&dir.join("scripts/start_campaign.sh"))?;
     make_executable(&dir.join("scripts/steps/01_build_binaries.sh"))?;
-    make_executable(&dir.join("scripts/steps/02_generate_genesis.sh"))?;
-    make_executable(&dir.join("scripts/steps/03_deploy.sh"))?;
-    make_executable(&dir.join("scripts/steps/04_validate.sh"))?;
-    make_executable(&dir.join("scripts/steps/05_run_experiment.sh"))?;
-    make_executable(&dir.join("scripts/steps/06_collect_artifacts.sh"))?;
+    if network_kind == NetworkKind::LocalGenesis {
+        make_executable(&dir.join("scripts/steps/02_generate_genesis.sh"))?;
+        make_executable(&dir.join("scripts/steps/03_deploy.sh"))?;
+        make_executable(&dir.join("scripts/steps/04_validate.sh"))?;
+        make_executable(&dir.join("scripts/steps/05_run_experiment.sh"))?;
+        make_executable(&dir.join("scripts/steps/06_collect_artifacts.sh"))?;
+    } else {
+        make_executable(&dir.join("scripts/steps/02_provision_nodes.sh"))?;
+        make_executable(&dir.join("scripts/steps/03_sync_ips.sh"))?;
+        make_executable(&dir.join("scripts/steps/04_generate_public_payload.sh"))?;
+        make_executable(&dir.join("scripts/steps/05_deploy.sh"))?;
+        make_executable(&dir.join("scripts/steps/06_validate.sh"))?;
+    }
     make_executable(&dir.join("scripts/steps/07_teardown.sh"))?;
 
     println!("Initialized experiment '{experiment}' for chain '{chain_id}'");
@@ -189,10 +268,15 @@ pub fn run(
     println!("Next steps:");
     println!("  1. cd {experiment}");
     println!("  2. Review PLAN.md and AGENTS.md");
-    println!("  3. MINER_COUNT=<N> scripts/bootstrap.sh");
-    println!("  4. kresko up");
-    println!("  5. Customize runs/*.env and scripts/steps/05_run_experiment.sh if needed");
-    println!("  6. scripts/init.sh");
+    if network_kind == NetworkKind::LocalGenesis {
+        println!("  3. MINER_COUNT=<N> scripts/bootstrap.sh");
+        println!("  4. kresko up");
+        println!("  5. Customize runs/*.env and scripts/steps/05_run_experiment.sh if needed");
+        println!("  6. scripts/init.sh");
+    } else {
+        println!("  3. MINER_COUNT=<N> scripts/bootstrap.sh");
+        println!("  4. scripts/init.sh");
+    }
 
     Ok(())
 }
@@ -700,9 +784,14 @@ fi
 
 kresko add "${add_args[@]}"
 
-announce_step "bootstrap build + genesis"
+announce_step "bootstrap build binaries"
 "${SCRIPT_DIR}/steps/01_build_binaries.sh"
-"${SCRIPT_DIR}/steps/02_generate_genesis.sh"
+if [[ -x "${SCRIPT_DIR}/steps/02_generate_genesis.sh" ]]; then
+  announce_step "bootstrap local genesis payload"
+  "${SCRIPT_DIR}/steps/02_generate_genesis.sh"
+else
+  echo "Public-network bootstrap complete. Run scripts/init.sh to provision, generate payload, deploy, and validate."
+fi
 "#
     .to_string()
 }
@@ -777,6 +866,140 @@ if [[ "${NO_POW_CALIBRATION}" == "1" ]]; then
 fi
 
 kresko genesis "${args[@]}"
+mark_step_done "${STEP_ID}"
+"#
+    .to_string()
+}
+
+fn render_public_step_provision_nodes() -> String {
+    r#"#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../common.sh"
+
+STEP_ID="02_provision_nodes"
+if step_should_skip "${STEP_ID}"; then
+  announce_step "${STEP_ID} (already done, skipping)"
+  exit 0
+fi
+
+announce_step "02 provision public nodes"
+kresko up -d "${EXPERIMENT_DIR}"
+mark_step_done "${STEP_ID}"
+"#
+    .to_string()
+}
+
+fn render_public_step_sync_ips() -> String {
+    r#"#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../common.sh"
+
+STEP_ID="03_sync_ips"
+if step_should_skip "${STEP_ID}"; then
+  announce_step "${STEP_ID} (already done, skipping)"
+  exit 0
+fi
+
+announce_step "03 sync public IPs"
+kresko sync-ips -d "${EXPERIMENT_DIR}" --overwrite
+mark_step_done "${STEP_ID}"
+"#
+    .to_string()
+}
+
+fn render_public_step_generate_payload() -> String {
+    r#"#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../common.sh"
+
+STEP_ID="04_generate_public_payload"
+payload_kresko="${EXPERIMENT_DIR}/payload/build/kresko"
+payload_zebrad="${EXPERIMENT_DIR}/payload/build/zebrad"
+payload_is_fresh=1
+if [[ ! -f "${payload_kresko}" || ! -f "${payload_zebrad}" ]]; then
+  payload_is_fresh=0
+elif [[ "${KRESKO_BINARY}" -nt "${payload_kresko}" || "${ZEBRAD_BINARY}" -nt "${payload_zebrad}" ]]; then
+  payload_is_fresh=0
+fi
+
+if step_should_skip "${STEP_ID}" && [[ "${payload_is_fresh}" == "1" ]]; then
+  announce_step "${STEP_ID} (already done, skipping)"
+  exit 0
+fi
+
+announce_step "04 generate public payload"
+require_file "${ZEBRAD_BINARY}"
+require_file "${KRESKO_BINARY}"
+kresko genesis-public \
+  -d "${EXPERIMENT_DIR}" \
+  --zebrad-binary "${ZEBRAD_BINARY}" \
+  --kresko-binary "${KRESKO_BINARY}"
+mark_step_done "${STEP_ID}"
+"#
+    .to_string()
+}
+
+fn render_public_step_deploy() -> String {
+    r#"#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../common.sh"
+
+STEP_ID="05_deploy"
+if step_should_skip "${STEP_ID}"; then
+  announce_step "${STEP_ID} (already done, skipping)"
+  exit 0
+fi
+
+announce_step "05 deploy public payload"
+args=(-d "${EXPERIMENT_DIR}")
+
+if [[ -n "${DEPLOY_NODES}" ]]; then
+  args+=(--nodes "${DEPLOY_NODES}")
+fi
+if [[ "${IGNORE_FAILED_MINERS}" == "1" ]]; then
+  args+=(--ignore-failed-miners)
+fi
+if [[ "${REUSE_APP_SESSION}" == "1" ]]; then
+  args+=(--reuse-app-session)
+fi
+if [[ "${RESTART_APP_SESSION}" == "1" ]]; then
+  args+=(--restart-app-session)
+fi
+
+kresko deploy "${args[@]}"
+mark_step_done "${STEP_ID}"
+"#
+    .to_string()
+}
+
+fn render_public_step_validate() -> String {
+    r#"#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../common.sh"
+
+STEP_ID="06_validate"
+if step_should_skip "${STEP_ID}"; then
+  announce_step "${STEP_ID} (already done, skipping)"
+  exit 0
+fi
+
+announce_step "06 validate public nodes"
+kresko status -d "${EXPERIMENT_DIR}" --summary
+if [[ "${STATUS_DEEP_ON_VALIDATE}" == "1" ]]; then
+  kresko status -d "${EXPERIMENT_DIR}" --deep
+fi
+kresko check -d "${EXPERIMENT_DIR}"
+
 mark_step_done "${STEP_ID}"
 "#
     .to_string()

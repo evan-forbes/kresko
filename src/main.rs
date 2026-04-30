@@ -51,7 +51,11 @@ enum Commands {
         #[arg(short = 'm', long, default_value = "generate")]
         mining_mode: String,
 
-        /// Target block time in seconds (default: 75, post-Blossom)
+        /// Network kind: local-genesis, public-testnet, or mainnet
+        #[arg(short = 'N', long, default_value = "local-genesis")]
+        network: String,
+
+        /// Target block time in seconds (default: 25, post-Blossom)
         #[arg(short = 't', long)]
         block_time: Option<u32>,
 
@@ -168,6 +172,35 @@ enum Commands {
         /// fleet need a nudge.
         #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         pow_adjust: f64,
+
+        /// Override the local-to-fleet benchmark discount. Higher values make
+        /// the initial target looser/faster.
+        #[arg(long)]
+        pow_fleet_discount: Option<f64>,
+
+        /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
+    /// Generate deployment payload for public Testnet/Mainnet observer nodes
+    GenesisPublic {
+        /// Path to pre-built zebrad binary
+        #[arg(long)]
+        zebrad_binary: String,
+
+        /// Path to kresko binary to ship to remote nodes (defaults to current executable)
+        #[arg(long, alias = "txblast-binary")]
+        kresko_binary: Option<String>,
+
+        /// Build directory name
+        #[arg(long, default_value = "build")]
+        build_dir: String,
+
+        /// Directory whose contents are baked into the payload under `scripts/`.
+        /// Resolved relative to the experiment directory unless absolute.
+        #[arg(long, default_value = "scripts")]
+        scripts_dir: String,
 
         /// Experiment directory
         #[arg(short = 'd', long, default_value = ".")]
@@ -288,6 +321,9 @@ enum Commands {
 
     /// Start transaction blaster on remote nodes
     Txblast {
+        #[command(subcommand)]
+        command: Option<TxblastCommand>,
+
         /// Comma-separated instance indices or "all"
         #[arg(short = 'i', long, default_value = "all")]
         instances: String,
@@ -374,7 +410,7 @@ enum Commands {
     /// Run PoW miner locally (intended to run on remote nodes)
     Mine {
         /// RPC endpoint
-        #[arg(long, default_value = "http://localhost:18232")]
+        #[arg(long)]
         rpc_endpoint: String,
 
         /// Path to the zebrad.toml whose network parameters should be used for mining
@@ -503,7 +539,7 @@ enum Commands {
     /// Run txblast locally (intended to run on remote nodes)
     TxblastLocal {
         /// RPC endpoint
-        #[arg(long, default_value = "http://localhost:18232")]
+        #[arg(long)]
         rpc_endpoint: String,
 
         /// Transactions per second
@@ -554,6 +590,10 @@ enum Commands {
         #[arg(long)]
         orchard_progress_interval_secs: Option<u64>,
 
+        /// Network parameters to use when building txblast transactions
+        #[arg(long)]
+        network: Option<String>,
+
         /// Deprecated no-op: txblast tracing is always enabled. Retained for script compatibility.
         #[arg(long)]
         trace_enable: bool,
@@ -578,7 +618,7 @@ enum Commands {
     /// Fund runtime keys locally from the cached bootstrap treasury (intended to run on remote nodes)
     FundRuntimeKeysLocal {
         /// RPC endpoint
-        #[arg(long, default_value = "http://localhost:18232")]
+        #[arg(long)]
         rpc_endpoint: String,
 
         /// Directory containing local genesis bootstrap artifacts on the remote node
@@ -712,11 +752,11 @@ enum Commands {
         target: Option<DownloadTarget>,
 
         /// Node name pattern (or "all")
-        #[arg(short = 'n', long, default_value = "all")]
+        #[arg(short = 'n', long, default_value = "all", global = true)]
         nodes: String,
 
         /// Number of parallel workers
-        #[arg(short = 'w', long, default_value_t = DEFAULT_WORKERS)]
+        #[arg(short = 'w', long, default_value_t = DEFAULT_WORKERS, global = true)]
         workers: usize,
 
         /// Skip remote compression before download
@@ -724,11 +764,11 @@ enum Commands {
         no_compress: bool,
 
         /// Subdirectory under data/ for downloaded artifacts
-        #[arg(short = 's', long)]
+        #[arg(short = 's', long, global = true)]
         data_subdir: Option<String>,
 
         /// Experiment directory
-        #[arg(short = 'd', long, default_value = ".")]
+        #[arg(short = 'd', long, default_value = ".", global = true)]
         directory: String,
     },
 
@@ -842,6 +882,309 @@ enum DownloadTarget {
     },
 }
 
+#[derive(Subcommand, Clone, Debug)]
+enum TxblastCommand {
+    /// Manage public-network txblast wallet state
+    Wallet {
+        #[command(subcommand)]
+        command: TxblastWalletCommand,
+    },
+    /// Manage public-network txblast deposits
+    Deposit {
+        #[command(subcommand)]
+        command: TxblastDepositCommand,
+    },
+    /// Create an immutable public-network txblast funding and rate plan
+    Plan {
+        /// Override experiment directory for txblast wallet state
+        #[arg(short = 'd', long)]
+        directory: Option<String>,
+
+        /// Target global bytes per public-network block
+        #[arg(long, default_value_t = 1_000_000)]
+        target_block_bytes: u64,
+
+        /// Expected public-network block spacing in seconds
+        #[arg(long, default_value_t = 75)]
+        block_spacing_secs: u64,
+
+        /// Planned run duration in seconds
+        #[arg(long, default_value_t = 900)]
+        duration_secs: u64,
+
+        /// Comma-separated instance indices or "all"
+        #[arg(long, default_value = "all")]
+        nodes: String,
+
+        /// Serialized lane-advance transaction size used for rate math
+        #[arg(long, default_value_t = 3_000)]
+        measured_tx_bytes: u64,
+
+        /// Pause threshold to record for future mempool guardrails
+        #[arg(long)]
+        max_mempool_bytes: Option<u64>,
+
+        /// Funding safety margin, for example 0.20
+        #[arg(long, default_value_t = 0.20)]
+        safety_margin: f64,
+
+        /// Record a plan even when imported deposits are insufficient
+        #[arg(long)]
+        allow_underfunded_plan: bool,
+
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fan deposits out into public-network hot keys and lane inventory
+    Prepare {
+        /// Override experiment directory for txblast wallet state
+        #[arg(short = 'd', long)]
+        directory: Option<String>,
+
+        /// Plan id to use, default latest
+        #[arg(long)]
+        plan: Option<String>,
+
+        /// Show what would happen without moving funds
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Run public-network txblast with byte-budget guardrails
+    Run {
+        /// Override experiment directory for txblast wallet state
+        #[arg(short = 'd', long)]
+        directory: Option<String>,
+
+        /// Plan id to use, default latest
+        #[arg(long)]
+        plan: Option<String>,
+
+        /// Override target global bytes per public-network block
+        #[arg(long)]
+        target_block_bytes: Option<u64>,
+
+        /// Advanced override for global byte budget
+        #[arg(long)]
+        max_global_bytes_per_sec: Option<u64>,
+
+        /// Optional cap for any one node
+        #[arg(long)]
+        max_node_bytes_per_sec: Option<u64>,
+
+        /// Maximum pending transactions per node
+        #[arg(long)]
+        max_pending_txs: Option<usize>,
+
+        /// Maximum pending transaction bytes per node
+        #[arg(long)]
+        max_pending_bytes: Option<u64>,
+
+        /// Pause when observed mempool bytes exceed this value
+        #[arg(long)]
+        max_mempool_bytes: Option<u64>,
+
+        /// Number of recent blocks used for future feedback control
+        #[arg(long)]
+        feedback_window_blocks: Option<u64>,
+
+        /// Trace directory for txblast JSONL files on remote nodes
+        #[arg(long)]
+        trace_dir: Option<String>,
+
+        /// Required on mainnet because fees are burned
+        #[arg(long)]
+        mainnet_i_understand_fees: bool,
+    },
+    /// Stop public-network txblast agents without sweeping funds
+    Stop {
+        /// Override experiment directory for txblast wallet state
+        #[arg(short = 'd', long)]
+        directory: Option<String>,
+
+        /// Plan id to use, default latest
+        #[arg(long)]
+        plan: Option<String>,
+
+        /// Show what would happen
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show public-network txblast workload status
+    Status {
+        /// Override experiment directory for txblast wallet state
+        #[arg(short = 'd', long)]
+        directory: Option<String>,
+
+        /// Plan id to use, default latest
+        #[arg(long)]
+        plan: Option<String>,
+
+        /// Show what would happen
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Fan funds back in and withdraw to an external transparent address
+    Withdraw {
+        /// Override experiment directory for txblast wallet state
+        #[arg(short = 'd', long)]
+        directory: Option<String>,
+
+        /// Destination transparent address
+        #[arg(long)]
+        to: String,
+
+        /// Amount in zats or "all"
+        #[arg(long, default_value = "all")]
+        amount: String,
+
+        /// Show what would happen without moving funds
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Required on mainnet
+        #[arg(long)]
+        mainnet_i_understand_finality: bool,
+    },
+    /// Recover funds using local recovery data
+    Recover {
+        #[command(subcommand)]
+        command: TxblastRecoverCommand,
+    },
+}
+
+#[derive(Subcommand, Clone, Debug)]
+enum TxblastWalletCommand {
+    /// Create public-network txblast wallet and recovery files
+    Init {
+        /// Override experiment directory for txblast wallet state
+        #[arg(short = 'd', long)]
+        directory: Option<String>,
+
+        /// Network for the wallet, default from config.json
+        #[arg(long)]
+        network: Option<String>,
+
+        /// Wallet birthday height, default 0
+        #[arg(long)]
+        birthday_height: Option<u32>,
+
+        /// Initial lane count per node
+        #[arg(long, default_value_t = 100)]
+        lanes_per_node: usize,
+
+        /// Value for each lane note, in zatoshis
+        #[arg(long, default_value_t = 30_000)]
+        lane_value_zats: u64,
+
+        /// Fanout width used by prepare-time fanout
+        #[arg(long, default_value_t = 1)]
+        fanout_width: usize,
+
+        /// Required for mainnet wallet creation
+        #[arg(long)]
+        require_mainnet_confirmation: bool,
+
+        /// Replace existing txblast wallet files
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand, Clone, Debug)]
+enum TxblastDepositCommand {
+    /// Print the control transparent deposit address
+    Address {
+        /// Override experiment directory for txblast wallet state
+        #[arg(short = 'd', long)]
+        directory: Option<String>,
+
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register a deposit outpoint or transaction manually
+    Import {
+        /// Override experiment directory for txblast wallet state
+        #[arg(short = 'd', long)]
+        directory: Option<String>,
+
+        /// Deposit transaction id
+        #[arg(long)]
+        txid: String,
+
+        /// Deposit output index
+        #[arg(long)]
+        vout: Option<u32>,
+
+        /// Expected deposit amount in zatoshis
+        #[arg(long)]
+        amount_zats: Option<u64>,
+
+        /// Expected destination address
+        #[arg(long)]
+        address: Option<String>,
+    },
+    /// Show deposit and spendability status
+    Status {
+        /// Override experiment directory for txblast wallet state
+        #[arg(short = 'd', long)]
+        directory: Option<String>,
+
+        /// RPC endpoint to query, default localhost port from config
+        #[arg(long)]
+        rpc_endpoint: Option<String>,
+
+        /// Confirmations required for spendability
+        #[arg(long, default_value_t = 10)]
+        confirmations: u32,
+
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Clone, Debug)]
+enum TxblastRecoverCommand {
+    /// Reconstruct recoverable inventory from local recovery data
+    Inventory {
+        /// Override experiment directory for txblast wallet state
+        #[arg(short = 'd', long)]
+        directory: Option<String>,
+
+        /// Scan start height override
+        #[arg(long)]
+        from_height: Option<u32>,
+
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Emergency sweep all recoverable funds to a transparent address
+    Sweep {
+        /// Override experiment directory for txblast wallet state
+        #[arg(short = 'd', long)]
+        directory: Option<String>,
+
+        /// Destination transparent address
+        #[arg(long)]
+        to: String,
+
+        /// Scan start height override
+        #[arg(long)]
+        from_height: Option<u32>,
+
+        /// Show what would happen without moving funds
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Required on mainnet
+        #[arg(long)]
+        mainnet_i_understand_recovery: bool,
+    },
+}
+
 impl Commands {
     fn directory(&self) -> Option<&str> {
         match self {
@@ -857,6 +1200,7 @@ impl Commands {
             | Commands::Up { directory, .. }
             | Commands::SyncIps { directory, .. }
             | Commands::Genesis { directory, .. }
+            | Commands::GenesisPublic { directory, .. }
             | Commands::Deploy { directory, .. }
             | Commands::Status { directory, .. }
             | Commands::Check { directory, .. }
@@ -879,6 +1223,244 @@ impl Commands {
             | Commands::ForceDown { directory, .. } => Some(directory),
         }
     }
+}
+
+async fn run_txblast_command(command: TxblastCommand, directory: &str) -> Result<()> {
+    match command {
+        TxblastCommand::Wallet { command } => match command {
+            TxblastWalletCommand::Init {
+                directory: state_directory,
+                network,
+                birthday_height,
+                lanes_per_node,
+                lane_value_zats,
+                fanout_width,
+                require_mainnet_confirmation,
+                force,
+            } => {
+                let network = network.as_deref().map(str::parse).transpose()?;
+                commands::txblast_public::wallet_init(
+                    directory,
+                    commands::txblast_public::WalletInitArgs {
+                        directory: state_directory,
+                        network,
+                        birthday_height,
+                        lanes_per_node,
+                        lane_value_zats,
+                        fanout_width,
+                        require_mainnet_confirmation,
+                        force,
+                    },
+                )
+                .await?;
+            }
+        },
+        TxblastCommand::Deposit { command } => match command {
+            TxblastDepositCommand::Address {
+                directory: state_directory,
+                json,
+            } => {
+                commands::txblast_public::deposit_address(
+                    directory,
+                    commands::txblast_public::DepositAddressArgs {
+                        directory: state_directory,
+                        json,
+                    },
+                )?;
+            }
+            TxblastDepositCommand::Import {
+                directory: state_directory,
+                txid,
+                vout,
+                amount_zats,
+                address,
+            } => {
+                commands::txblast_public::deposit_import(
+                    directory,
+                    commands::txblast_public::DepositImportArgs {
+                        directory: state_directory,
+                        txid,
+                        vout,
+                        amount_zats,
+                        address,
+                    },
+                )?;
+            }
+            TxblastDepositCommand::Status {
+                directory: state_directory,
+                rpc_endpoint,
+                confirmations,
+                json,
+            } => {
+                commands::txblast_public::deposit_status(
+                    directory,
+                    commands::txblast_public::DepositStatusArgs {
+                        directory: state_directory,
+                        rpc_endpoint,
+                        confirmations,
+                        json,
+                    },
+                )
+                .await?;
+            }
+        },
+        TxblastCommand::Plan {
+            directory: state_directory,
+            target_block_bytes,
+            block_spacing_secs,
+            duration_secs,
+            nodes,
+            measured_tx_bytes,
+            max_mempool_bytes,
+            safety_margin,
+            allow_underfunded_plan,
+            json,
+        } => {
+            commands::txblast_public::plan(
+                directory,
+                commands::txblast_public::PlanArgs {
+                    directory: state_directory,
+                    target_block_bytes,
+                    block_spacing_secs,
+                    duration_secs,
+                    nodes,
+                    measured_tx_bytes,
+                    max_mempool_bytes,
+                    safety_margin,
+                    allow_underfunded_plan,
+                    json,
+                },
+            )?;
+        }
+        TxblastCommand::Prepare {
+            directory: state_directory,
+            plan,
+            dry_run,
+        } => {
+            commands::txblast_public::prepare(
+                directory,
+                commands::txblast_public::GuardedLifecycleArgs {
+                    directory: state_directory,
+                    plan,
+                    dry_run,
+                },
+            )
+            .await?;
+        }
+        TxblastCommand::Run {
+            directory: state_directory,
+            plan,
+            target_block_bytes,
+            max_global_bytes_per_sec,
+            max_node_bytes_per_sec,
+            max_pending_txs,
+            max_pending_bytes,
+            max_mempool_bytes,
+            feedback_window_blocks,
+            trace_dir,
+            mainnet_i_understand_fees,
+        } => {
+            commands::txblast_public::run_public(
+                directory,
+                commands::txblast_public::PublicRunArgs {
+                    directory: state_directory,
+                    plan,
+                    target_block_bytes,
+                    max_global_bytes_per_sec,
+                    max_node_bytes_per_sec,
+                    max_pending_txs,
+                    max_pending_bytes,
+                    max_mempool_bytes,
+                    feedback_window_blocks,
+                    trace_dir,
+                    mainnet_i_understand_fees,
+                },
+            )
+            .await?;
+        }
+        TxblastCommand::Stop {
+            directory: state_directory,
+            plan,
+            dry_run,
+        } => {
+            commands::txblast_public::stop(
+                directory,
+                commands::txblast_public::GuardedLifecycleArgs {
+                    directory: state_directory,
+                    plan,
+                    dry_run,
+                },
+            )?;
+        }
+        TxblastCommand::Status {
+            directory: state_directory,
+            plan,
+            dry_run,
+        } => {
+            commands::txblast_public::status(
+                directory,
+                commands::txblast_public::GuardedLifecycleArgs {
+                    directory: state_directory,
+                    plan,
+                    dry_run,
+                },
+            )?;
+        }
+        TxblastCommand::Withdraw {
+            directory: state_directory,
+            to,
+            amount,
+            dry_run,
+            mainnet_i_understand_finality,
+        } => {
+            commands::txblast_public::withdraw(
+                directory,
+                commands::txblast_public::WithdrawArgs {
+                    directory: state_directory,
+                    to,
+                    amount,
+                    dry_run,
+                    mainnet_i_understand_finality,
+                },
+            )?;
+        }
+        TxblastCommand::Recover { command } => match command {
+            TxblastRecoverCommand::Inventory {
+                directory: state_directory,
+                from_height,
+                json,
+            } => {
+                commands::txblast_public::recover_inventory(
+                    directory,
+                    commands::txblast_public::RecoverInventoryArgs {
+                        directory: state_directory,
+                        from_height,
+                        json,
+                    },
+                )?;
+            }
+            TxblastRecoverCommand::Sweep {
+                directory: state_directory,
+                to,
+                from_height,
+                dry_run,
+                mainnet_i_understand_recovery,
+            } => {
+                commands::txblast_public::recover_sweep(
+                    directory,
+                    commands::txblast_public::RecoverSweepArgs {
+                        directory: state_directory,
+                        to,
+                        from_height,
+                        dry_run,
+                        mainnet_i_understand_recovery,
+                    },
+                )?;
+            }
+        },
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -939,11 +1521,13 @@ async fn main() -> Result<()> {
             ssh_pub_key_path,
             ssh_key_name,
             mining_mode,
+            network,
             block_time,
             equihash_params,
             env_source,
         } => {
             let mining_mode: config::MiningMode = mining_mode.parse()?;
+            let network_kind: config::NetworkKind = network.parse()?;
             let equihash_params: config::EquihashParameterSet = equihash_params.parse()?;
             commands::init::run(
                 &chain_id,
@@ -952,6 +1536,7 @@ async fn main() -> Result<()> {
                 ssh_pub_key_path,
                 ssh_key_name,
                 mining_mode,
+                network_kind,
                 block_time,
                 equihash_params,
                 env_source.as_deref(),
@@ -1000,10 +1585,12 @@ async fn main() -> Result<()> {
             orchard_fanout_outputs,
             scripts_dir,
             pow_adjust,
+            pow_fleet_discount,
             directory,
         } => {
             let pow_calibration = commands::genesis::PowCalibrationCli {
                 adjust_fraction: pow_adjust,
+                fleet_discount: pow_fleet_discount,
             };
             commands::genesis::run(
                 &zebrad_binary,
@@ -1016,6 +1603,21 @@ async fn main() -> Result<()> {
                 orchard_fanout_outputs,
                 &scripts_dir,
                 pow_calibration,
+                &directory,
+            )?;
+        }
+        Commands::GenesisPublic {
+            zebrad_binary,
+            kresko_binary,
+            build_dir,
+            scripts_dir,
+            directory,
+        } => {
+            commands::genesis_public::run(
+                &zebrad_binary,
+                kresko_binary.as_deref(),
+                &build_dir,
+                &scripts_dir,
                 &directory,
             )?;
         }
@@ -1131,8 +1733,12 @@ async fn main() -> Result<()> {
                 result.equihash_solutions, result.sol_per_sec,
             );
             println!(
+                "  mining_candidates={} ({:.3}/s)",
+                result.mining_candidates, result.mining_candidates_per_sec,
+            );
+            println!(
                 "  matrix input: --sol-per-sec {}={:.9}",
-                result.equihash_params, result.sol_per_sec,
+                result.equihash_params, result.mining_candidates_per_sec,
             );
         }
         Commands::PowSimulateMatrix {
@@ -1171,6 +1777,14 @@ async fn main() -> Result<()> {
             commands::fund_runtime_keys::run(&directory).await?;
         }
         Commands::Txblast {
+            command: Some(command),
+            directory,
+            ..
+        } => {
+            run_txblast_command(command, &directory).await?;
+        }
+        Commands::Txblast {
+            command: None,
             instances,
             rate,
             amount,
@@ -1225,6 +1839,7 @@ async fn main() -> Result<()> {
             orchard_fanout_max_in_flight,
             orchard_proving_workers,
             orchard_progress_interval_secs,
+            network,
             trace_enable: _,
             skip_funding,
             trace_dir,
@@ -1245,6 +1860,7 @@ async fn main() -> Result<()> {
                 orchard_fanout_max_in_flight,
                 orchard_proving_workers,
                 orchard_progress_interval_secs,
+                network.as_deref().map(str::parse).transpose()?,
                 skip_funding,
                 trace_dir.as_deref(),
                 funded_key_path.as_deref(),

@@ -9,8 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use crate::config::{
-    Config, GCP_DEFAULT_DISK_SIZE_GB, GCP_REGIONS, Instance, require_env, resolve_value,
-    shellexpand,
+    Config, GCP_REGIONS, Instance, gcp_disk_size_gb, require_env, resolve_value, shellexpand,
 };
 
 const COMPUTE_API: &str = "https://compute.googleapis.com/compute/v1";
@@ -216,7 +215,7 @@ impl GoogleCloudClient {
                 "autoDelete": true,
                 "initializeParams": {
                     "sourceImage": "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts",
-                    "diskSizeGb": GCP_DEFAULT_DISK_SIZE_GB,
+                    "diskSizeGb": gcp_disk_size_gb(self.config.network_kind),
                     "diskType": format!("zones/{zone}/diskTypes/pd-ssd"),
                 }
             }],

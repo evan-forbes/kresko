@@ -2,24 +2,31 @@
 set -u
 set -o pipefail
 
-RPC_URL="${RPC_URL:-http://127.0.0.1:18232}"
+if [[ -f /root/payload/vars.sh ]]; then
+    # shellcheck disable=SC1091
+    source /root/payload/vars.sh
+fi
+
+KRESKO_RPC_PORT="${KRESKO_RPC_PORT:-18232}"
+KRESKO_P2P_PORT="${KRESKO_P2P_PORT:-18233}"
+RPC_URL="${RPC_URL:-http://127.0.0.1:${KRESKO_RPC_PORT}}"
 CONFIG_PATH="${CONFIG_PATH:-/root/.config/zebrad.toml}"
 PEER_IP="${PEER_IP:-}"
-PEER_P2P_PORT="${PEER_P2P_PORT:-18233}"
-PEER_RPC_PORT="${PEER_RPC_PORT:-18232}"
+PEER_P2P_PORT="${PEER_P2P_PORT:-$KRESKO_P2P_PORT}"
+PEER_RPC_PORT="${PEER_RPC_PORT:-$KRESKO_RPC_PORT}"
 RPC_TIMEOUT="${RPC_TIMEOUT:-5}"
 DO_ADDNODE=0
 
 usage() {
-    cat <<'EOF'
+    cat <<EOF
 Usage: network_diag.sh [options]
 
 Options:
-  --rpc URL               Local JSON-RPC URL (default: http://127.0.0.1:18232)
+  --rpc URL               Local JSON-RPC URL (default: http://127.0.0.1:${KRESKO_RPC_PORT})
   --config PATH           zebrad config path (default: /root/.config/zebrad.toml)
   --peer-ip IP            Peer node IP for connectivity/addnode checks
-  --peer-p2p-port PORT    Peer P2P port (default: 18233)
-  --peer-rpc-port PORT    Peer RPC port (default: 18232)
+  --peer-p2p-port PORT    Peer P2P port (default: ${KRESKO_P2P_PORT})
+  --peer-rpc-port PORT    Peer RPC port (default: ${KRESKO_RPC_PORT})
   --rpc-timeout SEC       Curl timeout in seconds (default: 5)
   --addnode               Try addnode("<peer-ip>:<peer-p2p-port>", "add")
   -h, --help              Show this help
@@ -27,7 +34,7 @@ Options:
 Examples:
   ./network_diag.sh
   ./network_diag.sh --peer-ip 165.227.115.123 --addnode
-  ./network_diag.sh --rpc http://127.0.0.1:18232 --config /root/.config/zebrad.toml
+  ./network_diag.sh --rpc http://127.0.0.1:${KRESKO_RPC_PORT} --config /root/.config/zebrad.toml
 EOF
 }
 
@@ -155,8 +162,8 @@ print_basics() {
     fi
 
     if have_cmd ss; then
-        printf '\nListening ports (18232/18233):\n'
-        ss -ltnp 2>/dev/null | grep -E ':(18232|18233)\b' || true
+        printf '\nListening ports (%s/%s):\n' "$KRESKO_RPC_PORT" "$KRESKO_P2P_PORT"
+        ss -ltnp 2>/dev/null | grep -E ":(${KRESKO_RPC_PORT}|${KRESKO_P2P_PORT})\\b" || true
     fi
 }
 

@@ -148,10 +148,7 @@ pub async fn run(
         eprintln!("No miners are eligible to start after payload distribution.");
     } else {
         println!("Starting nodes via tmux...");
-        let script = std::fs::read_to_string(dir.join("scripts/node_init.sh"))
-            .or_else(|_| std::fs::read_to_string(dir.join("payload/scripts/node_init.sh")))
-            .or_else(|_| std::fs::read_to_string(dir.join("payload/node_init.sh")))
-            .context("node_init.sh not found")?;
+        let script = read_node_init_script(dir, &config).context("node_init.sh not found")?;
 
         let mut start_targets = Vec::new();
         let mut reused_sessions = HashSet::new();
@@ -275,6 +272,30 @@ pub async fn run(
 enum SessionPreparation {
     StartFresh,
     ReuseExisting,
+}
+
+fn read_node_init_script(dir: &Path, config: &Config) -> Result<String> {
+    let payload_scripts_path = dir.join("payload/scripts/node_init.sh");
+    let payload_flat_path = dir.join("payload/node_init.sh");
+    let local_path = dir.join("scripts/node_init.sh");
+
+    if config.is_public_network() {
+        std::fs::read_to_string(&payload_scripts_path)
+            .or_else(|_| std::fs::read_to_string(&payload_flat_path))
+            .or_else(|_| std::fs::read_to_string(&local_path))
+    } else {
+        std::fs::read_to_string(&local_path)
+            .or_else(|_| std::fs::read_to_string(&payload_scripts_path))
+            .or_else(|_| std::fs::read_to_string(&payload_flat_path))
+    }
+    .with_context(|| {
+        format!(
+            "tried {}, {}, and {}",
+            payload_scripts_path.display(),
+            payload_flat_path.display(),
+            local_path.display()
+        )
+    })
 }
 
 /// Returns true if the tarball needs to be (re)created.

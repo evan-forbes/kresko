@@ -73,6 +73,71 @@ impl From<EquihashParameterSet> for EquihashParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkKind {
+    #[default]
+    LocalGenesis,
+    PublicTestnet,
+    Mainnet,
+}
+
+impl std::fmt::Display for NetworkKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetworkKind::LocalGenesis => write!(f, "local-genesis"),
+            NetworkKind::PublicTestnet => write!(f, "public-testnet"),
+            NetworkKind::Mainnet => write!(f, "mainnet"),
+        }
+    }
+}
+
+impl std::str::FromStr for NetworkKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "local-genesis" | "local_genesis" | "local" => Ok(NetworkKind::LocalGenesis),
+            "public-testnet" | "public_testnet" | "testnet" => Ok(NetworkKind::PublicTestnet),
+            "mainnet" | "main" => Ok(NetworkKind::Mainnet),
+            other => anyhow::bail!(
+                "unknown network kind: {other}. Use local-genesis, public-testnet, or mainnet."
+            ),
+        }
+    }
+}
+
+impl NetworkKind {
+    pub fn is_local_genesis(self) -> bool {
+        self == NetworkKind::LocalGenesis
+    }
+
+    pub fn is_public_network(self) -> bool {
+        matches!(self, NetworkKind::PublicTestnet | NetworkKind::Mainnet)
+    }
+
+    pub fn rpc_port(self) -> u16 {
+        match self {
+            NetworkKind::Mainnet => 8232,
+            NetworkKind::LocalGenesis | NetworkKind::PublicTestnet => 18232,
+        }
+    }
+
+    pub fn p2p_port(self) -> u16 {
+        match self {
+            NetworkKind::Mainnet => 8233,
+            NetworkKind::LocalGenesis | NetworkKind::PublicTestnet => 18233,
+        }
+    }
+
+    pub fn zebra_network_string(self) -> &'static str {
+        match self {
+            NetworkKind::Mainnet => "Mainnet",
+            NetworkKind::LocalGenesis | NetworkKind::PublicTestnet => "Testnet",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeType {
@@ -214,14 +279,78 @@ pub struct Config {
     pub ssh_key_path: String,
     pub provider: Provider,
     #[serde(default)]
+    pub network_kind: NetworkKind,
+    #[serde(default)]
     pub mining_mode: MiningMode,
     #[serde(default)]
     pub block_time_secs: Option<u32>,
     #[serde(default)]
     pub equihash_params: EquihashParameterSet,
     #[serde(default)]
+    pub daa: DaaConfig,
+    #[serde(default)]
     pub orchard_txblast: OrchardTxblastConfig,
     pub local_genesis: Option<LocalGenesisConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaaConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pow_averaging_window: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pow_median_block_span: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_blossom_pow_target_spacing: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pow_damping_factor: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pow_max_adjust_up_percent: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pow_max_adjust_down_percent: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub testnet_min_difficulty_start_height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub testnet_min_difficulty_gap_multiplier: Option<i32>,
+}
+
+impl DaaConfig {
+    pub fn tuned_25s_defaults() -> Self {
+        Self {
+            pow_averaging_window: Some(51),
+            pow_median_block_span: Some(33),
+            pre_blossom_pow_target_spacing: None,
+            pow_damping_factor: Some(4),
+            pow_max_adjust_up_percent: Some(16),
+            pow_max_adjust_down_percent: Some(32),
+            testnet_min_difficulty_start_height: None,
+            testnet_min_difficulty_gap_multiplier: None,
+        }
+    }
+
+    pub fn with_missing_from(self, defaults: Self) -> Self {
+        Self {
+            pow_averaging_window: self.pow_averaging_window.or(defaults.pow_averaging_window),
+            pow_median_block_span: self
+                .pow_median_block_span
+                .or(defaults.pow_median_block_span),
+            pre_blossom_pow_target_spacing: self
+                .pre_blossom_pow_target_spacing
+                .or(defaults.pre_blossom_pow_target_spacing),
+            pow_damping_factor: self.pow_damping_factor.or(defaults.pow_damping_factor),
+            pow_max_adjust_up_percent: self
+                .pow_max_adjust_up_percent
+                .or(defaults.pow_max_adjust_up_percent),
+            pow_max_adjust_down_percent: self
+                .pow_max_adjust_down_percent
+                .or(defaults.pow_max_adjust_down_percent),
+            testnet_min_difficulty_start_height: self
+                .testnet_min_difficulty_start_height
+                .or(defaults.testnet_min_difficulty_start_height),
+            testnet_min_difficulty_gap_multiplier: self
+                .testnet_min_difficulty_gap_multiplier
+                .or(defaults.testnet_min_difficulty_gap_multiplier),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +377,9 @@ pub struct LocalGenesisConfig {
     pub network_name: String,
     pub network_magic: [u8; 4],
     pub target_difficulty_limit: String,
+    /// Live post-Blossom PoW target spacing used by the generated testnet.
+    #[serde(default)]
+    pub target_spacing_secs: Option<u32>,
     pub disable_pow: bool,
     pub genesis_hash: String,
     #[serde(default)]
@@ -309,6 +441,48 @@ impl Config {
         std::fs::write(&path, data)
             .with_context(|| format!("failed to write config to {}", path.display()))?;
         Ok(())
+    }
+
+    pub fn is_local_genesis(&self) -> bool {
+        self.network_kind.is_local_genesis()
+    }
+
+    pub fn is_public_network(&self) -> bool {
+        self.network_kind.is_public_network()
+    }
+
+    pub fn rpc_port(&self) -> u16 {
+        self.network_kind.rpc_port()
+    }
+
+    pub fn p2p_port(&self) -> u16 {
+        self.network_kind.p2p_port()
+    }
+
+    pub fn zebra_network_string(&self) -> &'static str {
+        self.network_kind.zebra_network_string()
+    }
+
+    pub fn require_local_genesis(&self, command_name: &str) -> Result<()> {
+        if self.is_local_genesis() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "`kresko {command_name}` only works with local-genesis experiments (current network: {}). Use public-network commands such as `kresko genesis-public` for public networks.",
+                self.network_kind
+            )
+        }
+    }
+
+    pub fn require_public_network(&self, command_name: &str) -> Result<()> {
+        if self.is_public_network() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "`kresko {command_name}` only works with public-testnet or mainnet experiments (current network: {}). Use `kresko genesis` for local-genesis experiments.",
+                self.network_kind
+            )
+        }
     }
 }
 
@@ -432,6 +606,35 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::DaaConfig;
+
+    #[test]
+    fn tuned_25s_daa_defaults_match_expected_profile() {
+        let daa = DaaConfig::tuned_25s_defaults();
+
+        assert_eq!(daa.pow_averaging_window, Some(51));
+        assert_eq!(daa.pow_median_block_span, Some(33));
+        assert_eq!(daa.pow_damping_factor, Some(4));
+        assert_eq!(daa.pow_max_adjust_up_percent, Some(16));
+        assert_eq!(daa.pow_max_adjust_down_percent, Some(32));
+    }
+
+    #[test]
+    fn daa_defaults_fill_missing_values_without_overwriting_explicit_values() {
+        let daa = DaaConfig {
+            pow_averaging_window: Some(17),
+            ..DaaConfig::default()
+        }
+        .with_missing_from(DaaConfig::tuned_25s_defaults());
+
+        assert_eq!(daa.pow_averaging_window, Some(17));
+        assert_eq!(daa.pow_median_block_span, Some(33));
+        assert_eq!(daa.pow_damping_factor, Some(4));
+    }
+}
+
 // Default instance shapes/images per provider
 /// DigitalOcean miner slugs in preference order. `add` walks this list per
 /// region and assigns the first slug the region actually carries, so we
@@ -441,6 +644,9 @@ pub const DO_FULL_MINER_SLUG_FALLBACKS: &[&str] =
     &["s-8vcpu-16gb", "s-8vcpu-16gb-amd", "s-8vcpu-16gb-intel"];
 pub const DO_LOW_MINER_SLUG_FALLBACKS: &[&str] =
     &["s-4vcpu-8gb", "s-4vcpu-8gb-amd", "s-4vcpu-8gb-intel"];
+pub const DO_PUBLIC_TESTNET_FULL_MINER_SLUG_FALLBACKS: &[&str] =
+    &["s-4vcpu-8gb", "s-4vcpu-8gb-amd", "s-4vcpu-8gb-intel"];
+pub const DO_MAINNET_FULL_MINER_SLUG_FALLBACKS: &[&str] = &["so-4vcpu-32gb"];
 pub const DO_DEFAULT_IMAGE: &str = "ubuntu-22-04-x64";
 pub const DO_REGIONS: &[&str] = &[
     "nyc1", "nyc3", "tor1", "sfo2", "sfo3", "ams3", "sgp1", "lon1", "fra1", "syd1",
@@ -449,6 +655,13 @@ pub const DO_REGIONS: &[&str] = &[
 pub const GCP_DEFAULT_MACHINE: &str = "c3d-highcpu-8";
 pub const GCP_LOW_RESOURCE_MACHINE: &str = "c3d-highcpu-4";
 pub const GCP_DEFAULT_DISK_SIZE_GB: u64 = 40;
+pub fn gcp_disk_size_gb(network_kind: NetworkKind) -> u64 {
+    match network_kind {
+        NetworkKind::LocalGenesis => 40,
+        NetworkKind::PublicTestnet => 100,
+        NetworkKind::Mainnet => 500,
+    }
+}
 pub const GCP_REGIONS: &[&str] = &[
     "us-central1",
     "us-east1",

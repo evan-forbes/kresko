@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::config::{Config, resolve_value, select_instances, shellexpand};
+use crate::config::{Config, NetworkKind, resolve_value, select_instances, shellexpand};
 use crate::ssh;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -98,6 +98,7 @@ pub async fn query_with_options(
 
     let active = select_instances(&config.miners, "all");
     let total = active.len();
+    let rpc_port = config.rpc_port();
 
     if active.is_empty() {
         return Ok(StatusReport {
@@ -130,9 +131,10 @@ pub async fn query_with_options(
             let ssh_key = ssh_key.clone();
 
             async move {
-                let mut node = fetch_rpc_status(&client, &name, &ip).await;
+                let mut node =
+                    fetch_rpc_status(&client, &name, &ip, rpc_port, config.network_kind).await;
                 if let Some(key) = ssh_key.as_deref() {
-                    populate_deep_status(&mut node, key).await;
+                    populate_deep_status(&mut node, key, rpc_port).await;
                 }
                 node
             }
@@ -151,57 +153,68 @@ pub async fn query_with_options(
     })
 }
 
-async fn fetch_rpc_status(client: &reqwest::Client, name: &str, ip: &str) -> NodeStatus {
-    let url = format!("http://{ip}:18232");
-    let body = serde_json::json!({
+async fn fetch_rpc_status(
+    client: &reqwest::Client,
+    name: &str,
+    ip: &str,
+    rpc_port: u16,
+    network_kind: NetworkKind,
+) -> NodeStatus {
+    let url = format!("http://{ip}:{rpc_port}");
+
+    let count_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getblockcount",
+        "params": []
+    });
+    let info_body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getblockchaininfo",
         "params": []
     });
 
-    match client.post(&url).json(&body).send().await {
+    let height = match client.post(&url).json(&count_body).send().await {
         Ok(resp) => match resp.json::<serde_json::Value>().await {
-            Ok(json) => {
-                let height = json["result"]["blocks"].as_u64();
-                let progress = json["result"]["verificationprogress"].as_f64();
-                let status = match progress {
-                    Some(p) if p >= 0.9999 => "synced".to_string(),
-                    Some(p) => format!("syncing ({:.1}%)", p * 100.0),
-                    None => "unknown".to_string(),
-                };
-                NodeStatus {
-                    name: name.to_string(),
-                    ip: ip.to_string(),
-                    height,
-                    verification_progress: progress,
-                    status,
-                    ssh_reachable: None,
-                    ssh_status: None,
-                    tmux_session_present: None,
-                    loopback_rpc_status: None,
-                    recent_log_tail: None,
-                }
+            Ok(json) => json["result"].as_u64(),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+
+    let info_result = client.post(&url).json(&info_body).send().await;
+    match info_result {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(json) => status_from_blockchain_info(name, ip, json, height, network_kind),
+            Err(error) => {
+                status_from_height_fallback(name, ip, height, network_kind, Some(error.to_string()))
             }
-            Err(error) => NodeStatus {
-                name: name.to_string(),
-                ip: ip.to_string(),
-                height: None,
-                verification_progress: None,
-                status: format!("error: {error}"),
-                ssh_reachable: None,
-                ssh_status: None,
-                tmux_session_present: None,
-                loopback_rpc_status: None,
-                recent_log_tail: None,
-            },
         },
         Err(error) => NodeStatus {
             name: name.to_string(),
             ip: ip.to_string(),
-            height: None,
-            verification_progress: None,
-            status: format!("unreachable: {error}"),
+            height,
+            verification_progress: height
+                .and_then(|height| estimate_progress(height, network_kind)),
+            status: match height.and_then(|height| estimate_progress(height, network_kind)) {
+                Some(progress) if progress >= 0.9999 => {
+                    format!(
+                        "synced? ({:.1}%; getblockchaininfo timed out)",
+                        progress * 100.0
+                    )
+                }
+                Some(progress) => {
+                    format!(
+                        "syncing (~{:.1}%; getblockchaininfo timed out)",
+                        progress * 100.0
+                    )
+                }
+                None if height.is_some() => {
+                    format!("height ok; getblockchaininfo failed: {error}")
+                }
+                None => format!("unreachable: {error}"),
+            },
             ssh_reachable: None,
             ssh_status: None,
             tmux_session_present: None,
@@ -211,15 +224,110 @@ async fn fetch_rpc_status(client: &reqwest::Client, name: &str, ip: &str) -> Nod
     }
 }
 
-async fn populate_deep_status(node: &mut NodeStatus, ssh_key: &str) {
-    let command = r#"tmux_state="absent"
+fn status_from_blockchain_info(
+    name: &str,
+    ip: &str,
+    json: serde_json::Value,
+    fallback_height: Option<u64>,
+    network_kind: NetworkKind,
+) -> NodeStatus {
+    let height = json["result"]["blocks"].as_u64().or(fallback_height);
+    let progress = json["result"]["verificationprogress"]
+        .as_f64()
+        .or_else(|| height.and_then(|height| estimate_progress(height, network_kind)));
+    let status = match progress {
+        Some(p) if p >= 0.9999 => "synced".to_string(),
+        Some(p) => format!("syncing ({:.1}%)", p * 100.0),
+        None if height.is_some() => "height ok; progress unknown".to_string(),
+        None => "unknown".to_string(),
+    };
+
+    NodeStatus {
+        name: name.to_string(),
+        ip: ip.to_string(),
+        height,
+        verification_progress: progress,
+        status,
+        ssh_reachable: None,
+        ssh_status: None,
+        tmux_session_present: None,
+        loopback_rpc_status: None,
+        recent_log_tail: None,
+    }
+}
+
+fn status_from_height_fallback(
+    name: &str,
+    ip: &str,
+    height: Option<u64>,
+    network_kind: NetworkKind,
+    error: Option<String>,
+) -> NodeStatus {
+    let progress = height.and_then(|height| estimate_progress(height, network_kind));
+    let status = match (progress, height, error) {
+        (Some(p), _, _) if p >= 0.9999 => format!("synced? (~{:.1}%)", p * 100.0),
+        (Some(p), _, _) => format!("syncing (~{:.1}%)", p * 100.0),
+        (None, Some(_), Some(error)) => format!("height ok; progress unavailable: {error}"),
+        (None, Some(_), None) => "height ok; progress unavailable".to_string(),
+        (None, None, Some(error)) => format!("error: {error}"),
+        (None, None, None) => "unknown".to_string(),
+    };
+
+    NodeStatus {
+        name: name.to_string(),
+        ip: ip.to_string(),
+        height,
+        verification_progress: progress,
+        status,
+        ssh_reachable: None,
+        ssh_status: None,
+        tmux_session_present: None,
+        loopback_rpc_status: None,
+        recent_log_tail: None,
+    }
+}
+
+fn estimate_progress(height: u64, network_kind: NetworkKind) -> Option<f64> {
+    let estimated_tip = estimated_public_network_tip(network_kind)?;
+    if estimated_tip == 0 {
+        return None;
+    }
+
+    Some((height as f64 / estimated_tip as f64).min(1.0))
+}
+
+fn estimated_public_network_tip(network_kind: NetworkKind) -> Option<u64> {
+    let now = chrono::Utc::now().timestamp();
+
+    // Zcash mainnet and testnet both use a 150s target spacing before Blossom
+    // and a 75s target spacing after Blossom. This fallback is only for status
+    // display when Zebra's richer getblockchaininfo RPC is busy during sync.
+    let (genesis_time, blossom_height) = match network_kind {
+        NetworkKind::Mainnet => (1_477_612_800_i64, 653_600_i64),
+        NetworkKind::PublicTestnet => (1_477_612_800_i64, 584_000_i64),
+        NetworkKind::LocalGenesis => return None,
+    };
+
+    let blossom_time = genesis_time + (blossom_height * 150);
+    let estimated_tip = if now <= blossom_time {
+        (now - genesis_time).div_euclid(150)
+    } else {
+        blossom_height + (now - blossom_time).div_euclid(75)
+    };
+
+    u64::try_from(estimated_tip.max(0)).ok()
+}
+
+async fn populate_deep_status(node: &mut NodeStatus, ssh_key: &str, rpc_port: u16) {
+    let command = format!(
+        r#"tmux_state="absent"
 if tmux has-session -t app >/dev/null 2>&1; then
   tmux_state="present"
 fi
 
 loopback_rpc="no-curl"
 if command -v curl >/dev/null 2>&1; then
-  if curl -fsS --max-time 5 -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}' http://127.0.0.1:18232 >/dev/null 2>&1; then
+  if curl -fsS --max-time 5 -H 'content-type: application/json' --data '{{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}}' http://127.0.0.1:{rpc_port} >/dev/null 2>&1; then
     loopback_rpc="ok"
   else
     loopback_rpc="error"
@@ -233,9 +341,10 @@ elif [ -f /root/logs ]; then
   log_tail="$(tail -n 1 /root/logs | tr '\n' ' ' | cut -c1-160)"
 fi
 
-printf 'tmux=%s\nloopback_rpc=%s\nlog_tail=%s\n' "$tmux_state" "$loopback_rpc" "$log_tail""#;
+printf 'tmux=%s\nloopback_rpc=%s\nlog_tail=%s\n' "$tmux_state" "$loopback_rpc" "$log_tail""#
+    );
 
-    match ssh::ssh_exec_capture(&node.ip, ssh_key, command).await {
+    match ssh::ssh_exec_capture(&node.ip, ssh_key, &command).await {
         Ok((_, output)) => {
             node.ssh_reachable = Some(true);
             node.ssh_status = Some("reachable".to_string());

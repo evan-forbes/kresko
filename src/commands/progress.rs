@@ -51,6 +51,8 @@ pub async fn run(
 
     let dir = std::path::Path::new(directory);
     let config = Config::load(dir)?;
+    config.require_local_genesis("progress")?;
+    let rpc_port = config.rpc_port();
     let miners: Vec<Instance> = select_instances(&config.miners, "all")
         .into_iter()
         .cloned()
@@ -64,9 +66,12 @@ pub async fn run(
     let log_path = resolve_log_path(dir, data_subdir)?;
 
     match config.mining_mode {
-        MiningMode::Pow => run_observer(block_time, &miners, &log_path, true).await,
+        MiningMode::Pow => run_observer(block_time, &miners, &log_path, true, rpc_port).await,
         MiningMode::Generate => {
-            run_generate(block_time, random, concurrent, &miners, &log_path, true).await
+            run_generate(
+                block_time, random, concurrent, &miners, &log_path, true, rpc_port,
+            )
+            .await
         }
     }
 }
@@ -84,6 +89,8 @@ pub async fn spawn_background(
     }
 
     let config = Config::load(directory)?;
+    config.require_local_genesis("progress")?;
+    let rpc_port = config.rpc_port();
     let miners: Vec<Instance> = select_instances(&config.miners, "all")
         .into_iter()
         .cloned()
@@ -98,9 +105,9 @@ pub async fn spawn_background(
 
     let handle = tokio::spawn(async move {
         let result = match mining_mode {
-            MiningMode::Pow => run_observer(block_time, &miners, &log_path, false).await,
+            MiningMode::Pow => run_observer(block_time, &miners, &log_path, false, rpc_port).await,
             MiningMode::Generate => {
-                run_generate(block_time, false, 1, &miners, &log_path, false).await
+                run_generate(block_time, false, 1, &miners, &log_path, false, rpc_port).await
             }
         };
         if let Err(e) = result {
@@ -135,6 +142,7 @@ async fn run_generate(
     miners: &[Instance],
     log_path: &Path,
     respond_to_ctrl_c: bool,
+    rpc_port: u16,
 ) -> Result<()> {
     let effective_concurrency = concurrent.min(miners.len());
     if effective_concurrency != concurrent {
@@ -185,7 +193,7 @@ async fn run_generate(
                 _ = ticker.tick() => {
                     generate_tick(
                         &client, miners, &mut log_file, &mut tick, mode, random,
-                        effective_concurrency, &mut next_idx, &mut rng, respond_to_ctrl_c,
+                        effective_concurrency, &mut next_idx, &mut rng, respond_to_ctrl_c, rpc_port,
                     ).await?;
                 }
             }
@@ -202,6 +210,7 @@ async fn run_generate(
                 &mut next_idx,
                 &mut rng,
                 respond_to_ctrl_c,
+                rpc_port,
             )
             .await?;
         }
@@ -222,6 +231,7 @@ async fn generate_tick(
     next_idx: &mut usize,
     rng: &mut impl rand::Rng,
     print_entries: bool,
+    rpc_port: u16,
 ) -> Result<()> {
     *tick = tick.saturating_add(1);
 
@@ -233,7 +243,7 @@ async fn generate_tick(
 
     let futs: Vec<_> = selected
         .into_iter()
-        .map(|miner| generate_block(client, miner, *tick, mode))
+        .map(|miner| generate_block(client, miner, *tick, mode, rpc_port))
         .collect();
 
     let results = join_all(futs).await;
@@ -254,6 +264,7 @@ async fn run_observer(
     miners: &[Instance],
     log_path: &Path,
     respond_to_ctrl_c: bool,
+    rpc_port: u16,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -292,7 +303,7 @@ async fn run_observer(
                 _ = ticker.tick() => {
                     observer_tick(
                         &client, miners, &mut log_file, &mut tick,
-                        &mut last_heights, &mut height_first_seen, respond_to_ctrl_c,
+                        &mut last_heights, &mut height_first_seen, respond_to_ctrl_c, rpc_port,
                     ).await?;
                 }
             }
@@ -306,6 +317,7 @@ async fn run_observer(
                 &mut last_heights,
                 &mut height_first_seen,
                 respond_to_ctrl_c,
+                rpc_port,
             )
             .await?;
         }
@@ -322,12 +334,13 @@ async fn observer_tick(
     last_heights: &mut HashMap<String, u64>,
     height_first_seen: &mut HashMap<u64, (u128, String)>,
     print_entries: bool,
+    rpc_port: u16,
 ) -> Result<()> {
     *tick = tick.saturating_add(1);
 
     let futs: Vec<_> = miners
         .iter()
-        .map(|miner| observe_node(client, miner, *tick))
+        .map(|miner| observe_node(client, miner, *tick, rpc_port))
         .collect();
 
     let results = join_all(futs).await;
@@ -367,10 +380,11 @@ async fn observe_node(
     client: &reqwest::Client,
     miner: &Instance,
     tick: u64,
+    rpc_port: u16,
 ) -> (String, ProgressLogEntry, u64) {
     let start = Instant::now();
     let ts_unix_ms = now_unix_ms();
-    let url = format!("http://{}:18232", miner.public_ip);
+    let url = format!("http://{}:{rpc_port}", miner.public_ip);
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": tick,
@@ -458,10 +472,11 @@ async fn generate_block(
     miner: &Instance,
     tick: u64,
     mode: &str,
+    rpc_port: u16,
 ) -> ProgressLogEntry {
     let start = Instant::now();
     let ts_unix_ms = now_unix_ms();
-    let url = format!("http://{}:18232", miner.public_ip);
+    let url = format!("http://{}:{rpc_port}", miner.public_ip);
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": tick,

@@ -27,13 +27,31 @@ pub async fn run(
     // Candidate slugs in preference order. For DO we try the basic slug
     // first, then fall back to premium AMD / Intel variants. Other
     // providers have only one candidate today.
-    let candidate_slugs: Vec<&'static str> = match (provider, node_type, low_resource) {
-        (Provider::DigitalOcean, NodeType::Miner, true) => DO_LOW_MINER_SLUG_FALLBACKS.to_vec(),
-        (Provider::DigitalOcean, NodeType::Miner, false) => DO_FULL_MINER_SLUG_FALLBACKS.to_vec(),
-        (Provider::GoogleCloud, NodeType::Miner, true) => vec![GCP_LOW_RESOURCE_MACHINE],
-        (Provider::GoogleCloud, NodeType::Miner, false) => vec![GCP_DEFAULT_MACHINE],
-        (Provider::Linode, NodeType::Miner, true) => vec![LINODE_LOW_RESOURCE_MINER_TYPE],
-        (Provider::Linode, NodeType::Miner, false) => vec![LINODE_DEFAULT_MINER_TYPE],
+    let candidate_slugs: Vec<&'static str> = match (
+        provider,
+        config.network_kind,
+        node_type,
+        low_resource,
+    ) {
+        (Provider::DigitalOcean, NetworkKind::Mainnet, NodeType::Miner, true) => {
+            anyhow::bail!(
+                "DigitalOcean mainnet nodes need at least 500 GB local disk; --low-resource is not supported for mainnet."
+            );
+        }
+        (Provider::DigitalOcean, NetworkKind::Mainnet, NodeType::Miner, false) => {
+            DO_MAINNET_FULL_MINER_SLUG_FALLBACKS.to_vec()
+        }
+        (Provider::DigitalOcean, NetworkKind::PublicTestnet, NodeType::Miner, false) => {
+            DO_PUBLIC_TESTNET_FULL_MINER_SLUG_FALLBACKS.to_vec()
+        }
+        (Provider::DigitalOcean, _, NodeType::Miner, true) => DO_LOW_MINER_SLUG_FALLBACKS.to_vec(),
+        (Provider::DigitalOcean, _, NodeType::Miner, false) => {
+            DO_FULL_MINER_SLUG_FALLBACKS.to_vec()
+        }
+        (Provider::GoogleCloud, _, NodeType::Miner, true) => vec![GCP_LOW_RESOURCE_MACHINE],
+        (Provider::GoogleCloud, _, NodeType::Miner, false) => vec![GCP_DEFAULT_MACHINE],
+        (Provider::Linode, _, NodeType::Miner, true) => vec![LINODE_LOW_RESOURCE_MINER_TYPE],
+        (Provider::Linode, _, NodeType::Miner, false) => vec![LINODE_DEFAULT_MINER_TYPE],
     };
     let tier = if low_resource { "low" } else { "full" };
 

@@ -1,12 +1,24 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::config::{Config, resolve_value, select_instances, shellexpand};
 use crate::ssh;
 
 const TRACE_MISSING_MARKER: &str = "KRESKO_TRACE_MISSING";
 const TRACE_TABLE_MISSING_MARKER: &str = "KRESKO_TRACE_TABLE_MISSING";
+
+/// Per-node hard timeout for the trace tarball download. Long enough for big
+/// archives on slow links, short enough that a wedged node fails the run
+/// instead of hanging it forever.
+const TRACE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// How often to print which nodes are still pending while a multi-node
+/// download is in flight.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TraceSelection {
@@ -159,26 +171,63 @@ pub async fn run_traces(
         }
     }
 
+    let total = targets.len();
+    let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    let reporter_in_flight = in_flight.clone();
+    let reporter = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
+        // The first tick fires immediately; skip it so we don't print before
+        // anything has had a chance to run.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let mut still: Vec<String> = {
+                let guard = reporter_in_flight.lock().unwrap();
+                guard.iter().cloned().collect()
+            };
+            if still.is_empty() {
+                continue;
+            }
+            still.sort();
+            println!(
+                "  ...still downloading on {}/{}: {}",
+                still.len(),
+                total,
+                still.join(", ")
+            );
+        }
+    });
+
     let mut results = stream::iter(targets.into_iter().map(|inst| {
         let ip = inst.public_ip;
         let name = inst.name;
         let key = key.clone();
         let node_dir = data_dir.join(&name);
         let trace_selection = trace_selection.clone();
+        let in_flight = in_flight.clone();
 
         async move {
-            std::fs::create_dir_all(&node_dir)?;
-            download_structured_traces(&ip, &key, &node_dir, &name, &trace_selection).await?;
-            Ok::<_, anyhow::Error>(())
+            in_flight.lock().unwrap().insert(name.clone());
+            let result: Result<()> = async {
+                std::fs::create_dir_all(&node_dir)?;
+                download_structured_traces(&ip, &key, &node_dir, &name, &trace_selection).await?;
+                Ok(())
+            }
+            .await;
+            in_flight.lock().unwrap().remove(&name);
+            result.with_context(|| format!("{name} ({ip})"))
         }
     }))
     .buffer_unordered(workers);
 
     while let Some(result) = results.next().await {
         if let Err(e) = result {
-            eprintln!("  Warning: {e}");
+            eprintln!("  Warning: {e:#}");
         }
     }
+
+    reporter.abort();
 
     println!(
         "Trace downloads complete. Data saved to {}",
@@ -266,7 +315,15 @@ async fn download_structured_traces(
     let trace_script = build_trace_download_script(selection);
 
     println!("  {name}: downloading structured traces...");
-    match ssh::ssh_exec_to_file(ip, key, &trace_script, trace_archive.to_str().unwrap()).await {
+    match ssh::ssh_exec_to_file(
+        ip,
+        key,
+        &trace_script,
+        trace_archive.to_str().unwrap(),
+        TRACE_DOWNLOAD_TIMEOUT,
+    )
+    .await
+    {
         Ok(bytes) => {
             unpack_trace_archive(&trace_archive, &node_dir.join("traces"))?;
             let _ = std::fs::remove_file(&trace_archive);
@@ -461,7 +518,7 @@ gzip_status="${{pipeline_status[1]}}"
 tar_ok=0
 if [ "$tar_status" -eq 0 ]; then
     tar_ok=1
-elif [ "$tar_status" -eq 1 ] && [ -s "$tar_stderr" ] && ! grep -Eqv '^tar: .*: file changed as we read it$' "$tar_stderr"; then
+elif [ "$tar_status" -eq 1 ] && [ -s "$tar_stderr" ] && ! grep -Eqv '^tar: (.*: file changed as we read it|Removing leading .* from (member names|hard link targets))$' "$tar_stderr"; then
     tar_ok=1
 fi
 

@@ -65,6 +65,12 @@ echo "=== Extracting payload ==="
 rm -rf /root/payload
 tar -xzf /root/$ARCHIVE_NAME -C /root/
 source /root/payload/vars.sh
+KRESKO_RPC_PORT="${KRESKO_RPC_PORT:-18232}"
+KRESKO_P2P_PORT="${KRESKO_P2P_PORT:-18233}"
+KRESKO_NETWORK_KIND="${KRESKO_NETWORK_KIND:-local-genesis}"
+KRESKO_MINING_MODE="${KRESKO_MINING_MODE:-generate}"
+KRESKO_FRESH_STATE="${KRESKO_FRESH_STATE:-1}"
+KRESKO_RPC_URL="http://127.0.0.1:${KRESKO_RPC_PORT}"
 
 # Zebra's config parser reads all ZEBRA_* env vars and rejects unknown ones.
 # Save all tracing env vars and unset them so config parsing succeeds.
@@ -90,8 +96,12 @@ install_binary_atomic payload/build/zebrad /usr/local/bin/zebrad
 install_binary_atomic payload/build/kresko /usr/local/bin/kresko
 
 echo "=== Setting up zebra config ==="
-echo "=== Resetting zebra state cache ==="
-rm -rf /root/.cache/zebra
+if [ "$KRESKO_FRESH_STATE" = "1" ]; then
+    echo "=== Resetting zebra state cache ==="
+    rm -rf /root/.cache/zebra
+else
+    echo "=== Preserving zebra state cache (KRESKO_FRESH_STATE=$KRESKO_FRESH_STATE) ==="
+fi
 mkdir -p /root/.cache/zebra
 mkdir -p /root/.config
 cp payload/$parsed_hostname/zebrad.toml /root/.config/zebrad.toml
@@ -101,6 +111,18 @@ fi
 # The deployed zebrad binary can lag behind payload config generation.
 # Remove this optional key to keep old and new zebrad versions compatible.
 sed -i -E '/^[[:space:]]*genesis_block_path[[:space:]]*=.*$/d' /root/.config/zebrad.toml
+if [[ -n "${KRESKO_TARGET_BLOCK_TIME_SECS:-}" ]]; then
+    actual_target_spacing="$(awk -F= '/^[[:space:]]*post_blossom_pow_target_spacing[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' /root/.config/zebrad.toml)"
+    if [[ -z "$actual_target_spacing" ]]; then
+        echo "ERROR: zebrad.toml is missing post_blossom_pow_target_spacing; expected ${KRESKO_TARGET_BLOCK_TIME_SECS}s"
+        exit 1
+    fi
+    if [[ "$actual_target_spacing" != "$KRESKO_TARGET_BLOCK_TIME_SECS" ]]; then
+        echo "ERROR: zebrad.toml target spacing is ${actual_target_spacing}s; expected ${KRESKO_TARGET_BLOCK_TIME_SECS}s"
+        exit 1
+    fi
+    echo "Verified zebrad target spacing: ${actual_target_spacing}s"
+fi
 
 BOOTSTRAP_CONFIG="/root/.config/zebrad.bootstrap.toml"
 prepare_bootstrap_config() {
@@ -121,6 +143,10 @@ prepare_bootstrap_config() {
             print "initial_testnet_peers = []"
             next
         }
+        in_network && $0 ~ /^[[:space:]]*initial_mainnet_peers[[:space:]]*=/ {
+            print "initial_mainnet_peers = []"
+            next
+        }
         { print }
     ' /root/.config/zebrad.toml > "$BOOTSTRAP_CONFIG"
     mkdir -p /root/.cache/zebra/network
@@ -129,6 +155,7 @@ prepare_bootstrap_config() {
 
 prepare_bootstrap_config
 
+if [ "$KRESKO_MINING_MODE" != "observe" ]; then
 current_miner_address=$(awk -F= '/^[[:space:]]*miner_address[[:space:]]*=/{gsub(/["[:space:]]/, "", $2); print tolower($2); exit}' /root/.config/zebrad.toml)
 if [ -z "$current_miner_address" ] || [ "$current_miner_address" = "auto" ] || [ "$current_miner_address" = "__auto__" ] || [ "$current_miner_address" = "__auto_miner_address__" ]; then
     bootstrap_miner_address="t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v"
@@ -146,7 +173,7 @@ if [ -z "$current_miner_address" ] || [ "$current_miner_address" = "auto" ] || [
         last_rpc_response=$(curl -sS --max-time 2 \
             -H "Content-Type: application/json" \
             --data '{"jsonrpc":"2.0","id":"kresko","method":"getnewaddress","params":[]}' \
-            http://127.0.0.1:18232 2>&1 || true)
+            "$KRESKO_RPC_URL" 2>&1 || true)
         generated_miner_address=$(printf '%s' "$last_rpc_response" | jq -r '.result // empty' 2>/dev/null || true)
 
         if [ -n "$generated_miner_address" ]; then
@@ -174,7 +201,7 @@ if [ -z "$current_miner_address" ] || [ "$current_miner_address" = "auto" ] || [
             echo "=== Last RPC response ==="
             echo "$last_rpc_response"
         else
-            echo "=== No RPC response captured from 127.0.0.1:18232 ==="
+            echo "=== No RPC response captured from $KRESKO_RPC_URL ==="
         fi
         if [ -f "$BOOTSTRAP_LOG" ]; then
             echo "=== Tail of bootstrap log ($BOOTSTRAP_LOG) ==="
@@ -196,6 +223,7 @@ if [ -z "$current_miner_address" ] || [ "$current_miner_address" = "auto" ] || [
     fi
     wait "$bootstrap_pid" 2>/dev/null || true
 fi
+fi
 
 GENESIS_BLOCK_FILE="/root/payload/local_genesis/genesis.hex"
 PREMINE_BLOCKS_FILE="/root/payload/local_genesis/premine_blocks.hex"
@@ -212,7 +240,7 @@ if [ -f "$GENESIS_BLOCK_FILE" ] || [ -f "$PREMINE_BLOCKS_FILE" ]; then
         rpc_response=$(curl -sS --max-time 2 \
             -H "Content-Type: application/json" \
             --data '{"jsonrpc":"2.0","id":"kresko","method":"getblockchaininfo","params":[]}' \
-            http://127.0.0.1:18232 2>&1 || true)
+            "$KRESKO_RPC_URL" 2>&1 || true)
         if rpc_has_result_and_no_error "$rpc_response"; then
             rpc_ready=1
             break
@@ -255,7 +283,7 @@ if [ -f "$GENESIS_BLOCK_FILE" ] || [ -f "$PREMINE_BLOCKS_FILE" ]; then
         genesis_submit_response=$(curl -sS --max-time 10 \
             -H "Content-Type: application/json" \
             --data "{\"jsonrpc\":\"2.0\",\"id\":\"kresko\",\"method\":\"submitblock\",\"params\":[\"$genesis_hex\"]}" \
-            http://127.0.0.1:18232 2>&1 || true)
+            "$KRESKO_RPC_URL" 2>&1 || true)
         if ! rpc_has_no_error "$genesis_submit_response"; then
             echo "=== submitblock RPC error while loading genesis block ===" >&2
             echo "$genesis_submit_response" >&2
@@ -303,7 +331,7 @@ if [ -f "$GENESIS_BLOCK_FILE" ] || [ -f "$PREMINE_BLOCKS_FILE" ]; then
                 submit_response=$(curl -sS --max-time 10 \
                     -H "Content-Type: application/json" \
                     --data "{\"jsonrpc\":\"2.0\",\"id\":\"kresko\",\"method\":\"submitblock\",\"params\":[\"$block_hex\"]}" \
-                    http://127.0.0.1:18232 2>&1 || true)
+                    "$KRESKO_RPC_URL" 2>&1 || true)
                 if ! rpc_has_no_error "$submit_response"; then
                     echo "=== submitblock RPC error while loading seed blocks ===" >&2
                     echo "$submit_response" >&2
@@ -356,7 +384,7 @@ if [ -f "$GENESIS_BLOCK_FILE" ] || [ -f "$PREMINE_BLOCKS_FILE" ]; then
         current_genesis_response=$(curl -sS --max-time 2 \
             -H "Content-Type: application/json" \
             --data '{"jsonrpc":"2.0","id":"kresko","method":"getblockhash","params":[0]}' \
-            http://127.0.0.1:18232 2>&1 || true)
+            "$KRESKO_RPC_URL" 2>&1 || true)
         if rpc_has_result_and_no_error "$current_genesis_response"; then
             current_genesis_hash=$(printf '%s' "$current_genesis_response" | jq -r '.result // empty' 2>/dev/null | tr '[:upper:]' '[:lower:]')
         else
@@ -366,7 +394,7 @@ if [ -f "$GENESIS_BLOCK_FILE" ] || [ -f "$PREMINE_BLOCKS_FILE" ]; then
         current_height_response=$(curl -sS --max-time 2 \
             -H "Content-Type: application/json" \
             --data '{"jsonrpc":"2.0","id":"kresko","method":"getblockchaininfo","params":[]}' \
-            http://127.0.0.1:18232 2>&1 || true)
+            "$KRESKO_RPC_URL" 2>&1 || true)
         if rpc_has_result_and_no_error "$current_height_response"; then
             current_height=$(printf '%s' "$current_height_response" | jq -r '.result.blocks // -1' 2>/dev/null || echo -1)
         else
@@ -424,10 +452,10 @@ for attempt in $(seq 1 120); do
     rpc_response=$(curl -sS --max-time 2 \
         -H "Content-Type: application/json" \
         --data '{"jsonrpc":"2.0","id":"kresko","method":"getblockchaininfo","params":[]}' \
-        http://127.0.0.1:18232 2>&1 || true)
+        "$KRESKO_RPC_URL" 2>&1 || true)
     if printf '%s' "$rpc_response" | jq -e '.error == null and .result != null' >/dev/null 2>&1; then
         echo "=== RPC ready, starting kresko mine ==="
-        exec kresko mine --rpc-endpoint http://localhost:18232
+        exec kresko mine --rpc-endpoint "http://localhost:${KRESKO_RPC_PORT}"
     fi
     sleep 2
 done

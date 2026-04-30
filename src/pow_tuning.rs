@@ -15,9 +15,20 @@
 //! and the chain stalls. Pass `sol_per_sec_override` only if you've measured
 //! the mining fleet's actual rate.
 
-use std::time::Instant;
+use std::{hint::black_box, time::Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use hex::FromHex;
+use zebra_chain::{
+    block::{self, Header},
+    fmt::HexDebug,
+    parameters::{Network, testnet},
+    serialization::ZcashSerialize,
+    work::{
+        difficulty::{CompactDifficulty, ExpandedDifficulty, U256},
+        equihash::Solution,
+    },
+};
 
 use crate::config::EquihashParameterSet;
 
@@ -279,13 +290,21 @@ pub const DEFAULT_SOL_PER_SEC_PER_CPU: f64 = 1.0;
 /// the DAA tighten from there once mining begins.
 pub const MAX_SAFE_TARGET_BITS: u32 = 251;
 
-/// Discount applied to a locally-measured Equihash sol/s when estimating the
-/// fleet's per-CPU rate. The dev machine running calibration is typically
-/// faster than the cloud VMs that actually mine; underestimating fleet sol/s
-/// produces a looser pow_limit and lets the DAA converge, while overestimating
-/// stalls the chain. Empirically, mid-tier cloud VMs run ~2× slower than a
-/// developer workstation on this RAM-bound workload.
-pub const LOCAL_TO_FLEET_DISCOUNT: f64 = 2.0;
+/// Discount applied to locally-measured Common Equihash candidates/sec when
+/// estimating fleet per-miner rate.
+pub const COMMON_LOCAL_TO_FLEET_DISCOUNT: f64 = 6.0;
+
+/// Discount applied to locally-measured Regtest Equihash candidates/sec when
+/// estimating fleet per-miner rate. Regtest has a much cheaper Equihash solve,
+/// so per-solution overhead and CPU-class differences dominate more heavily.
+pub const REGTEST_LOCAL_TO_FLEET_DISCOUNT: f64 = 16.0;
+
+pub fn default_local_to_fleet_discount(equihash_params: EquihashParameterSet) -> f64 {
+    match equihash_params {
+        EquihashParameterSet::Common => COMMON_LOCAL_TO_FLEET_DISCOUNT,
+        EquihashParameterSet::Regtest => REGTEST_LOCAL_TO_FLEET_DISCOUNT,
+    }
+}
 
 /// Default minimum duration for the genesis-time local Equihash benchmark.
 /// The run can exceed this because a single solver call is not interrupted.
@@ -309,19 +328,24 @@ pub struct PowBenchResult {
     pub nonce_trials: usize,
     /// Number of valid Equihash solutions returned by the solver.
     pub equihash_solutions: usize,
+    /// Number of solutions that were run through the same validation/hash path
+    /// used by the live miner before applying the difficulty filter.
+    pub mining_candidates: usize,
     pub elapsed_secs: f64,
     /// Nonce rounds per second. Useful for comparing raw solver throughput.
     pub nonce_trials_per_sec: f64,
-    /// Equihash solutions per second. This is the rate to feed into
-    /// `kresko pow-simulate --sol-per-sec` and the matrix runner.
+    /// Raw Equihash solutions per second.
     pub sol_per_sec: f64,
+    /// Live miner candidate checks per second. This is the rate to feed into
+    /// calibration because Regtest's small Equihash solutions make per-solution
+    /// validation and header hashing material.
+    pub mining_candidates_per_sec: f64,
 }
 
 /// Benchmark the same compiled Equihash solver used by live mining.
 ///
-/// This intentionally bypasses block construction and difficulty checks: the
-/// simulator wants the rate of valid Equihash solutions produced by one
-/// single-thread miner, then applies target difficulty statistically.
+/// This uses the same per-solution validation and header hash path as the live
+/// miner, then reports both raw solver output and live mining candidate rate.
 pub fn benchmark_equihash_solver(inputs: PowBenchInputs) -> Result<PowBenchResult> {
     if !inputs.min_seconds.is_finite() || inputs.min_seconds <= 0.0 {
         anyhow::bail!(
@@ -330,37 +354,60 @@ pub fn benchmark_equihash_solver(inputs: PowBenchInputs) -> Result<PowBenchResul
         );
     }
 
-    let input = b"kresko pow-bench v1";
+    let network = benchmark_network(inputs.equihash_params)?;
+    let mut header = benchmark_header(&network)?;
+    let mut input = Vec::new();
+    header.zcash_serialize(&mut input)?;
+    // Take the part of the header before the nonce and solution, matching
+    // zebra_chain::work::equihash::Solution::solve.
+    let input = input[..Solution::INPUT_LENGTH].to_vec();
+    let max_target = ExpandedDifficulty::from(U256::MAX);
+
     let started = Instant::now();
     let mut next_nonce = 0u64;
     let mut nonce_trials = 0usize;
     let mut equihash_solutions = 0usize;
+    let mut mining_candidates = 0usize;
 
-    while started.elapsed().as_secs_f64() < inputs.min_seconds || equihash_solutions == 0 {
+    while started.elapsed().as_secs_f64() < inputs.min_seconds || mining_candidates == 0 {
         let solutions = match inputs.equihash_params {
-            EquihashParameterSet::Common => equihash::tromp::solve_200_9(input, || {
+            EquihashParameterSet::Common => equihash::tromp::solve_200_9(&input, || {
                 nonce_trials = nonce_trials.saturating_add(1);
                 let nonce = nonce_from_counter(next_nonce);
                 next_nonce = next_nonce.wrapping_add(1);
+                header.nonce = HexDebug(nonce);
                 Some(nonce)
             }),
-            EquihashParameterSet::Regtest => equihash::tromp::solve_48_5(input, || {
+            EquihashParameterSet::Regtest => equihash::tromp::solve_48_5(&input, || {
                 nonce_trials = nonce_trials.saturating_add(1);
                 let nonce = nonce_from_counter(next_nonce);
                 next_nonce = next_nonce.wrapping_add(1);
+                header.nonce = HexDebug(nonce);
                 Some(nonce)
             }),
         };
         equihash_solutions = equihash_solutions.saturating_add(solutions.len());
+        for solution in solutions {
+            header.solution = Solution::from_bytes(&solution)
+                .map_err(|e| anyhow::anyhow!("solver returned invalid solution bytes: {e}"))?;
+            if header.solution.check(&header, &network).is_err() {
+                continue;
+            }
+
+            let hash = header.hash();
+            black_box(hash <= max_target);
+            mining_candidates = mining_candidates.saturating_add(1);
+        }
     }
 
     let elapsed_secs = started.elapsed().as_secs_f64();
-    if elapsed_secs <= 0.0 || nonce_trials == 0 || equihash_solutions == 0 {
+    if elapsed_secs <= 0.0 || nonce_trials == 0 || mining_candidates == 0 {
         anyhow::bail!(
-            "Equihash benchmark produced an unusable measurement (params={}, nonce_trials={}, solutions={}, elapsed={}s)",
+            "Equihash benchmark produced an unusable measurement (params={}, nonce_trials={}, solutions={}, candidates={}, elapsed={}s)",
             inputs.equihash_params,
             nonce_trials,
             equihash_solutions,
+            mining_candidates,
             elapsed_secs,
         );
     }
@@ -369,9 +416,32 @@ pub fn benchmark_equihash_solver(inputs: PowBenchInputs) -> Result<PowBenchResul
         equihash_params: inputs.equihash_params,
         nonce_trials,
         equihash_solutions,
+        mining_candidates,
         elapsed_secs,
         nonce_trials_per_sec: nonce_trials as f64 / elapsed_secs,
         sol_per_sec: equihash_solutions as f64 / elapsed_secs,
+        mining_candidates_per_sec: mining_candidates as f64 / elapsed_secs,
+    })
+}
+
+fn benchmark_network(equihash_params: EquihashParameterSet) -> Result<Network> {
+    testnet::Parameters::build()
+        .with_equihash_params(equihash_params.into())
+        .to_network()
+        .map_err(|err| anyhow::anyhow!("failed to build benchmark network: {err}"))
+}
+
+fn benchmark_header(network: &Network) -> Result<Header> {
+    Ok(Header {
+        version: 4,
+        previous_block_hash: block::Hash([0; 32]),
+        merkle_root: block::merkle::Root([0; 32]),
+        commitment_bytes: HexDebug([0; 32]),
+        time: chrono::DateTime::from_timestamp(0, 0).context("invalid benchmark timestamp")?,
+        difficulty_threshold: CompactDifficulty::from_hex("207fffff")
+            .map_err(|e| anyhow::anyhow!("invalid benchmark difficulty: {e}"))?,
+        nonce: HexDebug([0; 32]),
+        solution: Solution::for_proposal(network),
     })
 }
 
@@ -389,8 +459,10 @@ pub struct MeasuredSolRate {
     /// Equihash solves per second observed on this machine, single-threaded.
     pub local_sol_per_sec: f64,
     /// Conservative estimate of fleet per-CPU sol/s
-    /// (`local / LOCAL_TO_FLEET_DISCOUNT`).
+    /// (`local / fleet_discount`).
     pub assumed_fleet_sol_per_sec: f64,
+    /// Discount applied to the local measurement.
+    pub fleet_discount: f64,
     /// Total valid Equihash solutions counted across the benchmark.
     pub total_solves: usize,
     /// Wallclock seconds the benchmark consumed end-to-end.
@@ -404,19 +476,28 @@ pub struct MeasuredSolRate {
 pub fn measure_local_sol_per_sec(
     equihash_params: EquihashParameterSet,
     min_seconds: f64,
+    fleet_discount_override: Option<f64>,
 ) -> Result<MeasuredSolRate> {
+    if let Some(discount) = fleet_discount_override {
+        if !discount.is_finite() || discount <= 0.0 {
+            anyhow::bail!("fleet discount must be a positive finite number, got {discount}");
+        }
+    }
     let result = benchmark_equihash_solver(PowBenchInputs {
         equihash_params,
         min_seconds,
     })?;
     let elapsed_secs = result.elapsed_secs;
-    let total_solves = result.equihash_solutions;
+    let total_solves = result.mining_candidates;
 
-    let local_sol_per_sec = total_solves as f64 / elapsed_secs;
+    let local_sol_per_sec = result.mining_candidates_per_sec;
+    let fleet_discount =
+        fleet_discount_override.unwrap_or_else(|| default_local_to_fleet_discount(equihash_params));
     Ok(MeasuredSolRate {
         equihash_params,
         local_sol_per_sec,
-        assumed_fleet_sol_per_sec: local_sol_per_sec / LOCAL_TO_FLEET_DISCOUNT,
+        assumed_fleet_sol_per_sec: local_sol_per_sec / fleet_discount,
+        fleet_discount,
         total_solves,
         elapsed_secs,
     })
@@ -583,11 +664,15 @@ mod tests {
 
     #[test]
     fn local_measurement_uses_requested_equihash_params() {
-        let measured = measure_local_sol_per_sec(EquihashParameterSet::Regtest, 0.001)
+        let measured = measure_local_sol_per_sec(EquihashParameterSet::Regtest, 0.001, None)
             .expect("regtest solver benchmark should produce a measurement");
 
         assert_eq!(measured.equihash_params, EquihashParameterSet::Regtest);
         assert!(measured.total_solves > 0);
         assert!(measured.local_sol_per_sec > 0.0);
+        assert_eq!(
+            measured.fleet_discount,
+            default_local_to_fleet_discount(EquihashParameterSet::Regtest)
+        );
     }
 }

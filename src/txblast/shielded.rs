@@ -848,6 +848,7 @@ async fn run_bootstrap(
             "proving_bootstrap_shield",
         );
         let submitted = build_and_send_shielding_tx(
+            orchard_cfg.network_params,
             client,
             key,
             keys,
@@ -1414,12 +1415,14 @@ pub async fn run(
                 let mut tracked_notes: Vec<TrackedNote> = Vec::with_capacity(batch_len);
                 let mut build_handles: Vec<tokio::task::JoinHandle<anyhow::Result<BuiltTx>>> =
                     Vec::with_capacity(batch_len);
+                let network_params = orchard_cfg.network_params;
 
                 for (tracked, merkle_path) in lane_batch {
                     let keys_clone = keys.clone();
                     let tracked_clone = tracked.clone();
                     build_handles.push(tokio::task::spawn_blocking(move || {
                         build_lane_advance_tx(
+                            network_params,
                             &keys_clone,
                             &tracked_clone,
                             merkle_path,

@@ -22,6 +22,8 @@ pub async fn run(
 ) -> Result<()> {
     let dir = std::path::Path::new(directory);
     let config = Config::load(dir)?;
+    config.require_local_genesis("txblast")?;
+    let rpc_port = config.rpc_port();
     let orchard_runtime = OrchardBlastRuntimeConfig::from_parts(
         config.orchard_txblast.clone(),
         orchard_max_in_flight,
@@ -90,7 +92,7 @@ pub async fn run(
     let script = format!(
         r#"#!/bin/bash
 kresko txblast-local \
-    --rpc-endpoint http://localhost:18232 \
+    --rpc-endpoint http://localhost:{rpc_port} \
     --rate {rate} \
     --amount {amount} \
     --orchard-lanes-per-miner {} \

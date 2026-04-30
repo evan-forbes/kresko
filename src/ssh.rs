@@ -14,6 +14,11 @@ const SSH_OPTS: &[&str] = &[
     "LogLevel=ERROR",
     "-o",
     "ConnectTimeout=10",
+    // Drop dead connections after ~3 minutes of silence so transfers can't hang forever.
+    "-o",
+    "ServerAliveInterval=30",
+    "-o",
+    "ServerAliveCountMax=6",
 ];
 
 /// Execute a command on a remote host via SSH.
@@ -84,11 +89,13 @@ pub async fn sftp_download(
 }
 
 /// Execute a command on a remote host via SSH and stream stdout into a local file.
+/// On timeout the SSH child is killed and the partial local file is removed.
 pub async fn ssh_exec_to_file(
     host: &str,
     key: &str,
     command: &str,
     local_path: &str,
+    timeout: Duration,
 ) -> Result<u64> {
     let mut child = Command::new("ssh")
         .args(SSH_OPTS)
@@ -122,10 +129,19 @@ pub async fn ssh_exec_to_file(
         Ok::<Vec<u8>, std::io::Error>(buf)
     });
 
-    let status = child
-        .wait()
-        .await
-        .with_context(|| format!("SSH to {host} failed"))?;
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(res) => res.with_context(|| format!("SSH to {host} failed"))?,
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            let _ = tokio::fs::remove_file(local_path).await;
+            anyhow::bail!(
+                "SSH command on {host} timed out after {}s",
+                timeout.as_secs()
+            );
+        }
+    };
     let copied = stdout_task
         .await
         .with_context(|| format!("SSH stdout task for {host} failed"))??;

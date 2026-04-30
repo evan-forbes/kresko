@@ -8,9 +8,10 @@ pub(crate) mod types;
 
 pub(crate) use builder::{
     BuiltTx, ORCHARD_SPEND_FEE, OrchardKeys, build_and_send_orchard_to_transparent_tx,
-    build_and_send_shielding_tx, build_lane_advance_tx, decode_txblast_note_role,
-    derive_orchard_keys, min_bootstrap_shield_value, min_lane_value, min_treasury_reseed_value,
-    orchard_to_transparent_fee, plan_shielding_outputs, shielding_fee,
+    build_and_send_shielding_tx, build_and_send_transparent_fanout_tx, build_lane_advance_tx,
+    decode_txblast_note_role, derive_orchard_keys, min_bootstrap_shield_value, min_lane_value,
+    min_treasury_reseed_value, orchard_to_transparent_fee, plan_shielding_outputs, shielding_fee,
+    transparent_fanout_fee,
 };
 pub(crate) use planner::{pending_counts, pending_trace_summary, plan_next_work};
 pub(crate) use scanner::{

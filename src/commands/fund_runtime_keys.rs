@@ -24,7 +24,7 @@ use crate::txblast::orchard::{
 };
 use crate::txblast::rpc::{AddressUtxo, ZebraRpcClient};
 use crate::txblast::transparent::{FundedKey, load_funded_key};
-use crate::txblast::{OrchardBlastRuntimeConfig, TxblastTraceConfig};
+use crate::txblast::{OrchardBlastRuntimeConfig, TxblastNetworkParams, TxblastTraceConfig};
 
 const COINBASE_MATURITY: u32 = 100;
 const DEFAULT_CONFIRM_TIMEOUT_SECS: u64 = 600;
@@ -105,6 +105,7 @@ struct RecipientState {
 pub async fn run(directory: &str) -> Result<()> {
     let dir = Path::new(directory);
     let config = Config::load(dir)?;
+    config.require_local_genesis("fund-runtime-keys")?;
     let local_genesis = config
         .local_genesis
         .as_ref()
@@ -145,7 +146,7 @@ pub async fn run(directory: &str) -> Result<()> {
 
     let remote_command = format!(
         "bash -lc 'source /root/payload/vars.sh && kresko fund-runtime-keys-local \
-            --rpc-endpoint http://localhost:18232 \
+            --rpc-endpoint http://localhost:${{KRESKO_RPC_PORT:-18232}} \
             --local-genesis-dir /root/payload/local_genesis \
             --minimum-recipient-zats {minimum_recipient_zats} \
             --confirm-timeout-secs {DEFAULT_CONFIRM_TIMEOUT_SECS}'"
@@ -216,6 +217,7 @@ pub async fn run_local(
 pub async fn expected_funding_txid(directory: &str) -> Result<Option<String>> {
     let dir = Path::new(directory);
     let config = Config::load(dir)?;
+    config.require_local_genesis("fund-runtime-keys")?;
     let key = resolve_value(None, "KRESKO_SSH_KEY_PATH", &config.ssh_key_path);
     let key = shellexpand(&key);
     let operator = config
@@ -377,6 +379,7 @@ async fn fund_runtime_keys_local(
     let shield_anchor = fetch_orchard_anchor(&client).await?;
     let shield_target_height = current_height.saturating_add(10);
     let shield_submitted = build_and_send_shielding_tx(
+        TxblastNetworkParams::LocalGenesis,
         &client,
         &treasury_key,
         &treasury_orchard_keys,
@@ -488,6 +491,7 @@ async fn fund_runtime_keys_local(
 
     let funding_target_height = client.get_block_count().await?.saturating_add(10);
     let funding_txid = build_and_send_orchard_to_transparent_tx(
+        TxblastNetworkParams::LocalGenesis,
         &client,
         &treasury_orchard_keys,
         &funding_note,
@@ -871,7 +875,7 @@ async fn query_runtime_funding_node(
 ) -> Result<RuntimeFundingNodeStatus> {
     let local_command = format!(
         "source /root/payload/vars.sh && kresko fund-runtime-keys-local \
-         --rpc-endpoint http://localhost:18232 \
+         --rpc-endpoint http://localhost:${{KRESKO_RPC_PORT:-18232}} \
          --local-genesis-dir /root/payload/local_genesis \
          --minimum-recipient-zats {minimum_recipient_zats} \
          --verify-only \

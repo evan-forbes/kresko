@@ -49,6 +49,7 @@ pub async fn run(
 
     let dir = std::path::Path::new(directory);
     let config = Config::load(dir)?;
+    let rpc_port = config.rpc_port();
     let candidates = select_instances(&config.miners, nodes);
 
     if candidates.is_empty() {
@@ -99,7 +100,7 @@ pub async fn run(
             async move {
                 let name = inst.name.clone();
                 let ip = inst.public_ip.clone();
-                let result = fetch_node_tip_with_retry(&client, &name, &ip).await;
+                let result = fetch_node_tip_with_retry(&client, &name, &ip, rpc_port).await;
                 (name, ip, result)
             }
         })
@@ -138,6 +139,7 @@ pub async fn run(
         workers,
         batch_size,
         &mut failed_nodes,
+        rpc_port,
     )
     .await
     .context("failed to download heights from selected nodes")?;
@@ -200,11 +202,16 @@ fn write_entries(out_path: &std::path::Path, entries: &[HeightTraceEntry]) -> Re
     Ok(())
 }
 
-async fn fetch_node_tip_with_retry(client: &reqwest::Client, node: &str, ip: &str) -> Result<u64> {
+async fn fetch_node_tip_with_retry(
+    client: &reqwest::Client,
+    node: &str,
+    ip: &str,
+    rpc_port: u16,
+) -> Result<u64> {
     let mut last_error = None;
 
     for attempt in 1..=HEIGHT_FETCH_RETRIES_PER_NODE {
-        match fetch_node_tip(client, node, ip).await {
+        match fetch_node_tip(client, node, ip, rpc_port).await {
             Ok(tip) => {
                 if attempt > 1 {
                     println!("  {node}: recovered on attempt {attempt}");
@@ -232,8 +239,13 @@ async fn fetch_node_tip_with_retry(client: &reqwest::Client, node: &str, ip: &st
     }
 }
 
-async fn fetch_node_tip(client: &reqwest::Client, node: &str, ip: &str) -> Result<u64> {
-    let url = format!("http://{ip}:18232");
+async fn fetch_node_tip(
+    client: &reqwest::Client,
+    node: &str,
+    ip: &str,
+    rpc_port: u16,
+) -> Result<u64> {
+    let url = format!("http://{ip}:{rpc_port}");
     let tip = rpc_call(client, &url, "getblockcount", json!([]))
         .await
         .with_context(|| format!("{node}: getblockcount failed"))?;
@@ -248,6 +260,7 @@ async fn fetch_heights_with_failover(
     workers: usize,
     batch_size: usize,
     failed_nodes: &mut FailedNodeMap,
+    rpc_port: u16,
 ) -> Result<Vec<HeightTraceEntry>> {
     let tip_from_sources = sources
         .iter()
@@ -310,6 +323,7 @@ async fn fetch_heights_with_failover(
             &eligible_heights,
             workers,
             batch_size,
+            rpc_port,
         )
         .await;
 
@@ -378,6 +392,7 @@ async fn fetch_height_subset_until_failure(
     heights: &[u64],
     workers: usize,
     batch_size: usize,
+    rpc_port: u16,
 ) -> (Vec<HeightTraceEntry>, Vec<u64>, Option<anyhow::Error>) {
     let mut successes = Vec::with_capacity(heights.len());
     let mut start = 0usize;
@@ -386,7 +401,7 @@ async fn fetch_height_subset_until_failure(
         let end = (start + batch_size.max(1)).min(heights.len());
         let batch = &heights[start..end];
         let (mut fetched, mut failed, mut errors) =
-            fetch_height_batch(client, source, batch, workers).await;
+            fetch_height_batch(client, source, batch, workers, rpc_port).await;
 
         successes.append(&mut fetched);
 
@@ -414,8 +429,9 @@ async fn fetch_height_batch(
     source: &HeightSource,
     heights: &[u64],
     workers: usize,
+    rpc_port: u16,
 ) -> (Vec<HeightTraceEntry>, Vec<u64>, Vec<anyhow::Error>) {
-    let url = format!("http://{}:18232", source.ip);
+    let url = format!("http://{}:{rpc_port}", source.ip);
     let max_in_flight = workers.max(1).min(heights.len().max(1));
     let mut pending = heights.iter().copied();
     let mut in_flight = FuturesUnordered::new();

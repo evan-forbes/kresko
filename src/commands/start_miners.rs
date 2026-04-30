@@ -7,6 +7,7 @@ use crate::tmux;
 pub async fn run(instances: &str, directory: &str) -> Result<()> {
     let dir = std::path::Path::new(directory);
     let config = Config::load(dir)?;
+    config.require_local_genesis("start-miners")?;
 
     let key = resolve_value(None, "KRESKO_SSH_KEY_PATH", &config.ssh_key_path);
     let key = shellexpand(&key);
@@ -20,15 +21,18 @@ pub async fn run(instances: &str, directory: &str) -> Result<()> {
 
     println!("Starting PoW miners on {} nodes...", targets.len());
 
-    let script = r#"#!/bin/bash
-kresko mine --rpc-endpoint http://localhost:18232
-"#;
+    let rpc_port = config.rpc_port();
+    let script = format!(
+        r#"#!/bin/bash
+kresko mine --rpc-endpoint http://localhost:{rpc_port}
+"#
+    );
 
     let owned_targets: Vec<_> = targets.into_iter().cloned().collect();
     let results = tmux::run_script_in_tmux(
         &owned_targets,
         &key,
-        script,
+        &script,
         "mine",
         Duration::from_secs(30),
     )

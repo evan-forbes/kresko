@@ -6,17 +6,19 @@ use zebra_chain::{
     local_genesis::{LocalTestnetGenesisOptions, generate_local_testnet_with_funded_keys},
     parameters::NetworkUpgrade,
     serialization::ZcashSerialize,
+    work::difficulty::U256,
 };
 
 use crate::config::{
-    Config, LocalGenesisActivationHeights, LocalGenesisConfig, LocalGenesisFundedKey, MiningMode,
-    OrchardTxblastConfig,
+    Config, DaaConfig, LocalGenesisActivationHeights, LocalGenesisConfig, LocalGenesisFundedKey,
+    MiningMode, OrchardTxblastConfig,
 };
 use crate::pow_tuning::{self, PowCalibration, PowTuningInputs};
 use crate::premine::{self, CalibrationSignature};
 use crate::zebra_config::{self, LocalTestnetParameters};
 
 const DEFAULT_ZEBRA_TRACE_DIR: &str = "/root/.cache/zebra/traces";
+const DEFAULT_TARGET_SPACING_SECS: u32 = 25;
 
 /// PoW calibration inputs sourced from CLI flags and forwarded into the
 /// genesis pipeline.
@@ -25,6 +27,9 @@ pub struct PowCalibrationCli {
     /// Fractional adjustment to the natural target. `+0.10` = ~10% looser
     /// (faster initial blocks), `-0.10` = ~10% tighter. Usually 0.
     pub adjust_fraction: f64,
+    /// Optional divisor applied to the local benchmark before calibration.
+    /// Higher values produce a looser initial pow_limit.
+    pub fleet_discount: Option<f64>,
 }
 
 pub fn run(
@@ -42,6 +47,7 @@ pub fn run(
 ) -> Result<()> {
     let dir = Path::new(directory);
     let mut config = Config::load(dir)?;
+    config.require_local_genesis("genesis")?;
 
     validate_orchard_txblast_config(
         orchard_lanes_per_miner,
@@ -65,10 +71,47 @@ pub fn run(
         anyhow::bail!("No miners configured. Run 'kresko add -t miner -c <N>' first.");
     }
 
-    let prepared = match config.mining_mode {
-        MiningMode::Pow => prepare_premine_local_genesis(&config, &miner_names, &pow_calibration)?,
-        _ => prepare_generated_local_genesis(&config, &miner_names, maturity_padding_blocks)?,
+    let template_path = dir.join("zebrad.toml");
+    let template = if template_path.exists() {
+        std::fs::read_to_string(&template_path)
+            .with_context(|| format!("failed to read template {}", template_path.display()))?
+    } else {
+        zebra_config::DEFAULT_ZEBRAD_TOML.to_string()
     };
+    zebra_config::ensure_miner_address_is_set(&template).with_context(|| {
+        format!(
+            "invalid zebra config template at {}",
+            template_path.display()
+        )
+    })?;
+    let toml_network = zebra_config::testnet_toml_parameters(&template)
+        .with_context(|| format!("invalid testnet parameters in {}", template_path.display()))?;
+    let target_spacing_secs = toml_network
+        .post_blossom_pow_target_spacing
+        .or(config.block_time_secs)
+        .unwrap_or(DEFAULT_TARGET_SPACING_SECS);
+    let daa = toml_network
+        .daa
+        .with_missing_from(config.daa)
+        .with_missing_from(DaaConfig::tuned_25s_defaults());
+
+    let prepared = match config.mining_mode {
+        MiningMode::Pow => prepare_premine_local_genesis(
+            &config,
+            &miner_names,
+            &pow_calibration,
+            target_spacing_secs,
+            daa,
+        )?,
+        _ => prepare_generated_local_genesis(
+            &config,
+            &miner_names,
+            maturity_padding_blocks,
+            target_spacing_secs,
+            daa,
+        )?,
+    };
+    validate_target_spacing_consistency(&prepared)?;
 
     config.local_genesis = Some(prepared.local_genesis.clone());
     config.save(dir)?;
@@ -92,20 +135,6 @@ pub fn run(
         .map(|key| (key.name.clone(), key))
         .collect();
 
-    let template_path = dir.join("zebrad.toml");
-    let template = if template_path.exists() {
-        std::fs::read_to_string(&template_path)
-            .with_context(|| format!("failed to read template {}", template_path.display()))?
-    } else {
-        zebra_config::DEFAULT_ZEBRAD_TOML.to_string()
-    };
-    zebra_config::ensure_miner_address_is_set(&template).with_context(|| {
-        format!(
-            "invalid zebra config template at {}",
-            template_path.display()
-        )
-    })?;
-
     println!("Generating per-node zebrad.toml configs...");
     for inst in &config.miners {
         let node_name = inst.parsed_hostname();
@@ -116,7 +145,12 @@ pub fn run(
         let node_dir = payload_dir.join(&node_name);
         std::fs::create_dir_all(&node_dir)?;
 
-        let mut node_config = zebra_config::generate_node_config(&template, inst, &config.miners)?;
+        let mut node_config = zebra_config::generate_node_config(
+            &template,
+            config.network_kind,
+            inst,
+            &config.miners,
+        )?;
         node_config = zebra_config::set_miner_address(&node_config, &funded_key.address);
         node_config =
             zebra_config::apply_local_testnet_parameters(&node_config, &prepared.local_testnet);
@@ -154,6 +188,9 @@ pub fn run(
         for entry in std::fs::read_dir(&scripts_src)? {
             let entry = entry?;
             if entry.file_type()?.is_file() {
+                if entry.file_name() == "vars.sh" {
+                    continue;
+                }
                 std::fs::copy(entry.path(), payload_dir.join(entry.file_name()))?;
             }
         }
@@ -210,6 +247,12 @@ export KRESKO_LOCAL_GENESIS_DIR="/root/payload/local_genesis"
         std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "kresko-data".into()),
         std::env::var("AWS_S3_ENDPOINT").unwrap_or_default(),
     );
+    if let Some(target_spacing_secs) = prepared.local_testnet.post_blossom_pow_target_spacing {
+        vars_content.push_str(&format!(
+            "export KRESKO_TARGET_BLOCK_TIME_SECS=\"{}\"\n",
+            target_spacing_secs
+        ));
+    }
     if prepared.local_genesis.bootstrap_treasury_key.is_some() {
         vars_content.push_str(
             "export KRESKO_BOOTSTRAP_TREASURY_KEY_PATH=\"/root/payload/local_genesis/treasury_key.json\"\n",
@@ -243,21 +286,44 @@ struct PreparedLocalGenesis {
     payload_local_genesis_files: Vec<(String, Vec<u8>)>,
 }
 
+fn validate_target_spacing_consistency(prepared: &PreparedLocalGenesis) -> Result<()> {
+    let rendered_spacing = prepared
+        .local_testnet
+        .post_blossom_pow_target_spacing
+        .context("generated local testnet is missing post_blossom_pow_target_spacing")?;
+    let metadata_spacing = prepared
+        .local_genesis
+        .target_spacing_secs
+        .context("generated local_genesis metadata is missing target_spacing_secs")?;
+
+    if metadata_spacing != rendered_spacing {
+        anyhow::bail!(
+            "target spacing mismatch before payload render: local_genesis={}s, zebrad.toml={}s",
+            metadata_spacing,
+            rendered_spacing,
+        );
+    }
+
+    Ok(())
+}
+
 fn prepare_generated_local_genesis(
     config: &Config,
     miner_names: &[String],
     maturity_padding_blocks: u32,
+    target_spacing_secs: u32,
+    daa: DaaConfig,
 ) -> Result<PreparedLocalGenesis> {
-    // Non-PoW path: zebra-chain's default disables PoW entirely, which skips
-    // Equihash solves and lets us seed any number of blocks cheaply. The
-    // regtest-easy 0x0f target the default options carry is fine here — PoW
-    // is off, so the target isn't enforced on incoming blocks.
+    // Non-PoW path: zebra-chain disables Equihash solving so we can seed blocks
+    // cheaply, but contextual difficulty still needs a target limit that is safe
+    // for the configured DAA averaging window.
     let options = LocalTestnetGenesisOptions {
         network_name: local_network_name(&config.chain_id),
         latest_network_upgrade: NetworkUpgrade::Nu6,
-        target_spacing_secs: config.block_time_secs.unwrap_or(1),
+        target_spacing_secs,
         seeded_tip_time: None,
         maturity_padding_blocks,
+        target_difficulty_limit: safe_target_difficulty_limit_for_daa(daa),
         ..LocalTestnetGenesisOptions::default()
     };
 
@@ -297,6 +363,7 @@ fn prepare_generated_local_genesis(
         network_name: network_params.network_name().to_string(),
         network_magic: network_params.network_magic().0,
         target_difficulty_limit: network_params.target_difficulty_limit().to_string(),
+        target_spacing_secs: Some(network_params.post_blossom_pow_target_spacing()),
         disable_pow: network_params.disable_pow(),
         genesis_hash: network_params.genesis_hash().to_string(),
         seeded_tip_hash,
@@ -341,6 +408,7 @@ fn prepare_generated_local_genesis(
             activation_height: local_genesis.activation_heights.overwinter,
             post_blossom_pow_target_spacing: Some(network_params.post_blossom_pow_target_spacing()),
             equihash_params: config.equihash_params.into(),
+            daa,
             pow_start_height: None,
         },
         runtime_funded_keys: runtime_funded_keys.clone(),
@@ -363,17 +431,20 @@ fn prepare_generated_local_genesis(
     })
 }
 
+fn safe_target_difficulty_limit_for_daa(daa: DaaConfig) -> [u8; 32] {
+    let averaging_window = daa.pow_averaging_window.unwrap_or(17).max(1);
+    let divisor = U256::from(averaging_window.saturating_add(1));
+
+    (U256::MAX / divisor).to_big_endian()
+}
+
 fn prepare_premine_local_genesis(
     config: &Config,
     miner_names: &[String],
     pow_calibration: &PowCalibrationCli,
+    block_time_secs: u32,
+    daa: DaaConfig,
 ) -> Result<PreparedLocalGenesis> {
-    // PoW mode requires an explicit target block spacing.
-    let block_time_secs = config.block_time_secs.context(
-        "block_time_secs must be set in config when mining_mode = pow; \
-         edit config.json or pass --block-time-secs to 'kresko add'",
-    )?;
-
     // Calibrate the target from measured local Equihash sol/s, then generate
     // a fresh premine. Premine generation itself is cheap (disable_pow = true,
     // no Equihash solves); the calibration benchmark is the only slow step
@@ -427,6 +498,7 @@ fn prepare_premine_local_genesis(
         network_name: network_name.clone(),
         network_magic,
         target_difficulty_limit: manifest.target_difficulty_limit.clone(),
+        target_spacing_secs: Some(manifest.target_spacing_secs),
         disable_pow: manifest.disable_pow,
         genesis_hash: manifest.genesis_hash.clone(),
         seeded_tip_hash: Some(manifest.seeded_tip_hash.clone()),
@@ -460,6 +532,7 @@ fn prepare_premine_local_genesis(
             activation_height: manifest.activation_height,
             post_blossom_pow_target_spacing: Some(manifest.target_spacing_secs),
             equihash_params: config.equihash_params.into(),
+            daa,
             pow_start_height: manifest.pow_start_height,
         },
         runtime_funded_keys,
@@ -528,7 +601,7 @@ fn activation_height(
         .with_context(|| format!("missing activation height for {upgrade:?}"))
 }
 
-fn append_zebra_trace_exports(vars_content: &mut String) {
+pub(crate) fn append_zebra_trace_exports(vars_content: &mut String) {
     for (name, value) in collect_zebra_trace_env_vars(std::env::vars()) {
         vars_content.push_str(&format!("export {name}={}\n", shell_single_quote(&value)));
     }
@@ -566,7 +639,7 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -629,16 +702,17 @@ fn run_pow_calibration(
     let measured = pow_tuning::measure_local_sol_per_sec(
         config.equihash_params,
         pow_tuning::DEFAULT_BENCH_MIN_SECONDS,
+        cli.fleet_discount,
     )
     .context("local sol/s benchmark failed")?;
     println!(
-        "  params={} local={:.3} sol/s ({} solutions in {:.1}s) → assumed fleet={:.3} sol/s (÷{:.1})",
+        "  params={} local={:.3} candidates/s ({} candidates in {:.1}s) → assumed fleet={:.3} candidates/s (÷{:.1})",
         measured.equihash_params,
         measured.local_sol_per_sec,
         measured.total_solves,
         measured.elapsed_secs,
         measured.assumed_fleet_sol_per_sec,
-        pow_tuning::LOCAL_TO_FLEET_DISCOUNT,
+        measured.fleet_discount,
     );
 
     let inputs = PowTuningInputs {

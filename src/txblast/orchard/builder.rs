@@ -6,7 +6,7 @@ use orchard::note_encryption::OrchardDomain;
 use zcash_note_encryption::try_output_recovery_with_ovk;
 use zcash_primitives::transaction::builder::{BuildConfig, Builder};
 use zcash_primitives::transaction::fees::zip317;
-use zcash_protocol::consensus::{self, BlockHeight, NetworkType, NetworkUpgrade};
+use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::Zatoshis;
 use zcash_transparent::address::TransparentAddress;
@@ -14,9 +14,10 @@ use zcash_transparent::builder::TransparentSigningSet;
 use zcash_transparent::bundle::{OutPoint, TxOut};
 use zebra_chain::serialization::{BytesInDisplayOrder, ZcashSerialize};
 
-use crate::txblast::OrchardBlastRuntimeConfig;
+use crate::txblast::rpc::AddressUtxo;
 use crate::txblast::rpc::ZebraRpcClient;
 use crate::txblast::transparent::FundedKey;
+use crate::txblast::{OrchardBlastRuntimeConfig, TxblastNetworkParams};
 
 use super::{
     NoteRole, PendingRpcStatus, PendingTx, PendingTxKind, PlannedOutput, RecoveredNote, TrackedNote,
@@ -50,6 +51,10 @@ pub(crate) fn orchard_to_transparent_fee(output_count: usize) -> u64 {
     zip317_fee(0, output_count, orchard_bundle_actions(1, 0))
 }
 
+pub(crate) fn transparent_fanout_fee(input_count: usize, output_count: usize) -> u64 {
+    zip317_fee(input_count, output_count, 0)
+}
+
 pub(crate) struct SubmittedTx {
     pub(crate) txid: String,
     pub(crate) pending: PendingTx,
@@ -62,22 +67,6 @@ pub(crate) struct BuiltTx {
     pub(crate) tx_hex: String,
     pub(crate) recovered_notes: Vec<RecoveredNote>,
     pub(crate) build_duration_ms: u64,
-}
-
-#[derive(Clone, Debug)]
-struct KreskoTestnet;
-
-impl consensus::Parameters for KreskoTestnet {
-    fn network_type(&self) -> NetworkType {
-        NetworkType::Test
-    }
-
-    fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
-        match nu {
-            NetworkUpgrade::Nu6_1 => None,
-            _ => Some(BlockHeight::from_u32(1)),
-        }
-    }
 }
 
 struct NoSaplingSpendProver;
@@ -346,6 +335,7 @@ pub(crate) fn plan_treasury_reseed_outputs(
 }
 
 pub(crate) async fn build_and_send_shielding_tx(
+    network_params: TxblastNetworkParams,
     client: &ZebraRpcClient,
     funded_key: &FundedKey,
     keys: &OrchardKeys,
@@ -375,7 +365,7 @@ pub(crate) async fn build_and_send_shielding_tx(
         orchard_anchor: Some(anchor),
     };
     let height = BlockHeight::from_u32(target_height);
-    let mut builder = Builder::new(KreskoTestnet, height, build_config);
+    let mut builder = Builder::new(network_params, height, build_config);
 
     let outpoint = transparent_outpoint(utxo_txid, utxo_output_index)?;
     let coin = transparent_txout(input_value, utxo_script)?;
@@ -452,6 +442,7 @@ pub(crate) async fn build_and_send_shielding_tx(
 }
 
 pub(crate) async fn build_and_send_orchard_to_transparent_tx(
+    network_params: TxblastNetworkParams,
     client: &ZebraRpcClient,
     keys: &OrchardKeys,
     tracked: &TrackedNote,
@@ -477,7 +468,7 @@ pub(crate) async fn build_and_send_orchard_to_transparent_tx(
         orchard_anchor: Some(anchor),
     };
     let height = BlockHeight::from_u32(target_height);
-    let mut builder = Builder::new(KreskoTestnet, height, build_config);
+    let mut builder = Builder::new(network_params, height, build_config);
 
     builder
         .add_orchard_spend::<zip317::FeeError>(keys.fvk.clone(), tracked.note, merkle_path)
@@ -511,9 +502,82 @@ pub(crate) async fn build_and_send_orchard_to_transparent_tx(
     client.send_raw_transaction(&hex::encode(&tx_bytes)).await
 }
 
+pub(crate) async fn build_and_send_transparent_fanout_tx(
+    network_params: TxblastNetworkParams,
+    client: &ZebraRpcClient,
+    funded_key: &FundedKey,
+    inputs: &[AddressUtxo],
+    target_height: u32,
+    recipients: &[(TransparentAddress, u64)],
+) -> Result<String> {
+    if inputs.is_empty() {
+        anyhow::bail!("transparent fanout requires at least one input");
+    }
+    if recipients.is_empty() {
+        anyhow::bail!("transparent fanout requires at least one recipient");
+    }
+
+    let input_total: u64 = inputs.iter().map(|input| input.satoshis).sum();
+    let output_total: u64 = recipients.iter().map(|(_, value)| *value).sum();
+    let expected_fee = transparent_fanout_fee(inputs.len(), recipients.len());
+    if input_total != output_total + expected_fee {
+        anyhow::bail!(
+            "planned transparent fanout outputs {} plus fee {} do not match input value {}",
+            output_total,
+            expected_fee,
+            input_total
+        );
+    }
+
+    let build_config = BuildConfig::Standard {
+        sapling_anchor: None,
+        orchard_anchor: None,
+    };
+    let height = BlockHeight::from_u32(target_height);
+    let mut builder = Builder::new(network_params, height, build_config);
+
+    for input in inputs {
+        let outpoint = transparent_outpoint(&input.txid, input.output_index)?;
+        let coin = transparent_txout(input.satoshis, &input.script)?;
+        builder
+            .add_transparent_input(funded_key.public_key, outpoint, coin)
+            .map_err(|e| anyhow::anyhow!("add_transparent_input: {e}"))?;
+    }
+
+    for (address, value) in recipients {
+        let value = Zatoshis::from_u64(*value).context("invalid transparent output amount")?;
+        builder
+            .add_transparent_output(address, value)
+            .map_err(|e| anyhow::anyhow!("add_transparent_output: {e}"))?;
+    }
+
+    let mut signing_set = TransparentSigningSet::new();
+    signing_set.add_key(funded_key.secret_key);
+
+    let fee_rule = zip317::FeeRule::standard();
+    let result = builder
+        .build(
+            &signing_set,
+            &[],
+            &[],
+            rand_core_06::OsRng,
+            &NoSaplingSpendProver,
+            &NoSaplingOutputProver,
+            &fee_rule,
+        )
+        .map_err(|e| anyhow::anyhow!("transaction build failed: {e}"))?;
+
+    let tx = result.transaction();
+    let mut tx_bytes = Vec::new();
+    tx.write(&mut tx_bytes)
+        .map_err(|e| anyhow::anyhow!("failed to serialize transaction: {e}"))?;
+    client.send_raw_transaction(&hex::encode(&tx_bytes)).await
+}
+
 /// Build (prove) a lane advance transaction without submitting it.
 /// This is a synchronous, CPU-bound operation suitable for `spawn_blocking`.
 pub(crate) fn build_lane_advance_tx(
+    network_params: TxblastNetworkParams,
     keys: &OrchardKeys,
     tracked: &TrackedNote,
     merkle_path: orchard::tree::MerklePath,
@@ -531,7 +595,7 @@ pub(crate) fn build_lane_advance_tx(
         orchard_anchor: Some(anchor),
     };
     let height = BlockHeight::from_u32(target_height);
-    let mut builder = Builder::new(KreskoTestnet, height, build_config);
+    let mut builder = Builder::new(network_params, height, build_config);
 
     builder
         .add_orchard_spend::<zip317::FeeError>(keys.fvk.clone(), tracked.note, merkle_path)
@@ -578,6 +642,7 @@ pub(crate) fn build_lane_advance_tx(
 }
 
 pub(crate) async fn build_and_send_lane_advance_tx(
+    network_params: TxblastNetworkParams,
     client: &ZebraRpcClient,
     keys: &OrchardKeys,
     tracked: &TrackedNote,
@@ -597,7 +662,7 @@ pub(crate) async fn build_and_send_lane_advance_tx(
         orchard_anchor: Some(anchor),
     };
     let height = BlockHeight::from_u32(target_height);
-    let mut builder = Builder::new(KreskoTestnet, height, build_config);
+    let mut builder = Builder::new(network_params, height, build_config);
 
     builder
         .add_orchard_spend::<zip317::FeeError>(keys.fvk.clone(), tracked.note, merkle_path)
@@ -680,7 +745,7 @@ pub(crate) async fn build_and_send_reservoir_expand_tx(
         orchard_anchor: Some(anchor),
     };
     let height = BlockHeight::from_u32(target_height);
-    let mut builder = Builder::new(KreskoTestnet, height, build_config);
+    let mut builder = Builder::new(cfg.network_params, height, build_config);
 
     builder
         .add_orchard_spend::<zip317::FeeError>(keys.fvk.clone(), tracked.note, merkle_path)
@@ -765,6 +830,7 @@ pub(crate) async fn build_and_send_treasury_reseed_tx(
 ) -> Result<SubmittedTx> {
     let planned_outputs = plan_treasury_reseed_outputs(utxo.satoshis, cfg)?;
     build_and_send_shielding_tx(
+        cfg.network_params,
         client,
         funded_key,
         keys,

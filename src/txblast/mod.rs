@@ -6,20 +6,59 @@ pub mod transparent;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use zcash_protocol::consensus::{self, BlockHeight, NetworkType, NetworkUpgrade};
 
-use crate::config::OrchardTxblastConfig;
+use crate::config::{NetworkKind, OrchardTxblastConfig};
 
 const AUTO_RUNTIME_FUNDING_CONFIRM_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Clone, Debug)]
 pub struct OrchardBlastRuntimeConfig {
     pub lane_premine: OrchardTxblastConfig,
+    pub network_params: TxblastNetworkParams,
     pub max_in_flight: usize,
     pub target_ready_lanes: usize,
     pub lane_low_watermark: usize,
     pub fanout_max_in_flight: usize,
     pub proving_workers: usize,
     pub progress_interval: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxblastNetworkParams {
+    LocalGenesis,
+    PublicTestnet,
+    Mainnet,
+}
+
+impl TxblastNetworkParams {
+    pub fn from_network_kind(network_kind: NetworkKind) -> Self {
+        match network_kind {
+            NetworkKind::LocalGenesis => Self::LocalGenesis,
+            NetworkKind::PublicTestnet => Self::PublicTestnet,
+            NetworkKind::Mainnet => Self::Mainnet,
+        }
+    }
+}
+
+impl consensus::Parameters for TxblastNetworkParams {
+    fn network_type(&self) -> NetworkType {
+        match self {
+            Self::Mainnet => NetworkType::Main,
+            Self::LocalGenesis | Self::PublicTestnet => NetworkType::Test,
+        }
+    }
+
+    fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
+        match self {
+            Self::LocalGenesis => match nu {
+                NetworkUpgrade::Nu6_1 => None,
+                _ => Some(BlockHeight::from_u32(1)),
+            },
+            Self::PublicTestnet => consensus::Network::TestNetwork.activation_height(nu),
+            Self::Mainnet => consensus::Network::MainNetwork.activation_height(nu),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -44,6 +83,28 @@ impl TxblastTraceConfig {
 impl OrchardBlastRuntimeConfig {
     pub fn from_parts(
         premine: OrchardTxblastConfig,
+        max_in_flight: Option<usize>,
+        target_ready_lanes: Option<usize>,
+        lane_low_watermark: Option<usize>,
+        fanout_max_in_flight: Option<usize>,
+        proving_workers: Option<usize>,
+        progress_interval_secs: Option<u64>,
+    ) -> Result<Self> {
+        Self::from_parts_with_network(
+            premine,
+            TxblastNetworkParams::LocalGenesis,
+            max_in_flight,
+            target_ready_lanes,
+            lane_low_watermark,
+            fanout_max_in_flight,
+            proving_workers,
+            progress_interval_secs,
+        )
+    }
+
+    pub fn from_parts_with_network(
+        premine: OrchardTxblastConfig,
+        network_params: TxblastNetworkParams,
         max_in_flight: Option<usize>,
         target_ready_lanes: Option<usize>,
         lane_low_watermark: Option<usize>,
@@ -96,6 +157,7 @@ impl OrchardBlastRuntimeConfig {
 
         Ok(Self {
             lane_premine: premine,
+            network_params,
             max_in_flight,
             target_ready_lanes,
             lane_low_watermark,
@@ -121,6 +183,7 @@ pub async fn run_local(
     orchard_fanout_max_in_flight: Option<usize>,
     orchard_proving_workers: Option<usize>,
     orchard_progress_interval_secs: Option<u64>,
+    network: Option<NetworkKind>,
     skip_funding: bool,
     trace_dir: Option<&str>,
     funded_key_path: Option<&str>,
@@ -136,8 +199,11 @@ pub async fn run_local(
         fanout_outputs: orchard_fanout_outputs
             .unwrap_or_else(|| OrchardTxblastConfig::default().fanout_outputs),
     };
-    let orchard_runtime = OrchardBlastRuntimeConfig::from_parts(
+    let network_params =
+        TxblastNetworkParams::from_network_kind(network.unwrap_or(NetworkKind::LocalGenesis));
+    let orchard_runtime = OrchardBlastRuntimeConfig::from_parts_with_network(
         orchard_premine,
+        network_params,
         orchard_max_in_flight,
         orchard_target_ready_lanes,
         orchard_lane_low_watermark,
@@ -161,6 +227,11 @@ pub async fn run_local(
 
     if skip_funding {
         println!("Skipping cached runtime funding verification before txblast start.");
+    } else if network_params != TxblastNetworkParams::LocalGenesis {
+        println!(
+            "Skipping cached local-genesis runtime funding verification on {:?}.",
+            network_params
+        );
     } else {
         maybe_prepare_cached_runtime_funding(
             rpc_endpoint,
@@ -241,4 +312,38 @@ fn env_flag_enabled(name: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zcash_protocol::consensus::Parameters;
+
+    #[test]
+    fn txblast_network_params_use_public_activation_heights() {
+        assert_eq!(
+            TxblastNetworkParams::Mainnet.network_type(),
+            NetworkType::Main
+        );
+        assert_eq!(
+            TxblastNetworkParams::Mainnet.activation_height(NetworkUpgrade::Nu6_1),
+            Some(BlockHeight::from_u32(3_146_400))
+        );
+        assert_eq!(
+            TxblastNetworkParams::PublicTestnet.activation_height(NetworkUpgrade::Nu6_1),
+            Some(BlockHeight::from_u32(3_536_500))
+        );
+    }
+
+    #[test]
+    fn local_genesis_params_keep_all_stable_upgrades_at_height_one() {
+        assert_eq!(
+            TxblastNetworkParams::LocalGenesis.activation_height(NetworkUpgrade::Nu6),
+            Some(BlockHeight::from_u32(1))
+        );
+        assert_eq!(
+            TxblastNetworkParams::LocalGenesis.activation_height(NetworkUpgrade::Nu6_1),
+            None
+        );
+    }
 }
