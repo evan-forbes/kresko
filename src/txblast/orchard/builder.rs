@@ -14,7 +14,6 @@ use zcash_transparent::builder::TransparentSigningSet;
 use zcash_transparent::bundle::{OutPoint, TxOut};
 use zebra_chain::serialization::{BytesInDisplayOrder, ZcashSerialize};
 
-use crate::txblast::rpc::AddressUtxo;
 use crate::txblast::rpc::ZebraRpcClient;
 use crate::txblast::transparent::FundedKey;
 use crate::txblast::{OrchardBlastRuntimeConfig, TxblastNetworkParams};
@@ -51,8 +50,12 @@ pub(crate) fn orchard_to_transparent_fee(output_count: usize) -> u64 {
     zip317_fee(0, output_count, orchard_bundle_actions(1, 0))
 }
 
-pub(crate) fn transparent_fanout_fee(input_count: usize, output_count: usize) -> u64 {
-    zip317_fee(input_count, output_count, 0)
+pub(crate) fn orchard_to_transparent_with_change_fee() -> u64 {
+    zip317_fee(0, 1, orchard_bundle_actions(1, 1))
+}
+
+pub(crate) fn orchard_fanout_fee(output_count: usize) -> u64 {
+    zip317_fee(0, 0, orchard_bundle_actions(1, output_count))
 }
 
 pub(crate) struct SubmittedTx {
@@ -141,6 +144,10 @@ pub(crate) struct OrchardKeys {
 impl OrchardKeys {}
 
 impl OrchardKeys {
+    pub(crate) fn address(&self) -> orchard::Address {
+        self.address
+    }
+
     pub(crate) fn external_ivk(&self) -> orchard::keys::IncomingViewingKey {
         self.fvk.to_ivk(Scope::External)
     }
@@ -502,64 +509,73 @@ pub(crate) async fn build_and_send_orchard_to_transparent_tx(
     client.send_raw_transaction(&hex::encode(&tx_bytes)).await
 }
 
-pub(crate) async fn build_and_send_transparent_fanout_tx(
+pub(crate) async fn build_and_send_orchard_to_transparent_with_change_tx(
     network_params: TxblastNetworkParams,
     client: &ZebraRpcClient,
-    funded_key: &FundedKey,
-    inputs: &[AddressUtxo],
+    keys: &OrchardKeys,
+    tracked: &TrackedNote,
+    merkle_path: orchard::tree::MerklePath,
+    anchor: orchard::Anchor,
     target_height: u32,
-    recipients: &[(TransparentAddress, u64)],
+    recipient: &TransparentAddress,
+    recipient_value: u64,
+    change_role: Option<NoteRole>,
 ) -> Result<String> {
-    if inputs.is_empty() {
-        anyhow::bail!("transparent fanout requires at least one input");
-    }
-    if recipients.is_empty() {
-        anyhow::bail!("transparent fanout requires at least one recipient");
-    }
-
-    let input_total: u64 = inputs.iter().map(|input| input.satoshis).sum();
-    let output_total: u64 = recipients.iter().map(|(_, value)| *value).sum();
-    let expected_fee = transparent_fanout_fee(inputs.len(), recipients.len());
-    if input_total != output_total + expected_fee {
+    let orchard_outputs = usize::from(change_role.is_some());
+    let fee = zip317_fee(0, 1, orchard_bundle_actions(1, orchard_outputs));
+    let note_value = tracked.value();
+    let change_value = note_value
+        .checked_sub(recipient_value)
+        .and_then(|remaining| remaining.checked_sub(fee))
+        .with_context(|| {
+            format!(
+                "note value {} is insufficient for recipient {} plus fee {}",
+                note_value, recipient_value, fee
+            )
+        })?;
+    if change_value > 0 && change_role.is_none() {
         anyhow::bail!(
-            "planned transparent fanout outputs {} plus fee {} do not match input value {}",
-            output_total,
-            expected_fee,
-            input_total
+            "sweep would leave {} zats change but no change output was requested",
+            change_value
         );
     }
 
     let build_config = BuildConfig::Standard {
         sapling_anchor: None,
-        orchard_anchor: None,
+        orchard_anchor: Some(anchor),
     };
     let height = BlockHeight::from_u32(target_height);
     let mut builder = Builder::new(network_params, height, build_config);
 
-    for input in inputs {
-        let outpoint = transparent_outpoint(&input.txid, input.output_index)?;
-        let coin = transparent_txout(input.satoshis, &input.script)?;
-        builder
-            .add_transparent_input(funded_key.public_key, outpoint, coin)
-            .map_err(|e| anyhow::anyhow!("add_transparent_input: {e}"))?;
+    builder
+        .add_orchard_spend::<zip317::FeeError>(keys.fvk.clone(), tracked.note, merkle_path)
+        .map_err(|e| anyhow::anyhow!("add_orchard_spend: {e}"))?;
+
+    let value = Zatoshis::from_u64(recipient_value).context("invalid transparent output amount")?;
+    builder
+        .add_transparent_output(recipient, value)
+        .map_err(|e| anyhow::anyhow!("add_transparent_output: {e}"))?;
+
+    if let Some(role) = change_role {
+        if change_value > 0 {
+            builder
+                .add_orchard_output::<zip317::FeeError>(
+                    Some(keys.ovk.clone()),
+                    keys.address,
+                    change_value,
+                    memo_for_role(role),
+                )
+                .map_err(|e| anyhow::anyhow!("add_orchard_change_output: {e}"))?;
+        }
     }
 
-    for (address, value) in recipients {
-        let value = Zatoshis::from_u64(*value).context("invalid transparent output amount")?;
-        builder
-            .add_transparent_output(address, value)
-            .map_err(|e| anyhow::anyhow!("add_transparent_output: {e}"))?;
-    }
-
-    let mut signing_set = TransparentSigningSet::new();
-    signing_set.add_key(funded_key.secret_key);
-
+    let signing_set = TransparentSigningSet::new();
     let fee_rule = zip317::FeeRule::standard();
     let result = builder
         .build(
             &signing_set,
             &[],
-            &[],
+            &[keys.sak.clone()],
             rand_core_06::OsRng,
             &NoSaplingSpendProver,
             &NoSaplingOutputProver,
@@ -571,6 +587,81 @@ pub(crate) async fn build_and_send_transparent_fanout_tx(
     let mut tx_bytes = Vec::new();
     tx.write(&mut tx_bytes)
         .map_err(|e| anyhow::anyhow!("failed to serialize transaction: {e}"))?;
+    client.send_raw_transaction(&hex::encode(&tx_bytes)).await
+}
+
+pub(crate) async fn build_and_send_orchard_fanout_tx(
+    network_params: TxblastNetworkParams,
+    client: &ZebraRpcClient,
+    keys: &OrchardKeys,
+    tracked: &TrackedNote,
+    merkle_path: orchard::tree::MerklePath,
+    anchor: orchard::Anchor,
+    target_height: u32,
+    recipients: &[(orchard::Address, PlannedOutput)],
+) -> Result<String> {
+    if recipients.is_empty() {
+        anyhow::bail!("orchard fanout requires at least one recipient");
+    }
+
+    let fee = orchard_fanout_fee(recipients.len());
+    let output_total: u64 = recipients.iter().map(|(_, output)| output.value).sum();
+    let note_value = tracked.value();
+    if note_value != output_total + fee {
+        anyhow::bail!(
+            "planned Orchard fanout outputs {} plus fee {} do not match note value {}",
+            output_total,
+            fee,
+            note_value
+        );
+    }
+
+    let build_config = BuildConfig::Standard {
+        sapling_anchor: None,
+        orchard_anchor: Some(anchor),
+    };
+    let height = BlockHeight::from_u32(target_height);
+    let mut builder = Builder::new(network_params, height, build_config);
+
+    builder
+        .add_orchard_spend::<zip317::FeeError>(keys.fvk.clone(), tracked.note, merkle_path)
+        .map_err(|e| anyhow::anyhow!("add_orchard_spend: {e}"))?;
+
+    for (address, output) in recipients {
+        builder
+            .add_orchard_output::<zip317::FeeError>(
+                Some(keys.ovk.clone()),
+                *address,
+                output.value,
+                memo_for_role(output.role),
+            )
+            .map_err(|e| anyhow::anyhow!("add_orchard_output: {e}"))?;
+    }
+
+    let signing_set = TransparentSigningSet::new();
+    let fee_rule = zip317::FeeRule::standard();
+    let start = Instant::now();
+    let result = builder
+        .build(
+            &signing_set,
+            &[],
+            &[keys.sak.clone()],
+            rand_core_06::OsRng,
+            &NoSaplingSpendProver,
+            &NoSaplingOutputProver,
+            &fee_rule,
+        )
+        .map_err(|e| anyhow::anyhow!("Orchard fanout build failed: {e}"))?;
+    let proving_ms = duration_ms_u64(start.elapsed().as_millis());
+
+    let tx = result.transaction();
+    let mut tx_bytes = Vec::new();
+    tx.write(&mut tx_bytes)?;
+
+    if proving_ms > 1000 {
+        eprintln!("[shielded] Orchard proving took {proving_ms}ms");
+    }
+
     client.send_raw_transaction(&hex::encode(&tx_bytes)).await
 }
 

@@ -156,9 +156,11 @@ kresko download -n 0,1,2 -w 16 heights -b 16
 
 `scripts/network_diag.sh` is included for per-node RPC/network checks and can be run directly on a node.
 
-Structured trace table reference:
+Documentation:
 
 - [`docs/trace-tables.md`](docs/trace-tables.md)
+- [`docs/public-txblast.md`](docs/public-txblast.md)
+- [`docs/mainnet-txblast-runbook.md`](docs/mainnet-txblast-runbook.md)
 
 ## Command Reference
 
@@ -171,13 +173,15 @@ Structured trace table reference:
 - `deploy`: distribute payload via S3 (operator uploads to S3, nodes curl a presigned URL) and start nodes.
   The S3 upload path retries and can fall back to the `aws` CLI. Override with:
   `KRESKO_S3_UPLOAD_ATTEMPTS`, `KRESKO_S3_UPLOAD_RETRY_DELAY_SECS`, and `KRESKO_S3_UPLOAD_AWS_CLI_FALLBACK=0`.
+- `update`: upload a local `kresko` binary via S3 and atomically install it as `/usr/local/bin/kresko` on selected nodes, without changing payload, configs, sessions, or Zebra state.
 - `status`: query node RPC status/height/sync
 - `progress`: continuously call `generate` on miners
-- `txblast`: start remote tx blast (`transparent`, `shielded`, or `both`; shielded mode supports Orchard lane and fanout controls)
+- `txblast`: for local-genesis experiments, start remote tx blast (`transparent`, `shielded`, or `both`; shielded mode supports Orchard lane and fanout controls). For public-testnet/mainnet, use `txblast wallet|deposit|plan|prepare|run|withdraw|recover`.
 - `txblast-local`: local tx blast runner intended for remote execution
 - `download`: fetch logs from nodes
 - `download traces`: fetch every file from discovered remote trace directories by default, or a selected trace-table subset via `--tables`
 - `download heights`: collect one canonical per-block RPC trace into JSONL, with async tip probing, retry/fallback across selected nodes, and reuse of existing heights unless `--force` is set
+- `clear traces`: delete trace files from discovered remote trace directories without touching downloaded local `data/`
 - `upload-data`: upload collected `data/` to S3 prefix `<experiment>/data/`
 - `reset`: stop sessions and clean remote node state
 - `down`: destroy instances for this experiment
@@ -189,7 +193,8 @@ Structured trace table reference:
 - `down --all` is intentionally destructive. Use carefully.
 - Provider credentials are loaded from `.env` (current directory first, then experiment directory).
 - `workers` values must be greater than `0`.
-- Shielded txblast now uses the local-genesis premine UTXO to create an initial Orchard lane inventory, then replenishes width with fanout when ready lanes fall below the configured watermark.
+- Local-genesis shielded txblast uses the premine UTXO to create Orchard lane inventory, then replenishes width with fanout when ready lanes fall below the configured watermark.
+- Public-network txblast shields confirmed deposits into a control Orchard inventory, fans out shielded funds to per-node hot Orchard lanes, and stays shielded until withdrawal or recovery sweep. See [`docs/public-txblast.md`](docs/public-txblast.md).
 
 ## License
 

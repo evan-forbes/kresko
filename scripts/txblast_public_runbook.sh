@@ -98,6 +98,7 @@ fi
 kresko txblast wallet init \
   -d "${EXPERIMENT_DIR}" \
   --network "${NETWORK}" \
+  --rpc-endpoint "${RPC_ENDPOINT}" \
   --lanes-per-node 100 \
   --lane-value-zats 30000 \
   --fanout-width 1 \
@@ -108,6 +109,7 @@ kresko txblast wallet init \
 #   kresko txblast wallet init \
 #     -d "${EXPERIMENT_DIR}" \
 #     --network mainnet \
+#     --rpc-endpoint "${RPC_ENDPOINT}" \
 #     --lanes-per-node 100 \
 #     --lane-value-zats 30000 \
 #     --fanout-width 1 \
@@ -141,12 +143,14 @@ kresko txblast deposit address -d "${EXPERIMENT_DIR}"
 # 3. Track deposits
 ###############################################################################
 
-# Preferred when address-index RPC is available:
-#
 kresko txblast deposit status \
   -d "${EXPERIMENT_DIR}" \
   --rpc-endpoint "${RPC_ENDPOINT}" \
-  --confirmations 10
+  --confirmations 3
+#
+# When address-index RPC is available, deposit status auto-imports confirmed
+# control-address UTXOs for planning. Plan also auto-syncs before checking
+# funding.
 #
 # If getaddressutxos is not available, manually import the known deposit:
 #
@@ -279,7 +283,7 @@ kresko txblast run \
 kresko txblast deposit status \
   -d "${EXPERIMENT_DIR}" \
   --rpc-endpoint "${RPC_ENDPOINT}" \
-  --confirmations 10
+  --confirmations 3
 #
 # - Unified public workload status is guarded:
 #

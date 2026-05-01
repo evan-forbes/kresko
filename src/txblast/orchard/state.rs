@@ -41,6 +41,22 @@ impl LaneRegistry {
         self.ready_lane_count() + self.reservoir_count()
     }
 
+    pub(crate) fn spendable_notes(&self) -> Vec<TrackedNote> {
+        self.ready_lanes
+            .iter()
+            .chain(self.reservoir_notes.iter())
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn spendable_value(&self) -> u64 {
+        self.ready_lanes
+            .iter()
+            .chain(self.reservoir_notes.iter())
+            .map(TrackedNote::value)
+            .sum()
+    }
+
     pub(crate) fn drained_notes(&self) -> u64 {
         self.drained_notes
     }

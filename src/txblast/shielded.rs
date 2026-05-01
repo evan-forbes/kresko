@@ -15,7 +15,7 @@ use super::orchard::{
     derive_orchard_keys, detect_reorg_reason, latest_checkpoint_anchor, latest_witness,
     min_bootstrap_shield_value, min_lane_value, pending_counts, pending_trace_summary,
     plan_next_work, plan_shielding_outputs, poll_best_tip, refresh_treasury_inventory,
-    scan_block_range, wait_for_tip_change,
+    scan_block_range, seed_orchard_tree_from_treestate, wait_for_tip_change,
 };
 use super::rpc::ZebraRpcClient;
 use super::transparent::FundedKey;
@@ -272,6 +272,29 @@ fn transition_phase(
     });
 }
 
+async fn seed_orchard_tree_for_scan_start(
+    client: &ZebraRpcClient,
+    tree: &mut OrchardTree,
+    next_position: &mut u64,
+    scan_start_height: u32,
+) -> Result<()> {
+    if scan_start_height <= 1 {
+        return Ok(());
+    }
+
+    let frontier_height = scan_start_height - 1;
+    println!(
+        "[shielded] seeding Orchard tree from treestate at height {}",
+        frontier_height
+    );
+    seed_orchard_tree_from_treestate(tree, client, frontier_height).await?;
+    *next_position = tree
+        .frontier()
+        .map_err(|e| anyhow::anyhow!("seeded Orchard frontier read failed: {e:?}"))?
+        .tree_size();
+    Ok(())
+}
+
 async fn rescan_orchard_state_from_chain(
     client: &ZebraRpcClient,
     keys: &OrchardKeys,
@@ -285,6 +308,7 @@ async fn rescan_orchard_state_from_chain(
     treasury: &mut TreasuryInventory,
     pending_txs: &mut HashMap<String, PendingTx>,
     submit_credit: f64,
+    scan_start_height: u32,
     reason: &'static str,
     error: Option<String>,
 ) -> Result<()> {
@@ -338,16 +362,18 @@ async fn rescan_orchard_state_from_chain(
     registry.reset_for_rebuild();
     cursor.reset_for_rebuild();
 
+    seed_orchard_tree_for_scan_start(client, tree, next_position, scan_start_height).await?;
+
     let best_tip = poll_best_tip(client).await?;
     cursor.record_best_tip(best_tip.clone());
-    if best_tip.height > 0 {
+    if best_tip.height >= scan_start_height {
         scan_block_range(
             client,
             keys,
             tree,
             next_position,
             nullifier_index,
-            1,
+            scan_start_height,
             best_tip.height,
             pending_txs,
             registry,
@@ -576,6 +602,7 @@ async fn sync_orchard_chain_state(
     pending_txs: &mut HashMap<String, PendingTx>,
     submit_credit: f64,
     phase: RuntimePhase,
+    scan_start_height: u32,
 ) -> Result<()> {
     let best_tip = poll_best_tip(client).await?;
     cursor.record_best_tip(best_tip.clone());
@@ -594,6 +621,7 @@ async fn sync_orchard_chain_state(
             treasury,
             pending_txs,
             submit_credit,
+            scan_start_height,
             reason,
             None,
         )
@@ -624,13 +652,17 @@ async fn sync_orchard_chain_state(
             treasury,
             pending_txs,
             submit_credit,
+            scan_start_height,
             reason,
             None,
         )
         .await;
     }
 
-    let start_height = cursor.last_scanned_height().saturating_add(1);
+    let start_height = cursor
+        .last_scanned_height()
+        .saturating_add(1)
+        .max(scan_start_height);
     if best_tip.height >= start_height {
         scan_block_range(
             client,
@@ -704,6 +736,7 @@ async fn run_bootstrap(
     treasury: &mut TreasuryInventory,
     pending_txs: &mut HashMap<String, PendingTx>,
     coinbase_cache: &mut HashMap<String, bool>,
+    scan_start_height: u32,
 ) -> Result<()> {
     let mut phase = RuntimePhase::BootstrapScan;
     transition_phase(
@@ -778,6 +811,7 @@ async fn run_bootstrap(
             pending_txs,
             0.0,
             phase,
+            scan_start_height,
         )
         .await?;
     }
@@ -933,6 +967,7 @@ async fn run_bootstrap(
             pending_txs,
             0.0,
             phase,
+            scan_start_height,
         )
         .await?;
 
@@ -957,6 +992,7 @@ async fn run_bootstrap(
                 pending_txs,
                 0.0,
                 phase,
+                scan_start_height,
             )
             .await?;
         }
@@ -989,6 +1025,7 @@ pub async fn run(
     orchard_cfg: &OrchardBlastRuntimeConfig,
     trace_config: &TxblastTraceConfig,
     expected_runtime_funding_txid: Option<&str>,
+    wallet_birthday_height: Option<u32>,
 ) -> Result<()> {
     if rate == 0 {
         anyhow::bail!("--rate must be greater than 0");
@@ -1018,6 +1055,7 @@ pub async fn run(
     let mut pending_txs: HashMap<String, PendingTx> = HashMap::new();
     let mut next_position: u64 = 0;
     let mut coinbase_cache = HashMap::new();
+    let scan_start_height = wallet_birthday_height.unwrap_or(0).max(1);
 
     let best_tip = poll_best_tip(client).await?;
     cursor.record_best_tip(best_tip.clone());
@@ -1042,10 +1080,12 @@ pub async fn run(
         orchard_cfg,
         Some("starting_up"),
     );
-    if best_tip.height > 0 {
+    seed_orchard_tree_for_scan_start(client, &mut tree, &mut next_position, scan_start_height)
+        .await?;
+    if best_tip.height >= scan_start_height {
         println!(
-            "[shielded] scanning blocks 1..{} for existing Orchard commitments",
-            best_tip.height
+            "[shielded] scanning blocks {}..{} for existing Orchard commitments",
+            scan_start_height, best_tip.height
         );
         scan_block_range(
             client,
@@ -1053,7 +1093,7 @@ pub async fn run(
             &mut tree,
             &mut next_position,
             &mut nullifier_index,
-            1,
+            scan_start_height,
             best_tip.height,
             &mut pending_txs,
             &mut registry,
@@ -1067,7 +1107,11 @@ pub async fn run(
         .await?;
         println!(
             "[shielded] scanned {} blocks, tree has {} commitments",
-            best_tip.height, next_position,
+            best_tip
+                .height
+                .saturating_sub(scan_start_height)
+                .saturating_add(1),
+            next_position,
         );
     } else {
         cursor.record_last_scanned(best_tip);
@@ -1088,6 +1132,7 @@ pub async fn run(
         &mut treasury,
         &mut pending_txs,
         &mut coinbase_cache,
+        scan_start_height,
     )
     .await?;
 
@@ -1147,6 +1192,7 @@ pub async fn run(
             &mut pending_txs,
             submit_credit,
             RuntimePhase::SteadyState,
+            scan_start_height,
         )
         .await
         {
@@ -1263,6 +1309,7 @@ pub async fn run(
                         &mut treasury,
                         &mut pending_txs,
                         submit_credit,
+                        scan_start_height,
                         "rebuilding_after_checkpoint_mismatch",
                         None,
                     )
@@ -1360,6 +1407,7 @@ pub async fn run(
                                         &mut treasury,
                                         &mut pending_txs,
                                         submit_credit,
+                                        scan_start_height,
                                         "rebuilding_after_witness_error",
                                         Some(error),
                                     )
@@ -1648,6 +1696,7 @@ pub async fn run(
                         &mut treasury,
                         &mut pending_txs,
                         submit_credit,
+                        scan_start_height,
                         "rebuilding_after_anchor_rejection",
                         rescan_error,
                     )

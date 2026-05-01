@@ -21,6 +21,21 @@ const SSH_OPTS: &[&str] = &[
     "ServerAliveCountMax=6",
 ];
 
+const SSH_OPTS_LONG_CONNECT: &[&str] = &[
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "UserKnownHostsFile=/dev/null",
+    "-o",
+    "LogLevel=ERROR",
+    "-o",
+    "ConnectTimeout=60",
+    "-o",
+    "ServerAliveInterval=30",
+    "-o",
+    "ServerAliveCountMax=10",
+];
+
 /// Execute a command on a remote host via SSH.
 pub async fn ssh_exec(host: &str, key: &str, command: &str) -> Result<String> {
     ssh_exec_timeout(host, key, command, Duration::from_secs(300)).await
@@ -33,8 +48,28 @@ pub async fn ssh_exec_timeout(
     command: &str,
     timeout: Duration,
 ) -> Result<String> {
+    ssh_exec_timeout_with_opts(host, key, command, timeout, SSH_OPTS).await
+}
+
+/// Execute a command on a remote host via SSH with a longer connection timeout.
+pub async fn ssh_exec_long_connect_timeout(
+    host: &str,
+    key: &str,
+    command: &str,
+    timeout: Duration,
+) -> Result<String> {
+    ssh_exec_timeout_with_opts(host, key, command, timeout, SSH_OPTS_LONG_CONNECT).await
+}
+
+async fn ssh_exec_timeout_with_opts(
+    host: &str,
+    key: &str,
+    command: &str,
+    timeout: Duration,
+    opts: &[&str],
+) -> Result<String> {
     let fut = Command::new("ssh")
-        .args(SSH_OPTS)
+        .args(opts)
         .args(["-i", key, &format!("root@{host}"), command])
         .output();
 

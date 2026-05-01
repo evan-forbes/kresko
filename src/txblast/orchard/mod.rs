@@ -7,16 +7,18 @@ pub(crate) mod treasury;
 pub(crate) mod types;
 
 pub(crate) use builder::{
-    BuiltTx, ORCHARD_SPEND_FEE, OrchardKeys, build_and_send_orchard_to_transparent_tx,
-    build_and_send_shielding_tx, build_and_send_transparent_fanout_tx, build_lane_advance_tx,
-    decode_txblast_note_role, derive_orchard_keys, min_bootstrap_shield_value, min_lane_value,
-    min_treasury_reseed_value, orchard_to_transparent_fee, plan_shielding_outputs, shielding_fee,
-    transparent_fanout_fee,
+    BuiltTx, MIN_NOTE_VALUE, ORCHARD_SPEND_FEE, OrchardKeys, build_and_send_orchard_fanout_tx,
+    build_and_send_orchard_to_transparent_tx, build_and_send_orchard_to_transparent_with_change_tx,
+    build_and_send_shielding_tx, build_lane_advance_tx, decode_txblast_note_role,
+    derive_orchard_keys, min_bootstrap_shield_value, min_lane_value, min_treasury_reseed_value,
+    orchard_fanout_fee, orchard_to_transparent_fee, orchard_to_transparent_with_change_fee,
+    plan_shielding_outputs, shielding_fee,
 };
 pub(crate) use planner::{pending_counts, pending_trace_summary, plan_next_work};
 pub(crate) use scanner::{
     BlockRef, OrchardChainCursor, OrchardNullifierIndex, OrchardTree, detect_reorg_reason,
-    latest_checkpoint_anchor, latest_witness, poll_best_tip, scan_block_range, wait_for_tip_change,
+    latest_checkpoint_anchor, latest_witness, poll_best_tip, scan_block_range,
+    seed_orchard_tree_from_treestate, wait_for_tip_change,
 };
 pub(crate) use state::{LaneRegistry, TreasuryInventory};
 pub(crate) use tracing::OrchardTxblastTracer;

@@ -1,5 +1,6 @@
 pub mod add;
 pub mod check;
+pub mod clear;
 pub mod collect;
 pub mod deploy;
 pub mod down;
@@ -25,4 +26,5 @@ pub mod txblast;
 pub mod txblast_public;
 pub mod txblast_status;
 pub mod up;
+pub mod update;
 pub mod upload_data;

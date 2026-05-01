@@ -188,6 +188,7 @@ pub async fn run_local(
     trace_dir: Option<&str>,
     funded_key_path: Option<&str>,
     expected_runtime_funding_txid: Option<&str>,
+    wallet_birthday_height: Option<u32>,
 ) -> Result<()> {
     let orchard_premine = OrchardTxblastConfig {
         lanes_per_miner: orchard_lanes_per_miner
@@ -257,6 +258,7 @@ pub async fn run_local(
         &orchard_runtime,
         &trace_config,
         expected_runtime_funding_txid,
+        wallet_birthday_height,
     )
     .await
 }

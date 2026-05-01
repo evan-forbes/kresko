@@ -2,10 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use ff::PrimeField;
+use incrementalmerkletree::frontier::Frontier;
 use incrementalmerkletree::{Marking, Position, Retention};
 use orchard::tree::MerkleHashOrchard;
 use shardtree::ShardTree;
 use shardtree::store::memory::MemoryShardStore;
+use zcash_primitives::merkle_tree::{read_frontier_v0, read_frontier_v1};
 use zcash_protocol::consensus;
 use zebra_chain::parameters::NetworkUpgrade;
 use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize};
@@ -177,6 +179,93 @@ pub(crate) async fn scan_block_range(
     }
 
     Ok(())
+}
+
+pub(crate) async fn seed_orchard_tree_from_treestate(
+    tree: &mut OrchardTree,
+    client: &ZebraRpcClient,
+    height: u32,
+) -> Result<()> {
+    let treestate = client.z_get_treestate(height).await?;
+    let final_state_hex = treestate
+        .pointer("/orchard/commitments/finalState")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if final_state_hex.is_empty() {
+        return Ok(());
+    }
+    let final_root_hex = treestate
+        .pointer("/orchard/commitments/finalRoot")
+        .and_then(|v| v.as_str());
+
+    let final_state = hex::decode(final_state_hex)
+        .with_context(|| format!("orchard finalState at height {height} is not valid hex"))?;
+    let frontier = parse_orchard_treestate_frontier(&final_state, final_root_hex, height)?;
+    tree.insert_frontier(
+        frontier,
+        Retention::Checkpoint {
+            id: height,
+            marking: Marking::None,
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("failed to seed Orchard tree at height {height}: {e:?}"))?;
+    Ok(())
+}
+
+fn parse_orchard_treestate_frontier(
+    final_state: &[u8],
+    final_root_hex: Option<&str>,
+    height: u32,
+) -> Result<Frontier<MerkleHashOrchard, 32>> {
+    let expected_root = final_root_hex
+        .filter(|root| !root.is_empty())
+        .map(|root| {
+            hex::decode(root)
+                .with_context(|| format!("orchard finalRoot at height {height} is not valid hex"))?
+                .try_into()
+                .map_err(|_| {
+                    anyhow::anyhow!("orchard finalRoot at height {height} is not 32 bytes")
+                })
+        })
+        .transpose()?;
+
+    let legacy = read_frontier_v0(final_state);
+    if let Ok(frontier) = legacy.as_ref() {
+        if frontier_matches_root(frontier, expected_root.as_ref()) {
+            return Ok(frontier.clone());
+        }
+    }
+
+    let frontier_v1 = read_frontier_v1(final_state);
+    if let Ok(frontier) = frontier_v1.as_ref() {
+        if frontier_matches_root(frontier, expected_root.as_ref()) {
+            return Ok(frontier.clone());
+        }
+    }
+
+    match (legacy, frontier_v1) {
+        (Ok(_), Ok(_)) => anyhow::bail!(
+            "failed to parse Orchard finalState at height {height}: decoded roots did not match finalRoot"
+        ),
+        (Err(legacy_err), Err(frontier_err)) => anyhow::bail!(
+            "failed to parse Orchard finalState at height {height}: legacy={legacy_err}; frontier_v1={frontier_err}"
+        ),
+        (Err(legacy_err), Ok(_)) => anyhow::bail!(
+            "failed to parse Orchard finalState at height {height}: frontier_v1 root did not match finalRoot; legacy={legacy_err}"
+        ),
+        (Ok(_), Err(frontier_err)) => anyhow::bail!(
+            "failed to parse Orchard finalState at height {height}: legacy root did not match finalRoot; frontier_v1={frontier_err}"
+        ),
+    }
+}
+
+fn frontier_matches_root(
+    frontier: &Frontier<MerkleHashOrchard, 32>,
+    expected_root: Option<&[u8; 32]>,
+) -> bool {
+    expected_root
+        .map(|root| frontier.root().to_bytes() == *root)
+        .unwrap_or(true)
 }
 
 pub(crate) fn latest_checkpoint_anchor(

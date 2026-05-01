@@ -243,6 +243,33 @@ enum Commands {
         directory: String,
     },
 
+    /// Update only the kresko binary on cloud instances
+    Update {
+        /// Path to SSH private key
+        #[arg(short = 'k', long)]
+        ssh_key_path: Option<String>,
+
+        /// Comma-separated miner indices, "all", or wildcard patterns
+        #[arg(short = 'n', long, default_value = "all")]
+        nodes: String,
+
+        /// Number of parallel workers
+        #[arg(short = 'w', long, default_value_t = DEFAULT_WORKERS)]
+        workers: usize,
+
+        /// Continue even if some miners fail
+        #[arg(short = 'i', long)]
+        ignore_failed_miners: bool,
+
+        /// Path to kresko binary to install (defaults to current executable)
+        #[arg(long, alias = "binary")]
+        kresko_binary: Option<String>,
+
+        /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
     /// Query node status (block heights, sync progress)
     Status {
         /// Output as JSON
@@ -610,6 +637,10 @@ enum Commands {
         #[arg(long)]
         funded_key_path: Option<String>,
 
+        /// Wallet birthday height for public-network Orchard scans
+        #[arg(long)]
+        wallet_birthday_height: Option<u32>,
+
         /// Expected runtime funding transaction id for shielded bootstrap diagnostics
         #[arg(long)]
         expected_runtime_funding_txid: Option<String>,
@@ -772,6 +803,24 @@ enum Commands {
         directory: String,
     },
 
+    /// Clear selected remote artifacts without touching local downloads
+    Clear {
+        #[command(subcommand)]
+        target: ClearTarget,
+
+        /// Node name pattern (or "all")
+        #[arg(short = 'n', long, default_value = "all", global = true)]
+        nodes: String,
+
+        /// Number of parallel workers
+        #[arg(short = 'w', long, default_value_t = DEFAULT_WORKERS, global = true)]
+        workers: usize,
+
+        /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".", global = true)]
+        directory: String,
+    },
+
     /// Download the standard artifact set: logs, heights, and traces
     Collect {
         /// Node name pattern (or "all")
@@ -882,6 +931,12 @@ enum DownloadTarget {
     },
 }
 
+#[derive(Subcommand)]
+enum ClearTarget {
+    /// Delete trace files from discovered remote trace directories only
+    Traces,
+}
+
 #[derive(Subcommand, Clone, Debug)]
 enum TxblastCommand {
     /// Manage public-network txblast wallet state
@@ -927,6 +982,10 @@ enum TxblastCommand {
         /// Funding safety margin, for example 0.20
         #[arg(long, default_value_t = 0.20)]
         safety_margin: f64,
+
+        /// RPC endpoint to auto-discover confirmed deposits
+        #[arg(long)]
+        rpc_endpoint: Option<String>,
 
         /// Record a plan even when imported deposits are insufficient
         #[arg(long)]
@@ -1065,9 +1124,13 @@ enum TxblastWalletCommand {
         #[arg(long)]
         network: Option<String>,
 
-        /// Wallet birthday height, default 0
+        /// Wallet birthday height, default current RPC height when available
         #[arg(long)]
         birthday_height: Option<u32>,
+
+        /// RPC endpoint to query for the default birthday height
+        #[arg(long)]
+        rpc_endpoint: Option<String>,
 
         /// Initial lane count per node
         #[arg(long, default_value_t = 100)]
@@ -1136,7 +1199,7 @@ enum TxblastDepositCommand {
         rpc_endpoint: Option<String>,
 
         /// Confirmations required for spendability
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 3)]
         confirmations: u32,
 
         /// Output JSON
@@ -1202,6 +1265,7 @@ impl Commands {
             | Commands::Genesis { directory, .. }
             | Commands::GenesisPublic { directory, .. }
             | Commands::Deploy { directory, .. }
+            | Commands::Update { directory, .. }
             | Commands::Status { directory, .. }
             | Commands::Check { directory, .. }
             | Commands::List { directory }
@@ -1216,6 +1280,7 @@ impl Commands {
             | Commands::Run { directory, .. }
             | Commands::Exec { directory, .. }
             | Commands::Download { directory, .. }
+            | Commands::Clear { directory, .. }
             | Commands::Collect { directory, .. }
             | Commands::UploadData { directory }
             | Commands::Reset { directory, .. }
@@ -1232,6 +1297,7 @@ async fn run_txblast_command(command: TxblastCommand, directory: &str) -> Result
                 directory: state_directory,
                 network,
                 birthday_height,
+                rpc_endpoint,
                 lanes_per_node,
                 lane_value_zats,
                 fanout_width,
@@ -1245,6 +1311,7 @@ async fn run_txblast_command(command: TxblastCommand, directory: &str) -> Result
                         directory: state_directory,
                         network,
                         birthday_height,
+                        rpc_endpoint,
                         lanes_per_node,
                         lane_value_zats,
                         fanout_width,
@@ -1313,6 +1380,7 @@ async fn run_txblast_command(command: TxblastCommand, directory: &str) -> Result
             measured_tx_bytes,
             max_mempool_bytes,
             safety_margin,
+            rpc_endpoint,
             allow_underfunded_plan,
             json,
         } => {
@@ -1327,10 +1395,12 @@ async fn run_txblast_command(command: TxblastCommand, directory: &str) -> Result
                     measured_tx_bytes,
                     max_mempool_bytes,
                     safety_margin,
+                    rpc_endpoint,
                     allow_underfunded_plan,
                     json,
                 },
-            )?;
+            )
+            .await?;
         }
         TxblastCommand::Prepare {
             directory: state_directory,
@@ -1422,7 +1492,8 @@ async fn run_txblast_command(command: TxblastCommand, directory: &str) -> Result
                     dry_run,
                     mainnet_i_understand_finality,
                 },
-            )?;
+            )
+            .await?;
         }
         TxblastCommand::Recover { command } => match command {
             TxblastRecoverCommand::Inventory {
@@ -1437,7 +1508,8 @@ async fn run_txblast_command(command: TxblastCommand, directory: &str) -> Result
                         from_height,
                         json,
                     },
-                )?;
+                )
+                .await?;
             }
             TxblastRecoverCommand::Sweep {
                 directory: state_directory,
@@ -1455,7 +1527,8 @@ async fn run_txblast_command(command: TxblastCommand, directory: &str) -> Result
                         dry_run,
                         mainnet_i_understand_recovery,
                     },
-                )?;
+                )
+                .await?;
             }
         },
     }
@@ -1637,6 +1710,24 @@ async fn main() -> Result<()> {
                 ignore_failed_miners,
                 reuse_app_session,
                 restart_app_session,
+                &directory,
+            )
+            .await?;
+        }
+        Commands::Update {
+            ssh_key_path,
+            nodes,
+            workers,
+            ignore_failed_miners,
+            kresko_binary,
+            directory,
+        } => {
+            commands::update::run(
+                ssh_key_path.as_deref(),
+                &nodes,
+                workers,
+                ignore_failed_miners,
+                kresko_binary.as_deref(),
                 &directory,
             )
             .await?;
@@ -1844,6 +1935,7 @@ async fn main() -> Result<()> {
             skip_funding,
             trace_dir,
             funded_key_path,
+            wallet_birthday_height,
             expected_runtime_funding_txid,
         } => {
             txblast::run_local(
@@ -1865,6 +1957,7 @@ async fn main() -> Result<()> {
                 trace_dir.as_deref(),
                 funded_key_path.as_deref(),
                 expected_runtime_funding_txid.as_deref(),
+                wallet_birthday_height,
             )
             .await?;
         }
@@ -1964,6 +2057,16 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Commands::Clear {
+            target,
+            nodes,
+            workers,
+            directory,
+        } => match target {
+            ClearTarget::Traces => {
+                commands::clear::run_traces(&nodes, workers, &directory).await?;
+            }
+        },
         Commands::Collect {
             nodes,
             workers,
