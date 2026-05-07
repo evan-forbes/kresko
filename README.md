@@ -2,199 +2,258 @@
 
 Kresko is an experimental Zcash bench for spinning up arbitrary numbers of geographically distributed nodes, with a strong focus on being easy to debug for non-DevOps developers.
 
-## Why Kresko
+## Two pieces
 
-- Fast iteration on multi-node Zcash experiments.
-- Region-aware node placement across cloud providers.
-- Debug-first runtime model (tmux-managed sessions, easy log retrieval, diagnostic scripts).
-- Local genesis generation and per-node config generation for repeatable test networks.
+Kresko is split into a Rust binary and a Python orchestration layer.
 
-## Current Scope
+- **Rust `kresko`** — Zcash- and protocol-specific tooling: `genesis`,
+  `txblast-local`, `mine`. Stays a standalone binary; experiment scripts
+  invoke it as a subprocess.
+- **Python `kresko_py` / `kresko` CLI** — experiment lifecycle, provisioning,
+  asset tracking, deploy, tmux, collect, sync, teardown.
 
-- Node role: `miner`
-- Providers: `digitalocean`, `googlecloud`, `linode`
-- RPC-focused workflows: chain progress, status checks, transaction blasting, height trace collection
-- Data export: local `data/` plus optional S3 upload
+## `~/.kresko/` is the home
 
-## How It Works
+Everything kresko (Python) does lives under `~/.kresko/` (override with
+`KRESKO_HOME`):
 
-Typical flow:
+```
+~/.kresko/
+├── .env                          # global credentials
+├── config.toml                   # global defaults
+├── cache/                        # disposable scratch
+├── experiments/<exp>/            # stateless experiment source: run.py + payload + configs
+├── runs/<exp>/<run-name>/        # one self-contained run per invocation
+│   ├── manifest.json
+│   ├── result.json
+│   ├── run.py / payload/ / *.toml    # ← copied from experiments/<exp>/ at run start
+│   ├── inventory.py / deploy_*.py    # ← generated
+│   ├── stdout.log / stderr.log
+│   ├── nodes/<name>.json             # immutable asset snapshot
+│   └── data/                         # files collected from nodes
+└── assets/<provider>-<id>.json   # one JSON per live cloud asset
+```
 
-1. `init` creates an experiment directory with config, scripts, and `.env`.
-2. `add` defines miners (count + region/provider).
-3. `up` creates cloud instances and records their IPs in `config.json`.
-4. `sync-ips` reconstructs missing IPs in `config.json` from provider state when needed.
-5. `genesis` builds payload content (local genesis artifacts, per-node `zebrad.toml`, binaries).
-6. `deploy` ships payload and starts nodes via tmux session `app`.
-7. `status` / `progress` / `txblast` drive and observe network behavior.
-8. `download` / `download heights` / `upload-data` collect artifacts.
-9. `reset` / `down` clean up sessions, state, and instances.
+### Invariants
 
-## Prerequisites
+1. Experiment scripts under `experiments/<exp>/` are pure orchestration. They
+   never write to their own dir; re-running creates a new run, never
+   overwrites.
+2. A run is the unit of result encapsulation. Tar the run dir and you have
+   everything that experiment produced — script, payload, configs, inventory,
+   logs, node snapshots, collected data.
+3. `~/.kresko/assets/` mirrors live cloud infrastructure. `kresko sync`
+   refreshes it. Selectors and destroy paths read from it.
 
-- Rust toolchain with `cargo`
-- Local binaries/tools:
-  - `ssh`, `scp`, `tar`, `curl`, `bash`
-  - `openssl` (required for Google Cloud auth flow)
-- A built `zebrad` binary path for `kresko genesis --zebrad-binary ...`
-- Cloud credentials:
-  - DigitalOcean: `DIGITALOCEAN_TOKEN`
-  - Google Cloud: `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_KEY_JSON_PATH`
-  - Linode: `LINODE_TOKEN`
-- SSH key pair available for instance access
+### Tagging contract
+
+Every kresko-managed cloud asset carries:
+
+- `kresko` — mandatory; sync/destroy refuse without it.
+- `kresko-exp-<experiment>`
+- `kresko-role-<role>` — e.g. `kresko-role-miner`, `kresko-role-rpc`.
+- `kresko-run-<run-name>`
+
+### Run naming
+
+Default run name is the experiment name. On collision, kresko appends `-2`,
+`-3`, etc. — `runs/<exp>/<slug>/`, `runs/<exp>/<slug>-2/`, …
 
 ## Install
 
+Install the Python CLI:
+
+```bash
+uv sync --extra dev
+```
+
+This registers the `kresko` script. Add the Rust binary to `$PATH` for
+experiments that need it (`genesis`, `txblast-local`, `mine`):
+
 ```bash
 cargo build --release
+ln -sf "$PWD/target/release/kresko" ~/.local/bin/kresko
 ```
 
-Optional:
+## Quick start
 
 ```bash
-make install
+# 1) Bootstrap ~/.kresko/ and copy bundled reference experiments.
+kresko init
+
+# 2) (Optional) scaffold a new experiment from the reference one.
+kresko init my-exp                          # copy pyinfra_do_smoke -> ~/.kresko/experiments/my-exp
+kresko init my-exp --from pyinfra_do_smoke  # explicit reference
+$EDITOR ~/.kresko/experiments/my-exp/run.py
+
+# 3) Set credentials
+$EDITOR ~/.kresko/.env     # DIGITALOCEAN_TOKEN, AWS_*, KRESKO_SSH_KEY_NAME, ...
+
+# 4) Provision and drive
+kresko run pyinfra_do_smoke -- plan
+kresko run pyinfra_do_smoke --name nyc-1 -- up
+kresko run pyinfra_do_smoke --name nyc-1 -- deploy
+kresko run pyinfra_do_smoke --name nyc-1 -- smoke
+kresko run pyinfra_do_smoke --name nyc-1 -- collect
+kresko run pyinfra_do_smoke --name nyc-1 -- down
 ```
 
-## Quick Start (DigitalOcean)
+`kresko init` is a Rust subcommand. Re-running it is idempotent: existing
+`~/.kresko/.env`, `config.toml`, and experiment directories are left
+untouched. Pass `--force` with a `<name>` to overwrite a scaffolded
+experiment.
+
+`kresko run <exp> --name <slug> -- <verb>` allocates a new run dir, copies
+`experiments/<exp>/` into it, and exec's the copied `run.py` with the verb
+as its argv. The verbs (`plan / up / deploy / run / collect / down`) come
+from the shared `run_experiment()` helper — see "Writing an experiment".
+
+## CLI reference
+
+- `kresko init [<name>] [--from <ref>] [--force]` — bootstrap `~/.kresko/`
+  (subdirs + `.env` + `config.toml` stubs), copy bundled reference
+  experiments into `~/.kresko/experiments/`, and (with `<name>`) scaffold a
+  new experiment from a reference. This is a Rust subcommand baked into the
+  binary; the bundled experiments come from the build-time source tree.
+- `kresko run <experiment> [--name <slug>] -- [args...]` — allocate a fresh
+  run dir, copy `experiments/<exp>/` into it, exec the copied `run.py` with
+  `KRESKO_EXPERIMENT` / `KRESKO_RUN_NAME` / `KRESKO_RUN_DIR` set.
+- `kresko sync` — refresh `~/.kresko/assets/` from configured cloud
+  providers (currently DigitalOcean).
+- `kresko assets list [--tag <tag>] [--provider <name>]` — list assets,
+  filtered by tag (repeat `--tag` for AND).
+- `kresko assets show <provider> <provider_id>` — print one asset.
+- `kresko runs list <experiment>` — list runs, with stage/ok summary.
+- `kresko runs show <experiment> <run-name>` — print manifest and result.
+
+## Writing an experiment
+
+Each experiment provides a `run.py` that builds an `Experiment` and hands
+it to `run_experiment()`, which gives you the standard verbs for free:
+
+```python
+import os, sys
+from kresko_py import DigitalOcean, Experiment, node_type, run_experiment
+
+
+def build_experiment() -> Experiment:
+    miner = node_type(
+        role="miner",
+        provider=DigitalOcean(region="nyc3", size="s-1vcpu-1gb"),
+        payload=["payload"],
+    )
+    exp = Experiment.current()         # picks up the run dir from env vars
+    exp.add(miner, count=4)
+    return exp
+
+
+def smoke(exp: Experiment, args) -> dict:
+    # An experiment-specific verb. `args` is the parsed argparse Namespace,
+    # so shared filters like `--role` / `--pattern` are available here too.
+    return exp.run_tmux(
+        "app",
+        "zebrad -c /root/kresko/zebrad.toml",
+        role=args.role,
+        log_path="/root/app.log",
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(run_experiment(build_experiment, extra_actions={"smoke": smoke}))
+```
+
+`run_experiment()` parses the standard verbs (`plan / up / deploy / run /
+collect / down`) plus anything you register in `extra_actions`, dispatches
+to the matching `Experiment` method, prints the result as JSON, and exits
+non-zero when `result["ok"]` is false. Shared flags include `--dry-run`,
+`--retry-failed`, `--role`, `--name`, `--pattern`, `--failed-from`,
+`--command`, `--path`, `--dest`, `--force-tag`.
+
+To call the Rust binary from inside a verb handler:
+
+```python
+exp.shell([
+    "kresko", "genesis",
+    "--zebrad-binary", os.environ["ZEBRAD_BIN"],
+    "--out", str(exp.run_dir / "payload" / "local_genesis"),
+])
+```
+
+`exp.shell()` tees stdout/stderr into the run dir. The Rust binary stays
+unaware of `~/.kresko/`; pass `--out` paths it should write to.
+
+### Failure handling
+
+`exp.up()` no longer raises on per-node failures. It returns:
+
+```python
+{
+  "stage":      "up",
+  "ok":         False,             # True iff every requested node came up
+  "requested":  4,
+  "succeeded":  3,
+  "failed":     [{"name": "miner-3", "kind": "wait_timeout",
+                  "region": "nyc3", "size": "s-1vcpu-1gb",
+                  "message": "..."}],
+  "plan":       {...},
+}
+```
+
+Two failure shapes:
+
+- **Create-time** (e.g. region capacity exhausted): no asset is written for
+  the failed node; the failure is recorded in the run's `result.json`.
+- **Wait-timeout** (droplet created but never reported an IP): the asset is
+  written with `status: "failed"` and a structured `failure_reason`. The
+  selector layer treats `status: "failed"` as inactive, so subsequent
+  `deploy / run / collect / down` automatically skip it.
+
+To retry the failed nodes only, pass `--retry-failed`:
 
 ```bash
-# 1) Create experiment
-./target/release/kresko init \
-  --chain-id nu6-lab \
-  --experiment exp-nyc-sfo \
-  --provider digitalocean
-
-cd exp-nyc-sfo
-
-# 2) Fill credentials in .env
-# Required: DIGITALOCEAN_TOKEN
-# Required: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_S3_BUCKET
-# Optional: AWS_S3_ENDPOINT for Spaces-compatible providers
-# Payload distribution always goes through S3 — nodes curl the tarball
-# from a presigned URL. The deploy path retries S3 uploads and falls back
-# to `aws s3 cp` if the AWS CLI is installed.
-
-# 3) Define miners (random regions)
-../target/release/kresko add --node-type miner --count 8 --region random
-
-# Optional: add a smaller proof node without memorizing provider-specific slugs
-../target/release/kresko add --node-type miner --count 1 --region random --low-resource
-
-# 4) Create cloud instances
-../target/release/kresko up -w 16
-
-# 5) Build payload (point to your local zebrad binary)
-../target/release/kresko genesis \
-  --zebrad-binary /path/to/zebrad \
-  --orchard-lanes-per-miner 384 \
-  --orchard-lane-value-zats 100000 \
-  --orchard-fanout-source-value-zats 500000 \
-  --orchard-fanout-outputs 4
-
-# 6) Deploy and start remote nodes (tmux session: app)
-../target/release/kresko deploy -w 16
-
-# 7) Check RPC health/sync
-../target/release/kresko status
+kresko run my-exp --name nyc-1 -- up --retry-failed
 ```
 
-## Experiment Directory Layout
+This re-polls the failed assets in place; healthy nodes are not touched.
 
-Created by `kresko init`:
+### Programmatic / automation use
 
-```text
-<experiment>/
-  .env
-  config.json
-  zebrad.toml
-  payload/
-  data/
-  scripts/
+For scripts that drive an experiment without going through the CLI, use
+the `open_run` context manager. It allocates a run dir, sets the
+`KRESKO_*` env vars for the duration of the block, and restores them on
+exit:
+
+```python
+from kresko_py import open_run
+from experiments.my_exp.run import build_experiment
+
+with open_run("my-exp", name="auto-001"):
+    exp = build_experiment()
+    up = exp.up()
+    if up["succeeded"]:
+        exp.deploy()
+        exp.run_tmux("smoke", "...", log_path="/root/smoke.log")
+        exp.collect(["/root/logs"])
+        exp.down()
 ```
 
-Generated later:
+## Debugging
 
-- `payload/local_genesis/*` (genesis artifacts, checkpoints, funded keys)
-- `payload/<node>/zebrad.toml` (per-node peer config + local testnet params)
-- `payload/build/zebrad` and `payload/build/kresko` (single remote runner for `txblast-local` and `mine`)
-- `payload.tar.gz` (cached payload archive)
-- `progress.log.jsonl` (from `kresko progress`)
+- The Rust binary's app runs in tmux session `app` on each node.
+- Tx blaster runs in tmux session `txblast`.
+- Remote logs: `/root/logs`, `/root/kresko-app.log`, `/root/kresko-txblast.log`.
+- Local logs: every run dir contains `stdout.log`, `stderr.log`,
+  `pyinfra.<stage>.{stdout,stderr}.log`, plus per-shell logs from
+  `experiment.shell()`.
 
-## Debugging Workflow (Non-DevOps Friendly)
-
-Kresko is designed so you can debug with simple SSH + logs:
-
-- Remote node app runs in tmux session `app`
-- Tx blaster runs in tmux session `txblast`
-- Remote logs:
-  - `/root/logs`
-  - `/root/kresko-app.log`
-  - `/root/kresko-txblast.log`
-
-Useful commands:
-
-```bash
-# Kill a session across active nodes
-kresko kill-session --session app
-kresko kill-session --session txblast
-
-# Download logs from all nodes into ./data/
-kresko download -n all -w 16
-
-# Download only peer_message structured traces
-kresko download -n all -w 16 traces -t peer_message
-
-# Download every file from each node's discovered trace directories
-kresko download -n all -w 16 traces
-
-# Download a canonical block height/time/size trace from selected miners,
-# using up to 16 concurrent RPC block fetches, 16-height batches,
-# async tip probing, failover between miners, and resume from any
-# existing data/heights.jsonl unless -f/--force is set
-kresko download -n 0,1,2 -w 16 heights -b 16
-```
-
-`scripts/network_diag.sh` is included for per-node RPC/network checks and can be run directly on a node.
-
-Documentation:
-
-- [`docs/trace-tables.md`](docs/trace-tables.md)
-- [`docs/public-txblast.md`](docs/public-txblast.md)
-- [`docs/mainnet-txblast-runbook.md`](docs/mainnet-txblast-runbook.md)
-
-## Command Reference
-
-- `init`: bootstrap experiment directory and provider-specific `.env`
-- `add`: append miner definitions to config (`--region random` and `--low-resource` supported)
-- `up`: create instances across the providers referenced by the experiment config
-- `sync-ips`: repopulate missing `public_ip` / `private_ip` fields in `config.json` from cloud provider state
-- `list`: list running kresko instances across the providers referenced by the experiment config
-- `genesis`: generate local genesis + payload
-- `deploy`: distribute payload via S3 (operator uploads to S3, nodes curl a presigned URL) and start nodes.
-  The S3 upload path retries and can fall back to the `aws` CLI. Override with:
-  `KRESKO_S3_UPLOAD_ATTEMPTS`, `KRESKO_S3_UPLOAD_RETRY_DELAY_SECS`, and `KRESKO_S3_UPLOAD_AWS_CLI_FALLBACK=0`.
-- `update`: upload a local `kresko` binary via S3 and atomically install it as `/usr/local/bin/kresko` on selected nodes, without changing payload, configs, sessions, or Zebra state.
-- `status`: query node RPC status/height/sync
-- `progress`: continuously call `generate` on miners
-- `txblast`: for local-genesis experiments, start remote tx blast (`transparent`, `shielded`, or `both`; shielded mode supports Orchard lane and fanout controls). For public-testnet/mainnet, use `txblast wallet|deposit|plan|prepare|run|withdraw|recover`.
-- `txblast-local`: local tx blast runner intended for remote execution
-- `download`: fetch logs from nodes
-- `download traces`: fetch every file from discovered remote trace directories by default, or a selected trace-table subset via `--tables`
-- `download heights`: collect one canonical per-block RPC trace into JSONL, with async tip probing, retry/fallback across selected nodes, and reuse of existing heights unless `--force` is set
-- `clear traces`: delete trace files from discovered remote trace directories without touching downloaded local `data/`
-- `upload-data`: upload collected `data/` to S3 prefix `<experiment>/data/`
-- `reset`: stop sessions and clean remote node state
-- `down`: destroy instances for this experiment
-- `down --all`: destroy all kresko-tagged/grouped instances across configured providers
-
-## Notes and Caveats
+## Notes and caveats
 
 - Experimental project: interfaces and behavior may change.
-- `down --all` is intentionally destructive. Use carefully.
-- Provider credentials are loaded from `.env` (current directory first, then experiment directory).
-- `workers` values must be greater than `0`.
-- Local-genesis shielded txblast uses the premine UTXO to create Orchard lane inventory, then replenishes width with fanout when ready lanes fall below the configured watermark.
-- Public-network txblast shields confirmed deposits into a control Orchard inventory, fans out shielded funds to per-node hot Orchard lanes, and stays shielded until withdrawal or recovery sweep. See [`docs/public-txblast.md`](docs/public-txblast.md).
+- Payload distribution always goes through S3. `experiment.deploy()`
+  uploads the payload tarball; nodes curl a presigned URL.
+- `~/.kresko/` is per-user-per-host. If you run from two machines,
+  `assets/` diverges until each runs `kresko sync`.
+- Provider credentials are loaded from `~/.kresko/.env`.
 
 ## License
 

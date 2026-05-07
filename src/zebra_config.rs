@@ -145,27 +145,6 @@ pub fn template_for(network_kind: NetworkKind) -> &'static str {
     }
 }
 
-pub fn set_post_blossom_pow_target_spacing(config: &str, spacing_secs: u32) -> Result<String> {
-    let mut result = String::new();
-    let mut replaced = false;
-
-    for line in config.lines() {
-        if line.trim().starts_with("post_blossom_pow_target_spacing") {
-            result.push_str(&format!("post_blossom_pow_target_spacing = {spacing_secs}"));
-            replaced = true;
-        } else {
-            result.push_str(line);
-        }
-        result.push('\n');
-    }
-
-    if !replaced {
-        anyhow::bail!("default zebrad.toml template is missing post_blossom_pow_target_spacing");
-    }
-
-    Ok(result)
-}
-
 pub fn testnet_toml_parameters(config: &str) -> Result<TestnetTomlParameters> {
     let parsed: toml::Value = toml::from_str(config).context("failed to parse zebrad.toml")?;
     let Some(testnet_params) = parsed
@@ -762,8 +741,8 @@ mod tests {
     use super::{
         DEFAULT_ZEBRAD_TOML, LocalTestnetParameters, MAINNET_ZEBRAD_TOML,
         PUBLIC_TESTNET_ZEBRAD_TOML, apply_local_testnet_parameters, ensure_miner_address_is_set,
-        generate_node_config, set_miner_address, set_post_blossom_pow_target_spacing,
-        testnet_toml_parameters, verify_local_testnet_parameters,
+        generate_node_config, set_miner_address, testnet_toml_parameters,
+        verify_local_testnet_parameters,
     };
     use crate::config::{DaaConfig, Instance, NetworkKind, NodeType, Provider};
     use zebra_chain::parameters::EquihashParams;
@@ -799,17 +778,6 @@ mod tests {
         assert_eq!(params.daa.pow_damping_factor, Some(4));
         assert_eq!(params.daa.pow_max_adjust_up_percent, Some(16));
         assert_eq!(params.daa.pow_max_adjust_down_percent, Some(32));
-    }
-
-    #[test]
-    fn block_time_override_updates_default_template_spacing() {
-        let config = set_post_blossom_pow_target_spacing(DEFAULT_ZEBRAD_TOML, 42)
-            .expect("default template has post blossom spacing");
-        let params = testnet_toml_parameters(&config).expect("updated template should parse");
-
-        assert_eq!(params.post_blossom_pow_target_spacing, Some(42));
-        assert_eq!(params.daa.pow_averaging_window, Some(51));
-        assert_eq!(params.daa.pow_median_block_span, Some(33));
     }
 
     #[test]

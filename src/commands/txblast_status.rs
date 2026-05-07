@@ -1,50 +1,9 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-
-use crate::config::{Config, resolve_value, select_instances, shellexpand};
-use crate::ssh;
-
-const REMOTE_STATUS_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TxblastNodeStatus {
-    pub name: String,
-    pub ip: String,
-    pub status: String,
-    pub ready: bool,
-    pub phase: Option<String>,
-    pub last_height: Option<u32>,
-    pub ready_height: Option<u32>,
-    pub ready_lanes: usize,
-    pub target_ready_lanes: usize,
-    pub reservoir_count: usize,
-    pub treasury_backlog: usize,
-    pub pending_total: usize,
-    pub pending_fanout: usize,
-    pub pending_reseed: usize,
-    pub within_pending_limits: bool,
-    pub last_timestamp: Option<String>,
-    pub age_secs: Option<i64>,
-    pub stall_reason: Option<String>,
-    pub trace_dir: String,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TxblastStatusReport {
-    pub nodes: Vec<TxblastNodeStatus>,
-    pub total: usize,
-    pub ready_nodes: usize,
-    pub not_ready_nodes: usize,
-    pub errored_nodes: usize,
-    pub all_ready: bool,
-    pub min_ready_height: Option<u32>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TxblastLocalStatus {
@@ -90,60 +49,6 @@ struct RegistryRecord {
     target_ready_lanes: usize,
 }
 
-pub async fn run(
-    instances: &str,
-    json: bool,
-    trace_dir: &str,
-    stall_secs: i64,
-    directory: &str,
-) -> Result<()> {
-    let report = query(instances, trace_dir, stall_secs, directory).await?;
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
-    }
-
-    if report.nodes.is_empty() {
-        println!("No matching txblast nodes found.");
-        return Ok(());
-    }
-
-    println!(
-        "{:<30} {:<18} {:<12} {:<8} {:<12} {:<11} {:<12}",
-        "Name", "IP", "Status", "Height", "Phase", "ReadyLanes", "Stall"
-    );
-    println!("{}", "-".repeat(110));
-
-    for node in &report.nodes {
-        let height = node
-            .last_height
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "N/A".to_owned());
-        let phase = node.phase.as_deref().unwrap_or("unknown");
-        let ready_lanes = format!("{}/{}", node.ready_lanes, node.target_ready_lanes);
-        let stall = node.stall_reason.as_deref().unwrap_or("-");
-        println!(
-            "{:<30} {:<18} {:<12} {:<8} {:<12} {:<11} {:<12}",
-            node.name, node.ip, node.status, height, phase, ready_lanes, stall
-        );
-    }
-
-    println!();
-    println!(
-        "ready={}/{} all_ready={} min_ready_height={}",
-        report.ready_nodes,
-        report.total,
-        report.all_ready,
-        report
-            .min_ready_height
-            .map(|height| height.to_string())
-            .unwrap_or_else(|| "N/A".to_owned())
-    );
-
-    Ok(())
-}
-
 pub fn run_local(json: bool, trace_dir: &str, stall_secs: i64) -> Result<()> {
     let status = query_local(trace_dir, stall_secs);
 
@@ -175,139 +80,6 @@ pub fn run_local(json: bool, trace_dir: &str, stall_secs: i64) -> Result<()> {
     println!("registry_path={}", status.registry_path);
 
     Ok(())
-}
-
-pub async fn query(
-    instances: &str,
-    trace_dir: &str,
-    stall_secs: i64,
-    directory: &str,
-) -> Result<TxblastStatusReport> {
-    let dir = Path::new(directory);
-    let config = Config::load(dir)?;
-    let key = resolve_value(None, "KRESKO_SSH_KEY_PATH", &config.ssh_key_path);
-    let key = shellexpand(&key);
-    let targets = select_instances(&config.miners, instances);
-
-    if targets.is_empty() {
-        return Ok(TxblastStatusReport {
-            nodes: Vec::new(),
-            total: 0,
-            ready_nodes: 0,
-            not_ready_nodes: 0,
-            errored_nodes: 0,
-            all_ready: false,
-            min_ready_height: None,
-        });
-    }
-
-    let futures = targets.iter().map(|inst| {
-        let name = inst.name.clone();
-        let ip = inst.public_ip.clone();
-        let key = key.clone();
-        let trace_dir = trace_dir.to_owned();
-        let local_command = format!(
-            "source /root/payload/vars.sh && kresko txblast-status-local --json --trace-dir {} --stall-secs {}",
-            shell_single_quote(&trace_dir), stall_secs,
-        );
-        let command = format!("bash -lc {}", shell_single_quote(&local_command));
-
-        async move {
-            match ssh::ssh_exec_timeout(
-                &ip,
-                &key,
-                &command,
-                REMOTE_STATUS_COMMAND_TIMEOUT,
-            )
-            .await
-            {
-                Ok(output) => match serde_json::from_str::<TxblastLocalStatus>(&output) {
-                    Ok(local) => TxblastNodeStatus {
-                        name,
-                        ip,
-                        status: local.status,
-                        ready: local.ready,
-                        phase: local.phase,
-                        last_height: local.last_height,
-                        ready_height: local.ready_height,
-                        ready_lanes: local.ready_lanes,
-                        target_ready_lanes: local.target_ready_lanes,
-                        reservoir_count: local.reservoir_count,
-                        treasury_backlog: local.treasury_backlog,
-                        pending_total: local.pending_total,
-                        pending_fanout: local.pending_fanout,
-                        pending_reseed: local.pending_reseed,
-                        within_pending_limits: local.within_pending_limits,
-                        last_timestamp: local.last_timestamp,
-                        age_secs: local.age_secs,
-                        stall_reason: local.stall_reason,
-                        trace_dir: local.trace_dir,
-                        error: local.error,
-                    },
-                    Err(error) => TxblastNodeStatus {
-                        name,
-                        ip,
-                        status: "error".to_owned(),
-                        ready: false,
-                        phase: None,
-                        last_height: None,
-                        ready_height: None,
-                        ready_lanes: 0,
-                        target_ready_lanes: 0,
-                        reservoir_count: 0,
-                        treasury_backlog: 0,
-                        pending_total: 0,
-                        pending_fanout: 0,
-                        pending_reseed: 0,
-                        within_pending_limits: false,
-                        last_timestamp: None,
-                        age_secs: None,
-                        stall_reason: Some("invalid_status_json".to_owned()),
-                        trace_dir,
-                        error: Some(format!("failed to parse remote status JSON: {error}")),
-                    },
-                },
-                Err(error) => TxblastNodeStatus {
-                    name,
-                    ip,
-                    status: "error".to_owned(),
-                    ready: false,
-                    phase: None,
-                    last_height: None,
-                    ready_height: None,
-                    ready_lanes: 0,
-                    target_ready_lanes: 0,
-                    reservoir_count: 0,
-                    treasury_backlog: 0,
-                    pending_total: 0,
-                    pending_fanout: 0,
-                    pending_reseed: 0,
-                    within_pending_limits: false,
-                    last_timestamp: None,
-                    age_secs: None,
-                    stall_reason: Some("remote_command_failed".to_owned()),
-                    trace_dir,
-                    error: Some(error.to_string()),
-                },
-            }
-        }
-    });
-
-    let nodes = join_all(futures).await;
-    let ready_nodes = nodes.iter().filter(|node| node.ready).count();
-    let errored_nodes = nodes.iter().filter(|node| node.status == "error").count();
-    let not_ready_nodes = nodes.len().saturating_sub(ready_nodes);
-    let min_ready_height = nodes.iter().filter_map(|node| node.ready_height).min();
-
-    Ok(TxblastStatusReport {
-        total: nodes.len(),
-        ready_nodes,
-        not_ready_nodes,
-        errored_nodes,
-        all_ready: !nodes.is_empty() && ready_nodes == nodes.len(),
-        min_ready_height,
-        nodes,
-    })
 }
 
 fn query_local(trace_dir: &str, stall_secs: i64) -> TxblastLocalStatus {
@@ -575,10 +347,6 @@ fn node_name() -> String {
                 .map(|value| value.trim().to_owned())
         })
         .unwrap_or_else(|| "unknown".to_owned())
-}
-
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(test)]

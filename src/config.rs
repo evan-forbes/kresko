@@ -212,28 +212,6 @@ pub fn default_tier() -> String {
 }
 
 impl Instance {
-    pub fn new_base(
-        node_type: NodeType,
-        provider: Provider,
-        slug: &str,
-        region: &str,
-        name: &str,
-        experiment: &str,
-        tier: &str,
-    ) -> Self {
-        Self {
-            node_type,
-            public_ip: "TBD".to_string(),
-            private_ip: "TBD".to_string(),
-            provider,
-            slug: slug.to_string(),
-            region: region.to_string(),
-            name: name.to_string(),
-            tags: vec!["kresko".to_string(), experiment_tag(experiment)],
-            tier: tier.to_string(),
-        }
-    }
-
     pub fn parsed_hostname(&self) -> String {
         let parts: Vec<&str> = self.name.split('-').collect();
         if parts.len() >= 2 {
@@ -241,31 +219,6 @@ impl Instance {
         } else {
             self.name.clone()
         }
-    }
-}
-
-pub fn experiment_tag(experiment: &str) -> String {
-    format!("kresko-{experiment}")
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct S3Config {
-    pub region: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub bucket_name: String,
-    pub endpoint: String,
-}
-
-impl S3Config {
-    pub fn from_env() -> Result<Self> {
-        Ok(Self {
-            region: std::env::var("AWS_DEFAULT_REGION").unwrap_or_else(|_| "us-east-1".into()),
-            access_key_id: require_env("AWS_ACCESS_KEY_ID")?,
-            secret_access_key: require_env("AWS_SECRET_ACCESS_KEY")?,
-            bucket_name: std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "kresko-data".into()),
-            endpoint: std::env::var("AWS_S3_ENDPOINT").unwrap_or_default(),
-        })
     }
 }
 
@@ -419,14 +372,6 @@ pub struct LocalGenesisActivationHeights {
     pub nu6_1: u32,
 }
 
-pub fn require_env(var: &str) -> Result<String> {
-    let val = std::env::var(var).unwrap_or_default();
-    if val.is_empty() {
-        anyhow::bail!("{var} is not set. Add it to your .env file.");
-    }
-    Ok(val)
-}
-
 impl Config {
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join("config.json");
@@ -484,37 +429,6 @@ impl Config {
             )
         }
     }
-}
-
-pub fn provider_configs(base: &Config) -> Vec<Config> {
-    let mut providers = Vec::new();
-
-    if base.miners.is_empty() {
-        providers.push(base.provider);
-    } else {
-        for instance in &base.miners {
-            if !providers.contains(&instance.provider) {
-                providers.push(instance.provider);
-            }
-        }
-    }
-
-    providers
-        .into_iter()
-        .map(|provider| {
-            let mut config = base.clone();
-            config.provider = provider;
-            if !base.miners.is_empty() {
-                config.miners = base
-                    .miners
-                    .iter()
-                    .filter(|instance| instance.provider == provider)
-                    .cloned()
-                    .collect();
-            }
-            config
-        })
-        .collect()
 }
 
 /// Resolve a value with priority: flag > env > config
@@ -635,76 +549,3 @@ mod tests {
     }
 }
 
-// Default instance shapes/images per provider
-/// DigitalOcean miner slugs in preference order. `add` walks this list per
-/// region and assigns the first slug the region actually carries, so we
-/// fall back to premium AMD / Intel variants when the basic Intel slug
-/// isn't stocked in that datacenter.
-pub const DO_FULL_MINER_SLUG_FALLBACKS: &[&str] =
-    &["s-8vcpu-16gb", "s-8vcpu-16gb-amd", "s-8vcpu-16gb-intel"];
-pub const DO_LOW_MINER_SLUG_FALLBACKS: &[&str] =
-    &["s-4vcpu-8gb", "s-4vcpu-8gb-amd", "s-4vcpu-8gb-intel"];
-pub const DO_PUBLIC_TESTNET_FULL_MINER_SLUG_FALLBACKS: &[&str] =
-    &["s-4vcpu-8gb", "s-4vcpu-8gb-amd", "s-4vcpu-8gb-intel"];
-pub const DO_MAINNET_FULL_MINER_SLUG_FALLBACKS: &[&str] = &["so-4vcpu-32gb"];
-pub const DO_DEFAULT_IMAGE: &str = "ubuntu-22-04-x64";
-pub const DO_REGIONS: &[&str] = &[
-    "nyc1", "nyc3", "tor1", "sfo2", "sfo3", "ams3", "sgp1", "lon1", "fra1", "syd1",
-];
-
-pub const GCP_DEFAULT_MACHINE: &str = "c3d-highcpu-8";
-pub const GCP_LOW_RESOURCE_MACHINE: &str = "c3d-highcpu-4";
-pub const GCP_DEFAULT_DISK_SIZE_GB: u64 = 40;
-pub fn gcp_disk_size_gb(network_kind: NetworkKind) -> u64 {
-    match network_kind {
-        NetworkKind::LocalGenesis => 40,
-        NetworkKind::PublicTestnet => 100,
-        NetworkKind::Mainnet => 500,
-    }
-}
-pub const GCP_REGIONS: &[&str] = &[
-    "us-central1",
-    "us-east1",
-    "us-east4",
-    "asia-southeast1",
-    "europe-west1",
-    "asia-east1",
-];
-
-pub const LINODE_DEFAULT_MINER_TYPE: &str = "g6-dedicated-8";
-pub const LINODE_LOW_RESOURCE_MINER_TYPE: &str = "g6-dedicated-4";
-pub const LINODE_DEFAULT_IMAGE: &str = "linode/ubuntu22.04";
-pub const LINODE_REGIONS: &[&str] = &[
-    "us-east",
-    "us-central",
-    "us-west",
-    "us-southeast",
-    "us-ord",
-    "us-iad",
-    "us-lax",
-    "us-mia",
-    "us-sea",
-    "ca-central",
-    "br-gru",
-    "eu-west",
-    "eu-central",
-    "gb-lon",
-    "fr-par",
-    "fr-par-2",
-    "de-fra-2",
-    "nl-ams",
-    "es-mad",
-    "it-mil",
-    "se-sto",
-    "ap-south",
-    "ap-west",
-    "ap-southeast",
-    "ap-northeast",
-    "in-maa",
-    "in-bom-2",
-    "jp-osa",
-    "jp-tyo-3",
-    "sg-sin-2",
-    "id-cgk",
-    "au-mel",
-];

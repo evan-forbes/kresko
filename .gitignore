@@ -1,6 +1,19 @@
 /target
 /build
 
+__pycache__/
+*.py[cod]
+.venv/
+.env
+**/.env
+
 # Locally generated premine cache. Each entry is keyed by
 # (target_difficulty_limit, block_time_secs); see src/premine.rs.
 /bootstrap/cache
+
+# Python orchestration prototype runtime state. These files can contain
+# provider IDs, public IPs, command output, and per-run logs.
+**/kresko/state.json
+**/kresko/runs/
+**/.kresko/state.json
+**/.kresko/runs/

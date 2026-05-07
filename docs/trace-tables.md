@@ -19,9 +19,9 @@ Kresko currently has two trace families:
 - Kresko txblast JSONL traces, written by `src/txblast/orchard/tracing.rs`
   into `KRESKO_TRACE_DIR`.
 
-`kresko download traces` will collect every file it finds in discovered trace
-directories. `kresko download traces --tables ...` currently has explicit names
-for:
+The Python orchestration layer's collect step (`kresko collect`) gathers
+every file it finds in discovered trace directories. Selectable trace tables
+currently include:
 
 - `peer_message`
 - `trace_dropped`
@@ -849,10 +849,6 @@ Called from:
 When a new trace table is added:
 
 1. Add it here with purpose, fields, provenance, and call sites.
-2. If it should be selectable by name in `kresko download traces --tables`,
-   update `TraceTable` in `src/commands/download.rs`.
-3. If it should always be preserved across deploy/bootstrap, make sure the
+2. If it should always be preserved across deploy/bootstrap, make sure the
    relevant `ZEBRA_*TRACE*` or `ZEBRA_*TRACING*` env var is still covered by the
-   generic env handling in:
-   `src/commands/genesis.rs`, `scripts/node_init.sh`, and
-   `src/commands/download.rs`.
+   generic env handling in `src/commands/genesis.rs` and `scripts/node_init.sh`.

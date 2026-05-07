@@ -3,36 +3,29 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use shardtree::store::memory::MemoryShardStore;
 use zcash_address::ZcashAddress;
 use zcash_transparent::address::TransparentAddress;
 use zebra_chain::serialization::ZcashDeserialize;
 
-use crate::config::{
-    Config, Instance, LocalGenesisFundedKey, MiningMode, OrchardTxblastConfig, resolve_value,
-    shellexpand,
-};
-use crate::ssh;
+use crate::config::{LocalGenesisFundedKey, OrchardTxblastConfig};
 use crate::txblast::orchard::{
     LaneRegistry, OrchardChainCursor, OrchardNullifierIndex, OrchardTree, OrchardTxblastTracer,
     PendingTxKind, PlannedOutput, RuntimePhase, TreasuryInventory,
     build_and_send_orchard_to_transparent_tx, build_and_send_shielding_tx, derive_orchard_keys,
-    latest_checkpoint_anchor, latest_witness, min_treasury_reseed_value,
-    orchard_to_transparent_fee, scan_block_range, shielding_fee,
+    latest_checkpoint_anchor, latest_witness, orchard_to_transparent_fee, scan_block_range,
+    shielding_fee,
 };
 use crate::txblast::rpc::{AddressUtxo, ZebraRpcClient};
 use crate::txblast::transparent::{FundedKey, load_funded_key};
 use crate::txblast::{OrchardBlastRuntimeConfig, TxblastNetworkParams, TxblastTraceConfig};
 
 const COINBASE_MATURITY: u32 = 100;
-const DEFAULT_CONFIRM_TIMEOUT_SECS: u64 = 600;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const FUNDING_MARKER_FILE: &str = "runtime_keys_funded.txid";
 const FUNDING_METADATA_FILE: &str = "runtime_keys_funded.json";
 const FUNDING_METADATA_SCHEMA: &str = "kresko.runtime_funding.v1";
-const REMOTE_VERIFY_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RuntimeFundingMetadata {
@@ -79,103 +72,12 @@ struct RuntimeFundingLocalStatus {
     error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct RuntimeFundingNodeStatus {
-    name: String,
-    ip: String,
-    status: RuntimeFundingLocalStatus,
-}
-
-#[derive(Debug, Clone)]
-struct RuntimeFundingVerificationReport {
-    operator: String,
-    expected_funding_txid: String,
-    expected_best_block_hash: Option<String>,
-    nodes: Vec<RuntimeFundingNodeStatus>,
-}
-
 #[derive(Debug, Clone, Default)]
 struct RecipientState {
     spendable_non_coinbase_utxo_count: usize,
     spendable_non_coinbase_balance_zats: u64,
     immature_coinbase_utxo_count: usize,
     immature_coinbase_balance_zats: u64,
-}
-
-pub async fn run(directory: &str) -> Result<()> {
-    let dir = Path::new(directory);
-    let config = Config::load(dir)?;
-    config.require_local_genesis("fund-runtime-keys")?;
-    let local_genesis = config
-        .local_genesis
-        .as_ref()
-        .context("missing local_genesis config; run 'kresko genesis' first")?;
-
-    if config.mining_mode != MiningMode::Pow {
-        println!("Runtime funding skipped: mining mode is not PoW.");
-        return Ok(());
-    }
-    if local_genesis.bootstrap_treasury_key.is_none() {
-        println!("Runtime funding skipped: no treasury key attached to local genesis config.");
-        return Ok(());
-    }
-
-    let runtime = OrchardBlastRuntimeConfig::from_parts(
-        config.orchard_txblast.clone(),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )?;
-    let minimum_recipient_zats = min_treasury_reseed_value(&runtime);
-
-    let key = resolve_value(None, "KRESKO_SSH_KEY_PATH", &config.ssh_key_path);
-    let key = shellexpand(&key);
-    let operator = config
-        .miners
-        .iter()
-        .find(|inst| inst.public_ip != "TBD")
-        .context("no active miners with assigned IPs")?;
-
-    println!(
-        "Funding runtime keys from cached treasury via {} (minimum per recipient: {} zats)...",
-        operator.name, minimum_recipient_zats
-    );
-
-    let remote_command = format!(
-        "bash -lc 'source /root/payload/vars.sh && kresko fund-runtime-keys-local \
-            --rpc-endpoint http://localhost:${{KRESKO_RPC_PORT:-18232}} \
-            --local-genesis-dir /root/payload/local_genesis \
-            --minimum-recipient-zats {minimum_recipient_zats} \
-            --confirm-timeout-secs {DEFAULT_CONFIRM_TIMEOUT_SECS}'"
-    );
-    let output = ssh::ssh_exec_timeout(
-        &operator.public_ip,
-        &key,
-        &remote_command,
-        Duration::from_secs(DEFAULT_CONFIRM_TIMEOUT_SECS + 60),
-    )
-    .await?;
-
-    if !output.trim().is_empty() {
-        print!("{output}");
-    }
-
-    let verification =
-        verify_network_runtime_funding(&config.miners, operator, &key, minimum_recipient_zats)
-            .await?;
-    print_runtime_funding_verification(&verification);
-
-    if !runtime_funding_verification_ready(&verification) {
-        anyhow::bail!(
-            "runtime funding is confirmed on {} but not yet visible as the required confirmed non-coinbase transparent UTXO on every miner",
-            operator.name,
-        );
-    }
-
-    Ok(())
 }
 
 pub async fn run_local(
@@ -212,24 +114,6 @@ pub async fn run_local(
     }
 
     Ok(())
-}
-
-pub async fn expected_funding_txid(directory: &str) -> Result<Option<String>> {
-    let dir = Path::new(directory);
-    let config = Config::load(dir)?;
-    config.require_local_genesis("fund-runtime-keys")?;
-    let key = resolve_value(None, "KRESKO_SSH_KEY_PATH", &config.ssh_key_path);
-    let key = shellexpand(&key);
-    let operator = config
-        .miners
-        .iter()
-        .find(|inst| inst.public_ip != "TBD")
-        .context("no active miners with assigned IPs")?;
-
-    let status = query_runtime_funding_node(operator, &key, minimum_recipient_zats(&config)?, None)
-        .await?
-        .status;
-    Ok(status.observed_funding_txid)
 }
 
 pub async fn ensure_local_runtime_funding(
@@ -817,142 +701,6 @@ fn runtime_funding_stall_reason(
     }
 }
 
-async fn verify_network_runtime_funding(
-    miners: &[Instance],
-    operator: &Instance,
-    ssh_key: &str,
-    minimum_recipient_zats: u64,
-) -> Result<RuntimeFundingVerificationReport> {
-    let operator_status =
-        query_runtime_funding_node(operator, ssh_key, minimum_recipient_zats, None).await?;
-    let expected_best_height = operator_status.status.best_height;
-    let expected_funding_txid = operator_status
-        .status
-        .observed_funding_txid
-        .clone()
-        .context("operator did not record runtime funding txid after successful funding")?;
-    let expected_best_block_hash = operator_status.status.best_block_hash.clone();
-
-    let futures = miners.iter().map(|miner| {
-        query_runtime_funding_node(
-            miner,
-            ssh_key,
-            minimum_recipient_zats,
-            Some(expected_funding_txid.as_str()),
-        )
-    });
-    let mut nodes = join_all(futures)
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
-
-    for node in &mut nodes {
-        if node.status.ready
-            && node_is_best_chain_diverged(
-                expected_best_height,
-                expected_best_block_hash.as_deref(),
-                &node.status,
-            )
-        {
-            node.status.ready = false;
-            node.status.stall_reason = Some("best_chain_diverged".to_owned());
-        }
-    }
-
-    Ok(RuntimeFundingVerificationReport {
-        operator: operator.name.clone(),
-        expected_funding_txid,
-        expected_best_block_hash,
-        nodes,
-    })
-}
-
-async fn query_runtime_funding_node(
-    inst: &Instance,
-    ssh_key: &str,
-    minimum_recipient_zats: u64,
-    expected_funding_txid: Option<&str>,
-) -> Result<RuntimeFundingNodeStatus> {
-    let local_command = format!(
-        "source /root/payload/vars.sh && kresko fund-runtime-keys-local \
-         --rpc-endpoint http://localhost:${{KRESKO_RPC_PORT:-18232}} \
-         --local-genesis-dir /root/payload/local_genesis \
-         --minimum-recipient-zats {minimum_recipient_zats} \
-         --verify-only \
-         --json{}",
-        expected_funding_txid
-            .map(|txid| format!(" --expected-funding-txid {}", shell_single_quote(txid)))
-            .unwrap_or_default(),
-    );
-    let command = format!("bash -lc {}", shell_single_quote(&local_command));
-    let output = ssh::ssh_exec_timeout(&inst.public_ip, ssh_key, &command, REMOTE_VERIFY_TIMEOUT)
-        .await
-        .with_context(|| format!("runtime funding query failed on {}", inst.name))?;
-    let status = serde_json::from_str::<RuntimeFundingLocalStatus>(&output)
-        .with_context(|| format!("failed to parse runtime funding status on {}", inst.name))?;
-
-    Ok(RuntimeFundingNodeStatus {
-        name: inst.name.clone(),
-        ip: inst.public_ip.clone(),
-        status,
-    })
-}
-
-fn runtime_funding_verification_ready(report: &RuntimeFundingVerificationReport) -> bool {
-    report.nodes.iter().all(|node| node.status.ready)
-}
-
-fn node_is_best_chain_diverged(
-    expected_best_height: Option<u32>,
-    expected_best_block_hash: Option<&str>,
-    status: &RuntimeFundingLocalStatus,
-) -> bool {
-    matches!(
-        (
-            expected_best_height,
-            expected_best_block_hash,
-            status.best_height,
-            status.best_block_hash.as_deref(),
-        ),
-        (Some(expected_height), Some(expected_hash), Some(node_height), Some(node_hash))
-            if node_height == expected_height && node_hash != expected_hash
-    )
-}
-
-fn print_runtime_funding_verification(report: &RuntimeFundingVerificationReport) {
-    println!(
-        "[fund-runtime-keys] verifying network-wide visibility for funding tx {} (operator={}, tip={})",
-        report.expected_funding_txid,
-        report.operator,
-        report
-            .expected_best_block_hash
-            .as_deref()
-            .unwrap_or("unknown"),
-    );
-    println!(
-        "{:<24} {:<16} {:<8} {:<18} {:<18} {:<12}",
-        "Name", "IP", "Ready", "Height", "NonCoinbase", "Reason"
-    );
-    for node in &report.nodes {
-        println!(
-            "{:<24} {:<16} {:<8} {:<18} {:<18} {:<12}",
-            node.name,
-            node.ip,
-            if node.status.ready { "yes" } else { "no" },
-            node.status
-                .best_height
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "N/A".to_owned()),
-            format!(
-                "{}/{}",
-                node.status.spendable_non_coinbase_utxo_count,
-                node.status.spendable_non_coinbase_balance_zats
-            ),
-            node.status.stall_reason.as_deref().unwrap_or("-"),
-        );
-    }
-}
-
 fn print_runtime_funding_local_status(status: &RuntimeFundingLocalStatus) {
     println!(
         "node={} funded_key={} address={} ready={} height={} balance_non_coinbase={} utxos_non_coinbase={} funding_tx_visible={} funding_tx_confirmed={} stall_reason={}",
@@ -981,19 +729,6 @@ fn print_runtime_funding_local_status(status: &RuntimeFundingLocalStatus) {
     }
 }
 
-fn minimum_recipient_zats(config: &Config) -> Result<u64> {
-    let runtime = OrchardBlastRuntimeConfig::from_parts(
-        config.orchard_txblast.clone(),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )?;
-    Ok(min_treasury_reseed_value(&runtime))
-}
-
 fn node_name() -> String {
     std::env::var("HOSTNAME")
         .ok()
@@ -1004,10 +739,6 @@ fn node_name() -> String {
                 .map(|value| value.trim().to_owned())
         })
         .unwrap_or_else(|| "unknown".to_owned())
-}
-
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 async fn select_spendable_treasury_utxo(
@@ -1139,69 +870,3 @@ async fn is_coinbase_transaction(
     Ok(is_coinbase)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn does_not_flag_best_chain_divergence_when_node_is_ahead() {
-        let status = RuntimeFundingLocalStatus {
-            node: "miner-1".to_owned(),
-            funded_key_name: "miner-1".to_owned(),
-            funded_address: "tmTest".to_owned(),
-            minimum_recipient_zats: 1,
-            best_height: Some(312),
-            best_block_hash: Some("hash-312".to_owned()),
-            observed_funding_txid: Some("funding".to_owned()),
-            expected_funding_txid: Some("funding".to_owned()),
-            funding_tx_visible: true,
-            funding_tx_confirmed: true,
-            funding_tx_confirmations: Some(1),
-            funding_tx_blockhash: Some("funding-block".to_owned()),
-            spendable_non_coinbase_utxo_count: 1,
-            spendable_non_coinbase_balance_zats: 10,
-            immature_coinbase_utxo_count: 0,
-            immature_coinbase_balance_zats: 0,
-            ready: true,
-            stall_reason: None,
-            error: None,
-        };
-
-        assert!(!node_is_best_chain_diverged(
-            Some(311),
-            Some("hash-311"),
-            &status
-        ));
-    }
-
-    #[test]
-    fn flags_best_chain_divergence_when_same_height_hash_differs() {
-        let status = RuntimeFundingLocalStatus {
-            node: "miner-1".to_owned(),
-            funded_key_name: "miner-1".to_owned(),
-            funded_address: "tmTest".to_owned(),
-            minimum_recipient_zats: 1,
-            best_height: Some(311),
-            best_block_hash: Some("different-hash".to_owned()),
-            observed_funding_txid: Some("funding".to_owned()),
-            expected_funding_txid: Some("funding".to_owned()),
-            funding_tx_visible: true,
-            funding_tx_confirmed: true,
-            funding_tx_confirmations: Some(1),
-            funding_tx_blockhash: Some("funding-block".to_owned()),
-            spendable_non_coinbase_utxo_count: 1,
-            spendable_non_coinbase_balance_zats: 10,
-            immature_coinbase_utxo_count: 0,
-            immature_coinbase_balance_zats: 0,
-            ready: true,
-            stall_reason: None,
-            error: None,
-        };
-
-        assert!(node_is_best_chain_diverged(
-            Some(311),
-            Some("hash-311"),
-            &status
-        ));
-    }
-}
