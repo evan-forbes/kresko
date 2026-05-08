@@ -70,22 +70,8 @@ KRESKO_P2P_PORT="${KRESKO_P2P_PORT:-18233}"
 KRESKO_NETWORK_KIND="${KRESKO_NETWORK_KIND:-local-genesis}"
 KRESKO_MINING_MODE="${KRESKO_MINING_MODE:-generate}"
 KRESKO_FRESH_STATE="${KRESKO_FRESH_STATE:-1}"
-KRESKO_RPC_URL="http://127.0.0.1:${KRESKO_RPC_PORT}"
-
-# Zebra's config parser reads all ZEBRA_* env vars and rejects unknown ones.
-# Save all tracing env vars and unset them so config parsing succeeds.
-# They'll be re-exported just before launching zebrad.
-declare -a _SAVED_ZEBRA_TRACE_NAMES=()
-declare -a _SAVED_ZEBRA_TRACE_VALUES=()
-for _kresko_var_name in ${!ZEBRA@}; do
-    case "$_kresko_var_name" in
-        ZEBRA_*TRACE*|ZEBRA_*TRACING*)
-            _SAVED_ZEBRA_TRACE_NAMES+=("$_kresko_var_name")
-            _SAVED_ZEBRA_TRACE_VALUES+=("${!_kresko_var_name}")
-            unset "$_kresko_var_name"
-            ;;
-    esac
-done
+export KRESKO_RPC_URL="http://127.0.0.1:${KRESKO_RPC_PORT}"
+export KRESKO_RPC_PORT
 
 cd $HOME
 hostname=$(hostname)
@@ -127,6 +113,15 @@ fi
 BOOTSTRAP_CONFIG="/root/.config/zebrad.bootstrap.toml"
 prepare_bootstrap_config() {
     awk '
+        function starts_multiline_array(line) {
+            return line ~ /=.*\[/ && line !~ /\]/
+        }
+        skip_array_tail {
+            if ($0 ~ /^[[:space:]]*\]/) {
+                skip_array_tail = 0
+            }
+            next
+        }
         $0 ~ /^\[network\]$/ {
             in_network = 1
             print
@@ -141,10 +136,16 @@ prepare_bootstrap_config() {
         }
         in_network && $0 ~ /^[[:space:]]*initial_testnet_peers[[:space:]]*=/ {
             print "initial_testnet_peers = []"
+            if (starts_multiline_array($0)) {
+                skip_array_tail = 1
+            }
             next
         }
         in_network && $0 ~ /^[[:space:]]*initial_mainnet_peers[[:space:]]*=/ {
             print "initial_mainnet_peers = []"
+            if (starts_multiline_array($0)) {
+                skip_array_tail = 1
+            }
             next
         }
         { print }
@@ -445,6 +446,7 @@ echo "=== Node: $parsed_hostname ==="
 # The miner runs in a separate tmux session so it can be managed independently.
 if [ "${KRESKO_MINING_MODE:-generate}" = "pow" ] && command -v kresko >/dev/null 2>&1; then
     echo "=== Scheduling PoW miner (will start after RPC is ready) ==="
+    : > /root/kresko-mine.log
     cat > /root/kresko-mine-wait.sh <<'MINER_SCRIPT'
 #!/bin/bash
 # Wait for zebrad RPC to become available before starting the miner.
@@ -462,33 +464,15 @@ done
 echo "=== RPC not ready after 240s, miner not started ==="
 MINER_SCRIPT
     chmod +x /root/kresko-mine-wait.sh
+    tmux set-environment -g KRESKO_RPC_URL "$KRESKO_RPC_URL"
+    tmux set-environment -g KRESKO_RPC_PORT "$KRESKO_RPC_PORT"
     tmux new-session -d -s mine "bash -lc 'bash /root/kresko-mine-wait.sh 2>&1 | tee -a /root/kresko-mine.log; exec bash -i'"
 fi
 
 echo "=== Starting zebrad ==="
 
-# Re-export tracing env vars now that config parsing is done.
-# zebra tracing modules read these directly via std::env::var().
-for _kresko_idx in "${!_SAVED_ZEBRA_TRACE_NAMES[@]}"; do
-    _kresko_var_name="${_SAVED_ZEBRA_TRACE_NAMES[$_kresko_idx]}"
-    _kresko_var_value="${_SAVED_ZEBRA_TRACE_VALUES[$_kresko_idx]}"
-    export "$_kresko_var_name=$_kresko_var_value"
-
-    case "$_kresko_var_name" in
-        ZEBRA_*TRACE*_DIR|ZEBRA_*TRACING*_DIR)
-            if [ -n "$_kresko_var_value" ]; then
-                mkdir -p "$_kresko_var_value"
-            fi
-            ;;
-        ZEBRA_*TRACE*_FILE|ZEBRA_*TRACING*_FILE)
-            if [ -n "$_kresko_var_value" ]; then
-                mkdir -p "$(dirname "$_kresko_var_value")/traces"
-            fi
-            ;;
-    esac
-done
-
-LOG_FILE="/root/logs"
+mkdir -p /root/logs
+LOG_FILE="/root/logs/zebrad.log"
 zebrad -c /root/.config/zebrad.toml start 2>&1 | tee -a "$LOG_FILE"
 zebrad_exit=${PIPESTATUS[0]}
 

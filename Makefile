@@ -1,6 +1,6 @@
 PREFIX ?= $(HOME)/.local
-UBUNTU_TARGET = x86_64-unknown-linux-musl
-ZEBRA_DIR ?= ../zebra
+NU7_ZEBRA_ROOT ?= ../nu7-testnet
+ZEBRA_ROOT ?= ../zebra
 
 .PHONY: build install uninstall clean txblast ubuntu
 
@@ -12,10 +12,7 @@ txblast:
 	@$(MAKE) ubuntu
 
 ubuntu:
-	cargo build --release --target $(UBUNTU_TARGET)
-	mkdir -p target/ubuntu
-	rm -f target/ubuntu/txblast
-	cp target/$(UBUNTU_TARGET)/release/kresko target/ubuntu/kresko
+	NU7_ZEBRA_ROOT="$(NU7_ZEBRA_ROOT)" ZEBRA_ROOT="$(ZEBRA_ROOT)" ./scripts/build-ubuntu.sh --kresko-only --output-dir target/ubuntu
 
 install: build
 	install -d $(DESTDIR)$(PREFIX)/bin

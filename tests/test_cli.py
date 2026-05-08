@@ -28,7 +28,7 @@ def make_asset(home, **overrides):
         "run": "smoke",
         "public_ip": "203.0.113.1",
         "status": "active",
-        "tags": ["kresko", "kresko-exp-smoke", "kresko-role-miner", "kresko-run-smoke"],
+        "tags": ["kresko", "experiment-smoke", "role-miner", "run-smoke"],
     }
     base.update(overrides)
     assets.write_asset(base)
@@ -41,10 +41,10 @@ def test_assets_list_filters_by_tag(home, capsys):
         provider_id="2",
         name="rpc-0",
         role="rpc",
-        tags=["kresko", "kresko-exp-smoke", "kresko-role-rpc", "kresko-run-smoke"],
+        tags=["kresko", "experiment-smoke", "role-rpc", "run-smoke"],
     )
 
-    rc = main(["assets", "list", "--tag", "kresko-role-miner"])
+    rc = main(["assets", "list", "--tag", "role-miner"])
     captured = capsys.readouterr()
 
     assert rc == 0
@@ -165,14 +165,76 @@ def test_run_executes_copied_run_py(home, capsys):
         encoding="utf-8",
     )
 
-    rc = main(["run", "hello"])
+    rc = main(["run", "hello", "--run-name", "smoke-1", "--python", sys.executable])
     captured = capsys.readouterr()
 
     assert rc == 0, captured.err
     line = next(line for line in captured.out.splitlines() if line.startswith("{"))
     parsed = json.loads(line)
-    assert parsed == {"experiment": "hello", "run_name": "hello", "cwd_is_run_dir": True}
+    assert parsed == {"experiment": "hello", "run_name": "smoke-1", "cwd_is_run_dir": True}
 
     # Output is also tee'd into the run dir.
-    run_dir = paths.run_dir("hello", "hello")
+    run_dir = paths.run_dir("hello", "smoke-1")
     assert (run_dir / "stdout.log").read_text().strip().startswith("{")
+
+
+def test_run_default_name_is_short_timestamped_slug(home, capsys):
+    src = paths.experiment_dir("hello")
+    src.mkdir(parents=True)
+    (src / "run.py").write_text("print('ok')\n", encoding="utf-8")
+
+    rc = main(["run", "hello", "--python", sys.executable])
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+
+    runs = list(paths.experiment_runs_dir("hello").iterdir())
+    assert len(runs) == 1
+    name = runs[0].name
+    # r-YYYYmmdd-HHMMSS — much shorter than the experiment name when the
+    # experiment slug is long.
+    assert name.startswith("r-") and len(name) == len("r-20260507-141502")
+
+
+def test_build_run_command_defaults_to_uv_run(monkeypatch, tmp_path):
+    from kresko_py.cli import _build_run_command
+
+    monkeypatch.setattr("kresko_py.cli._kresko_project_root", lambda: tmp_path)
+    monkeypatch.setattr("kresko_py.cli._which", lambda name: f"/usr/bin/{name}")
+
+    cmd = _build_run_command(None, tmp_path / "run.py", ["launch"])
+
+    assert cmd[:2] == ["uv", "run"]
+    assert "--project" in cmd
+    assert cmd[-2:] == [str(tmp_path / "run.py"), "launch"]
+
+
+def test_build_run_command_falls_back_when_uv_missing(monkeypatch, tmp_path):
+    from kresko_py.cli import _build_run_command
+
+    monkeypatch.setattr("kresko_py.cli._kresko_project_root", lambda: tmp_path)
+    monkeypatch.setattr("kresko_py.cli._which", lambda name: None)
+
+    cmd = _build_run_command(None, tmp_path / "run.py", [])
+
+    assert cmd[0] == sys.executable
+
+
+def test_build_run_command_explicit_python_skips_uv(tmp_path):
+    from kresko_py.cli import _build_run_command
+
+    cmd = _build_run_command("/custom/python", tmp_path / "run.py", ["a"])
+
+    assert cmd == ["/custom/python", str(tmp_path / "run.py"), "a"]
+
+
+def test_run_requires_double_dash_before_forwarded_args(home, capsys):
+    src = paths.experiment_dir("hello")
+    src.mkdir(parents=True)
+    (src / "run.py").write_text("print('ran')\n", encoding="utf-8")
+
+    # Forwarded args without `--` should error so `kresko run hello --name foo`
+    # cannot silently capture --name as a node filter or run dir name.
+    with pytest.raises(SystemExit):
+        main(["run", "hello", "--name", "foo", "launch"])
+    err = capsys.readouterr().err
+    assert "--" in err

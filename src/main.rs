@@ -2,7 +2,6 @@ mod commands;
 mod config;
 mod pow_sim;
 mod pow_tuning;
-mod premine;
 mod ssh;
 mod tmux;
 mod txblast;
@@ -53,9 +52,8 @@ enum Commands {
         #[arg(long, default_value = "build")]
         build_dir: String,
 
-        /// Extra empty local-genesis blocks to seed after funding blocks so premine outputs mature.
-        /// Only used by the non-PoW genesis path; the PoW path uses the cached premine bundle's
-        /// own fixed padding (see `src/premine.rs::MATURITY_PADDING_BLOCKS`).
+        /// Extra empty local-genesis blocks to seed after funding blocks so generated outputs mature.
+        /// The PoW path uses real solved seed blocks and currently keeps this at zero.
         #[arg(long, default_value_t = 125)]
         maturity_padding_blocks: u32,
 
@@ -127,6 +125,29 @@ enum Commands {
         command: TxblastCommand,
 
         /// Experiment directory
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
+    /// Show node height and RPC health across an experiment or run directory
+    Status {
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Print only aggregate height buckets
+        #[arg(long)]
+        summary: bool,
+
+        /// Also check SSH, local RPC, tmux sessions, and recent logs
+        #[arg(long)]
+        deep: bool,
+
+        /// SSH private key path for deep checks
+        #[arg(long)]
+        ssh_key_path: Option<String>,
+
+        /// Experiment or run directory
         #[arg(short = 'd', long, default_value = ".")]
         directory: String,
     },
@@ -706,6 +727,7 @@ impl Commands {
             | Commands::TxblastStatusLocal { .. } => None,
             Commands::Genesis { directory, .. }
             | Commands::GenesisPublic { directory, .. }
+            | Commands::Status { directory, .. }
             | Commands::Txblast { directory, .. } => Some(directory),
         }
     }
@@ -1044,6 +1066,15 @@ async fn main() -> Result<()> {
         }
         Commands::Txblast { command, directory } => {
             run_txblast_command(command, &directory).await?;
+        }
+        Commands::Status {
+            json,
+            summary,
+            deep,
+            ssh_key_path,
+            directory,
+        } => {
+            commands::status::run(json, summary, deep, ssh_key_path.as_deref(), &directory).await?;
         }
         Commands::Mine {
             rpc_endpoint,

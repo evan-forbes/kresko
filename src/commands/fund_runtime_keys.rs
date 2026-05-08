@@ -869,4 +869,3 @@ async fn is_coinbase_transaction(
     coinbase_cache.insert(txid.to_owned(), is_coinbase);
     Ok(is_coinbase)
 }
-

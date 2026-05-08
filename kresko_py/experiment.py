@@ -37,6 +37,7 @@ from kresko_py.digitalocean import (
     destroy_tagged_droplets,
     experiment_tag,
     reconcile_droplets,
+    run_tag,
 )
 from kresko_py.env import load_experiment_env
 from kresko_py.inventory import write_pyinfra_inventory
@@ -110,7 +111,7 @@ def node_type(
 def run_pyinfra(
     inventory: Path, deploy_file: Path, dry_run: bool = False
 ) -> subprocess.CompletedProcess[str]:
-    cmd = ["pyinfra", str(inventory), str(deploy_file)]
+    cmd = ["pyinfra", "-y", str(inventory), str(deploy_file)]
     if dry_run:
         cmd.append("--dry")
     return subprocess.run(cmd, text=True, capture_output=True, check=False)
@@ -142,7 +143,7 @@ class Experiment:
         self.tags = list(tags or [])
         self.ssh = {
             "user": "root",
-            "key_path": "~/.ssh/id_ed25519",
+            "key_path": "",
             "public_key_path": "~/.ssh/id_ed25519.pub",
             "key_name": "",
             **(ssh or {}),
@@ -231,6 +232,13 @@ class Experiment:
     def assets(self) -> list[dict[str, Any]]:
         return assets_store.list_assets(tags=[self.experiment_tag_value])
 
+    def run_assets(self) -> list[dict[str, Any]]:
+        return [
+            asset
+            for asset in self.assets()
+            if asset.get("run") == self.run_name
+        ]
+
     def shell(
         self,
         cmd: list[str] | str,
@@ -295,7 +303,7 @@ class Experiment:
                 retry_failed=retry_failed,
             )
             if not dry_run:
-                for asset in self.assets():
+                for asset in self.run_assets():
                     write_node_snapshot(self.run_dir, asset)
             requested = sum(count for _, count in self._node_specs)
             failed = list(plan.get("failed", []))
@@ -452,9 +460,12 @@ class Experiment:
                 destroyed = destroy_tagged_droplets(force_tag, client, dry_run=dry_run)
             else:
                 destroyed = destroy_assets(
-                    self.assets(),
+                    self.run_assets(),
                     client,
-                    required_tag=self.experiment_tag_value,
+                    required_tags=[
+                        self.experiment_tag_value,
+                        run_tag(self.run_name),
+                    ],
                     dry_run=dry_run,
                 )
             return self._success_result(

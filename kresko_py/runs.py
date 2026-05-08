@@ -29,8 +29,14 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def default_run_slug(now: datetime | None = None) -> str:
+    """Short timestamped slug like `r-20260507-141502` (UTC)."""
+    moment = (now or datetime.now(timezone.utc)).strftime("%Y%m%d-%H%M%S")
+    return f"r-{moment}"
+
+
 def resolve_run_name(experiment: str, name: str | None = None) -> str:
-    base = name or experiment
+    base = name or default_run_slug()
     paths.validate_slug(base, kind="run")
     runs_root = paths.experiment_runs_dir(experiment)
     if not (runs_root / base).exists():

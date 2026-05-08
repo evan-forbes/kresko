@@ -2,16 +2,20 @@
 
 Top-level `kresko` subcommands::
 
-    kresko run <experiment> [--name <slug>] -- [args...]
+    kresko run <experiment> [--run-name <slug>] -- [args...]
     kresko sync
     kresko assets list [--tag tag] [--provider name]
     kresko assets show <provider> <provider_id>
     kresko runs list <experiment>
     kresko runs show <experiment> <run-name>
 
-`kresko run` allocates a new run dir under `~/.kresko/runs/<exp>/<name>/`,
+`kresko run` allocates a new run dir under `~/.kresko/runs/<exp>/<run-name>/`,
 copies `~/.kresko/experiments/<exp>/` into it, and executes the copied
 `run.py` with `KRESKO_EXPERIMENT` / `KRESKO_RUN_NAME` / `KRESKO_RUN_DIR` set.
+
+A literal `--` is required before any args forwarded to `run.py`. This
+prevents `--name` (an experiment-level node filter) from being silently
+swallowed as a run dir name.
 
 Per-experiment scripts use `run_experiment()` for the standard lifecycle
 verbs (plan/up/deploy/down/collect) plus any experiment-specific actions::
@@ -51,18 +55,35 @@ DEFAULT_ACTIONS = ("plan", "up", "deploy", "run", "collect", "down")
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = list(argv)
+    forwarded: list[str] = []
+    if argv and argv[0] == "run" and "--" in argv:
+        idx = argv.index("--")
+        forwarded = argv[idx + 1 :]
+        argv = argv[:idx]
+
     parser = argparse.ArgumentParser(prog="kresko", description="Kresko orchestration CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_run = sub.add_parser("run", help="Run an experiment in a fresh run dir")
     p_run.add_argument("experiment", help="experiment name (matches ~/.kresko/experiments/<exp>/)")
-    p_run.add_argument("--name", help="run name slug (defaults to experiment name)")
+    p_run.add_argument(
+        "-n",
+        "--run-name",
+        dest="run_name",
+        help="run dir slug (defaults to a short timestamped slug)",
+    )
     p_run.add_argument(
         "--python",
-        default=sys.executable,
-        help="python interpreter used to launch run.py (default: current)",
+        default=None,
+        help=(
+            "python interpreter used to launch run.py. Defaults to "
+            "`uv run python` from the kresko_py project root so pyinfra and "
+            "other deps are present. Pass an explicit path to bypass uv."
+        ),
     )
-    p_run.add_argument("args", nargs=argparse.REMAINDER, help="extra args passed to run.py")
 
     sub.add_parser("sync", help="Refresh ~/.kresko/assets/ from the cloud")
 
@@ -83,10 +104,18 @@ def main(argv: list[str] | None = None) -> int:
     p_runs_show.add_argument("experiment")
     p_runs_show.add_argument("run_name")
 
-    args = parser.parse_args(argv)
+    args, leftover = parser.parse_known_args(argv)
+    if leftover:
+        if args.command == "run":
+            parser.error(
+                f"unrecognized args after experiment: {' '.join(leftover)}\n"
+                f"forward args to run.py with a literal `--`: "
+                f"kresko run {args.experiment} -- {' '.join(leftover)}"
+            )
+        parser.error(f"unrecognized arguments: {' '.join(leftover)}")
 
     if args.command == "run":
-        return cmd_run(args)
+        return cmd_run(args, forwarded)
     if args.command == "sync":
         return cmd_sync(args)
     if args.command == "assets":
@@ -97,15 +126,15 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-def cmd_run(args: argparse.Namespace) -> int:
+def cmd_run(args: argparse.Namespace, forwarded: list[str]) -> int:
     paths.ensure_home()
-    load_experiment_env(paths.kresko_home())
+    load_experiment_env(
+        experiment_root=paths.experiment_dir(args.experiment),
+        repo_root=paths.kresko_home(),
+    )
 
-    extra = list(args.args or [])
-    if extra and extra[0] == "--":
-        extra = extra[1:]
-
-    run_path = start_run(args.experiment, name=args.name, argv=[args.experiment, *extra])
+    extra = list(forwarded)
+    run_path = start_run(args.experiment, name=args.run_name, argv=[args.experiment, *extra])
     run_py = run_path / "run.py"
     if not run_py.exists():
         print(f"error: {run_py} does not exist (experiment must include run.py)", file=sys.stderr)
@@ -118,7 +147,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         ENV_RUN_DIR: str(run_path),
     }
     print(f"run dir: {run_path}", file=sys.stderr)
-    cmd = [args.python, str(run_py), *extra]
+    cmd = _build_run_command(args.python, run_py, extra)
     stdout_path = run_path / "stdout.log"
     stderr_path = run_path / "stderr.log"
     with stdout_path.open("a", encoding="utf-8") as out, stderr_path.open("a", encoding="utf-8") as err:
@@ -148,9 +177,52 @@ def _tee(src: IO[str], *dests: IO[str]) -> None:
             dest.flush()
 
 
+def _build_run_command(
+    python_override: str | None, run_py: Path, extra: list[str]
+) -> list[str]:
+    """Pick the interpreter for `run.py`.
+
+    Default: `uv run --project <kresko-repo> python <run_py>` so the spawned
+    process always has pyinfra and the other repo deps, regardless of how
+    the user invoked the CLI. Explicit `--python` skips uv entirely.
+    """
+
+    if python_override:
+        return [python_override, str(run_py), *extra]
+    project_root = _kresko_project_root()
+    if project_root and _which("uv"):
+        return [
+            "uv",
+            "run",
+            "--project",
+            str(project_root),
+            "python",
+            str(run_py),
+            *extra,
+        ]
+    return [sys.executable, str(run_py), *extra]
+
+
+def _kresko_project_root() -> Path | None:
+    """Find the kresko_py project root (the directory holding pyproject.toml)."""
+    candidate = Path(__file__).resolve().parent.parent
+    if (candidate / "pyproject.toml").exists():
+        return candidate
+    return None
+
+
+def _which(program: str) -> str | None:
+    from shutil import which as _shutil_which
+
+    return _shutil_which(program)
+
+
 def cmd_sync(args: argparse.Namespace) -> int:
     paths.ensure_home()
-    load_experiment_env(paths.kresko_home())
+    load_experiment_env(
+        experiment_root=paths.kresko_home(),
+        repo_root=paths.kresko_home(),
+    )
     reports = sync_all()
     out = [report_to_dict(report) for report in reports]
     print(json.dumps(out, indent=2, sort_keys=True))

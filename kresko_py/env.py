@@ -1,3 +1,15 @@
+"""Layered .env loading with strict shell-wins precedence.
+
+Precedence (high → low):
+    1. explicit shell environment (never overridden)
+    2. repo `.env`                 (fills gaps; never overrides shell)
+    3. experiment `.env`           (fills remaining gaps; never overrides repo)
+
+Loading both .env files with `override=False` is what enforces this — the
+old implementation captured `protected` once at entry and let the
+experiment .env clobber values the repo .env had just set.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -28,5 +40,5 @@ def load_experiment_env(
     if experiment_root.is_file():
         experiment_root = experiment_root.parent
     repo = Path(repo_root).resolve() if repo_root else find_repo_root(experiment_root)
-    _load_dotenv(repo / ".env", override=True)
-    _load_dotenv(experiment_root / ".env", override=True)
+    _load_dotenv(repo / ".env", override=False)
+    _load_dotenv(experiment_root / ".env", override=False)

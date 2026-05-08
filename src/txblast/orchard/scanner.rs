@@ -341,7 +341,7 @@ async fn scan_block(
             .branch_id()
             .ok_or_else(|| anyhow::anyhow!("missing branch id for orchard transaction {tx_hash}"))
             .and_then(|branch_id| {
-                consensus::BranchId::try_from(branch_id).map_err(|_| {
+                consensus::BranchId::try_from(u32::from(branch_id)).map_err(|_| {
                     anyhow::anyhow!("invalid branch id for orchard transaction {tx_hash}")
                 })
             })?;

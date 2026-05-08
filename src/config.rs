@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use zebra_chain::parameters::EquihashParams;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -60,15 +59,6 @@ impl std::str::FromStr for EquihashParameterSet {
             other => {
                 anyhow::bail!("unknown equihash parameter set: {other}. Use common or regtest.")
             }
-        }
-    }
-}
-
-impl From<EquihashParameterSet> for EquihashParams {
-    fn from(value: EquihashParameterSet) -> Self {
-        match value {
-            EquihashParameterSet::Common => EquihashParams::Common,
-            EquihashParameterSet::Regtest => EquihashParams::Regtest,
         }
     }
 }
@@ -370,6 +360,7 @@ pub struct LocalGenesisActivationHeights {
     pub nu5: u32,
     pub nu6: u32,
     pub nu6_1: u32,
+    pub nu7: u32,
 }
 
 impl Config {
@@ -548,4 +539,3 @@ mod tests {
         assert_eq!(daa.pow_damping_factor, Some(4));
     }
 }
-

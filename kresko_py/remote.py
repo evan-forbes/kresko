@@ -26,6 +26,7 @@ def render_command_plan(nodes: list[dict[str, Any]], command: str) -> list[str]:
 def pyinfra_deploy_base(payload_paths: list[str], remote_root: str = "/root/kresko") -> None:
     """Run common deploy mutations inside a pyinfra deploy file."""
 
+    from pyinfra import host
     from pyinfra.operations import apt, files, server
 
     apt.packages(
@@ -53,7 +54,7 @@ def pyinfra_deploy_base(payload_paths: list[str], remote_root: str = "/root/kres
             )
     server.shell(
         name="Set hostname from Kresko metadata",
-        commands=["hostnamectl set-hostname {{ host.data.kresko_name }}"],
+        commands=[f"hostnamectl set-hostname {shlex.quote(str(host.data.kresko_name))}"],
     )
 
 

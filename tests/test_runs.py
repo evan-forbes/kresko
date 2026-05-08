@@ -36,11 +36,11 @@ def make_experiment_source(name: str = "smoke") -> None:
 
 def test_resolve_run_name_increments_on_collision(home):
     make_experiment_source()
-    assert resolve_run_name("smoke") == "smoke"
-    start_run("smoke")
-    assert resolve_run_name("smoke") == "smoke-2"
-    start_run("smoke")
-    assert resolve_run_name("smoke") == "smoke-3"
+    assert resolve_run_name("smoke", "alpha") == "alpha"
+    start_run("smoke", name="alpha")
+    assert resolve_run_name("smoke", "alpha") == "alpha-2"
+    start_run("smoke", name="alpha")
+    assert resolve_run_name("smoke", "alpha") == "alpha-3"
 
 
 def test_resolve_run_name_uses_explicit_slug(home):
@@ -48,16 +48,24 @@ def test_resolve_run_name_uses_explicit_slug(home):
     assert resolve_run_name("smoke", "experiment-a") == "experiment-a"
 
 
+def test_resolve_run_name_default_is_short_timestamped_slug(home):
+    make_experiment_source()
+    name = resolve_run_name("smoke")
+    assert name.startswith("r-")
+    # r-YYYYmmdd-HHMMSS
+    assert len(name) == len("r-20260507-141502")
+
+
 def test_start_run_copies_source_and_writes_manifest(home):
     make_experiment_source("copy-exp")
-    run_path = start_run("copy-exp", argv=["run", "copy-exp"])
+    run_path = start_run("copy-exp", name="seed", argv=["run", "copy-exp"])
 
     assert (run_path / "run.py").exists()
     assert (run_path / "payload" / "data.txt").read_text() == "hello\n"
     assert (run_path / "nodes").is_dir()
     manifest = json.loads((run_path / "manifest.json").read_text())
     assert manifest["experiment"] == "copy-exp"
-    assert manifest["run_name"] == "copy-exp"
+    assert manifest["run_name"] == "seed"
     assert manifest["argv"] == ["run", "copy-exp"]
 
 

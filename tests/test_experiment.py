@@ -7,7 +7,7 @@ import pytest
 
 from kresko_py import DigitalOceanNodeType, Experiment, paths
 from kresko_py import assets as assets_store
-from kresko_py.experiment import ENV_EXPERIMENT, ENV_RUN_DIR, ENV_RUN_NAME
+from kresko_py.experiment import ENV_EXPERIMENT, ENV_RUN_DIR, ENV_RUN_NAME, run_pyinfra
 from kresko_py.runs import start_run
 
 
@@ -80,7 +80,7 @@ def make_experiment(home, monkeypatch, name="api-exp", run="api-exp", **kwargs) 
     src.mkdir(parents=True, exist_ok=True)
     (src / "run.py").write_text("# placeholder\n", encoding="utf-8")
     (src / "payload").mkdir(exist_ok=True)
-    run_path = start_run(name)
+    run_path = start_run(name, name=run)
     monkeypatch.setenv(ENV_EXPERIMENT, name)
     monkeypatch.setenv(ENV_RUN_NAME, run_path.name)
     monkeypatch.setenv(ENV_RUN_DIR, str(run_path))
@@ -115,9 +115,9 @@ def test_experiment_up_writes_assets_and_node_snapshots(home, monkeypatch):
     assert result["ok"] is True
     asset = assets_store.read_asset("digitalocean", "1")
     assert asset["name"] == "miner-0"
-    assert "kresko-exp-api-exp" in asset["tags"]
-    assert "kresko-role-miner" in asset["tags"]
-    assert "kresko-run-api-exp" in asset["tags"]
+    assert "experiment-api-exp" in asset["tags"]
+    assert "role-miner" in asset["tags"]
+    assert "run-api-exp" in asset["tags"]
     snapshot = experiment.run_dir / "nodes" / "miner-0.json"
     assert snapshot.exists()
 
@@ -178,9 +178,9 @@ def test_experiment_down_dry_run_validates_assets(home, monkeypatch):
     experiment.up()
     fake.droplets_by_id["1"]["tags"] = [
         "kresko",
-        "kresko-exp-api-exp",
-        "kresko-role-miner",
-        "kresko-run-api-exp",
+        "experiment-api-exp",
+        "role-miner",
+        "run-api-exp",
     ]
 
     result = experiment.down(dry_run=True)
@@ -286,6 +286,23 @@ def test_experiment_up_retry_failed_clears_marker(home, monkeypatch):
     assert "failure_reason" not in asset
 
 
+def test_run_pyinfra_passes_y_flag(monkeypatch):
+    """pyinfra -y is required so deploy doesn't hang on a yes/no prompt
+    in non-interactive runs (CI, kresko orchestration, etc.)."""
+    captured: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    run_pyinfra(paths.kresko_home() / "inv.py", paths.kresko_home() / "deploy.py")
+
+    assert captured, "subprocess.run was not called"
+    assert captured[0][:2] == ["pyinfra", "-y"]
+
+
 def test_run_dir_contains_copied_experiment_source(home):
     name = "copied-exp"
     src = paths.experiment_dir(name)
@@ -294,9 +311,9 @@ def test_run_dir_contains_copied_experiment_source(home):
     (src / "payload").mkdir()
     (src / "payload" / "thing.txt").write_text("payload\n", encoding="utf-8")
 
-    run_path = start_run(name)
+    run_path = start_run(name, name="seed")
 
     assert (run_path / "run.py").read_text() == "print('hi')\n"
     assert (run_path / "payload" / "thing.txt").read_text() == "payload\n"
     assert (run_path / "manifest.json").exists()
-    assert json.loads((run_path / "manifest.json").read_text())["run_name"] == name
+    assert json.loads((run_path / "manifest.json").read_text())["run_name"] == "seed"

@@ -24,7 +24,7 @@ def make_asset(provider_id: str = "1", tags: list[str] | None = None) -> dict:
         "private_ip": "",
         "status": "active",
         "tags": tags
-        or ["kresko", "kresko-exp-smoke", "kresko-role-miner", "kresko-run-smoke"],
+        or ["kresko", "experiment-smoke", "role-miner", "run-smoke"],
     }
 
 
@@ -53,18 +53,18 @@ def test_write_preserves_created_at(home):
 
 def test_normalize_requires_kresko_tag(home):
     with pytest.raises(ValueError):
-        assets.write_asset(make_asset("42", tags=["kresko-exp-smoke"]))
+        assets.write_asset(make_asset("42", tags=["experiment-smoke"]))
 
 
 def test_list_assets_filters_by_tag(home):
-    assets.write_asset(make_asset("1", tags=["kresko", "kresko-exp-a", "kresko-role-miner"]))
-    assets.write_asset(make_asset("2", tags=["kresko", "kresko-exp-b", "kresko-role-miner"]))
-    assets.write_asset(make_asset("3", tags=["kresko", "kresko-exp-a", "kresko-role-rpc"]))
+    assets.write_asset(make_asset("1", tags=["kresko", "experiment-a", "role-miner"]))
+    assets.write_asset(make_asset("2", tags=["kresko", "experiment-b", "role-miner"]))
+    assets.write_asset(make_asset("3", tags=["kresko", "experiment-a", "role-rpc"]))
 
-    miners_a = assets.list_assets(tags=["kresko-exp-a", "kresko-role-miner"])
+    miners_a = assets.list_assets(tags=["experiment-a", "role-miner"])
     assert [a["provider_id"] for a in miners_a] == ["1"]
 
-    role_miner = assets.list_assets(tags=["kresko-role-miner"])
+    role_miner = assets.list_assets(tags=["role-miner"])
     assert sorted(a["provider_id"] for a in role_miner) == ["1", "2"]
 
     every = assets.list_assets()

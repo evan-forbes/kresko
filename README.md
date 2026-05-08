@@ -49,15 +49,20 @@ Everything kresko (Python) does lives under `~/.kresko/` (override with
 
 Every kresko-managed cloud asset carries:
 
-- `kresko` — mandatory; sync/destroy refuse without it.
-- `kresko-exp-<experiment>`
-- `kresko-role-<role>` — e.g. `kresko-role-miner`, `kresko-role-rpc`.
-- `kresko-run-<run-name>`
+- `kresko` — mandatory marker; sync/destroy refuse without it.
+- `experiment-<experiment>`
+- `role-<role>` — e.g. `role-miner`, `role-rpc`.
+- `run-<run-name>`
+
+The typed prefixes are intentionally short and provider-portable; the
+`kresko` marker exists separately so a colliding `experiment-foo` tag from
+some other tool can't trick us into deleting unrelated droplets.
 
 ### Run naming
 
-Default run name is the experiment name. On collision, kresko appends `-2`,
-`-3`, etc. — `runs/<exp>/<slug>/`, `runs/<exp>/<slug>-2/`, …
+Default run name is a UTC-timestamped slug like `r-20260507-141502`. Use
+`--run-name <slug>` to set one explicitly. On collision, kresko appends
+`-2`, `-3`, etc. — `runs/<exp>/<slug>/`, `runs/<exp>/<slug>-2/`, …
 
 ## Install
 
@@ -91,11 +96,11 @@ $EDITOR ~/.kresko/.env     # DIGITALOCEAN_TOKEN, AWS_*, KRESKO_SSH_KEY_NAME, ...
 
 # 4) Provision and drive
 kresko run pyinfra_do_smoke -- plan
-kresko run pyinfra_do_smoke --name nyc-1 -- up
-kresko run pyinfra_do_smoke --name nyc-1 -- deploy
-kresko run pyinfra_do_smoke --name nyc-1 -- smoke
-kresko run pyinfra_do_smoke --name nyc-1 -- collect
-kresko run pyinfra_do_smoke --name nyc-1 -- down
+kresko run pyinfra_do_smoke --run-name nyc-1 -- up
+kresko run pyinfra_do_smoke --run-name nyc-1 -- deploy
+kresko run pyinfra_do_smoke --run-name nyc-1 -- smoke
+kresko run pyinfra_do_smoke --run-name nyc-1 -- collect
+kresko run pyinfra_do_smoke --run-name nyc-1 -- down
 ```
 
 `kresko init` is a Rust subcommand. Re-running it is idempotent: existing
@@ -103,10 +108,13 @@ kresko run pyinfra_do_smoke --name nyc-1 -- down
 untouched. Pass `--force` with a `<name>` to overwrite a scaffolded
 experiment.
 
-`kresko run <exp> --name <slug> -- <verb>` allocates a new run dir, copies
-`experiments/<exp>/` into it, and exec's the copied `run.py` with the verb
-as its argv. The verbs (`plan / up / deploy / run / collect / down`) come
-from the shared `run_experiment()` helper — see "Writing an experiment".
+`kresko run <exp> [--run-name <slug>] -- <verb>` allocates a new run dir,
+copies `experiments/<exp>/` into it, and exec's the copied `run.py` with
+the verb as its argv. The literal `--` is required when forwarding args
+so that experiment-level flags (e.g. `--name` for node filtering) cannot
+be silently consumed as a run dir name. The verbs (`plan / up / deploy /
+run / collect / down`) come from the shared `run_experiment()` helper —
+see "Writing an experiment".
 
 ## CLI reference
 
@@ -115,9 +123,12 @@ from the shared `run_experiment()` helper — see "Writing an experiment".
   experiments into `~/.kresko/experiments/`, and (with `<name>`) scaffold a
   new experiment from a reference. This is a Rust subcommand baked into the
   binary; the bundled experiments come from the build-time source tree.
-- `kresko run <experiment> [--name <slug>] -- [args...]` — allocate a fresh
-  run dir, copy `experiments/<exp>/` into it, exec the copied `run.py` with
-  `KRESKO_EXPERIMENT` / `KRESKO_RUN_NAME` / `KRESKO_RUN_DIR` set.
+- `kresko run <experiment> [--run-name <slug>] -- [args...]` — allocate a
+  fresh run dir, copy `experiments/<exp>/` into it, exec the copied
+  `run.py` with `KRESKO_EXPERIMENT` / `KRESKO_RUN_NAME` / `KRESKO_RUN_DIR`
+  set. The `--` is required before forwarded args. By default the spawned
+  `run.py` runs through `uv run --project <kresko-repo>` so pyinfra and
+  the other repo deps are available; pass `--python <path>` to bypass uv.
 - `kresko sync` — refresh `~/.kresko/assets/` from configured cloud
   providers (currently DigitalOcean).
 - `kresko assets list [--tag <tag>] [--provider <name>]` — list assets,
@@ -211,7 +222,7 @@ Two failure shapes:
 To retry the failed nodes only, pass `--retry-failed`:
 
 ```bash
-kresko run my-exp --name nyc-1 -- up --retry-failed
+kresko run my-exp --run-name nyc-1 -- up --retry-failed
 ```
 
 This re-polls the failed assets in place; healthy nodes are not touched.

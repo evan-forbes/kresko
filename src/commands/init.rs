@@ -93,13 +93,7 @@ fn seed_bundled_experiments(home: &Path, source_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn scaffold(
-    home: &Path,
-    source_root: &Path,
-    name: &str,
-    from: &str,
-    force: bool,
-) -> Result<()> {
+fn scaffold(home: &Path, source_root: &Path, name: &str, from: &str, force: bool) -> Result<()> {
     validate_slug(name)?;
     let source = source_root.join(from);
     if !source.is_dir() {

@@ -52,4 +52,3 @@ pub async fn run_script_in_tmux(
 
     join_all(futs).await
 }
-

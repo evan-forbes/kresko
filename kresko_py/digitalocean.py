@@ -1,8 +1,10 @@
 """DigitalOcean provider: create/destroy droplets, write to assets/.
 
-Tag contract: every droplet must carry `kresko`. Experiment, role, and run
-are also recorded as `kresko-exp-<exp>`, `kresko-role-<role>`,
-`kresko-run-<name>`. `sync` and destroy paths read assets, never a state file.
+Tag contract: every droplet carries the `kresko` marker tag plus typed
+prefix tags `experiment-<exp>`, `role-<role>`, `run-<name>`. The `kresko`
+marker stays in place because DigitalOcean tags are flat strings, and we
+need a safety token to refuse deletion of foreign droplets that happen to
+share an `experiment-...` or `run-...` tag from some other tool.
 """
 
 from __future__ import annotations
@@ -19,9 +21,10 @@ DO_API = "https://api.digitalocean.com/v2"
 PROVIDER = "digitalocean"
 
 REQUIRED_TAG = "kresko"
-EXPERIMENT_TAG_PREFIX = "kresko-exp-"
-ROLE_TAG_PREFIX = "kresko-role-"
-RUN_TAG_PREFIX = "kresko-run-"
+EXPERIMENT_TAG_PREFIX = "experiment-"
+ROLE_TAG_PREFIX = "role-"
+RUN_TAG_PREFIX = "run-"
+KRESKO_TYPED_TAG_PREFIXES = (EXPERIMENT_TAG_PREFIX, ROLE_TAG_PREFIX, RUN_TAG_PREFIX)
 
 
 class DigitalOceanError(RuntimeError):
@@ -229,8 +232,14 @@ def reconcile_droplets(
 
     desired = _expand_desired(spec, experiment=experiment, run_name=run_name)
     exp_tag = experiment_tag(experiment)
-    existing = client.list_droplets_by_tag(exp_tag)
-    existing_by_name: dict[str, dict[str, Any]] = {d.get("name", ""): d for d in existing}
+    existing = [
+        droplet
+        for droplet in client.list_droplets_by_tag(exp_tag)
+        if run_tag(run_name) in set(droplet.get("tags") or [])
+    ]
+    existing_by_name: dict[str, dict[str, Any]] = {
+        d.get("name", ""): d for d in existing
+    }
 
     plan: dict[str, list[dict[str, Any]]] = {
         "create": [],
@@ -248,10 +257,39 @@ def reconcile_droplets(
     target_by_name: dict[str, dict[str, Any]] = {target["name"]: target for target in desired}
 
     for target in desired:
-        if target["name"] in existing_by_name:
-            plan["reuse"].append(droplet_to_asset(existing_by_name[target["name"]]))
-        else:
+        existing_droplet = existing_by_name.get(target["name"])
+        if existing_droplet is None:
             plan["create"].append(target)
+            continue
+        existing_role = tag_value(existing_droplet.get("tags") or [], ROLE_TAG_PREFIX)
+        if existing_role and existing_role != target["role"]:
+            plan["failed"].append(
+                {
+                    "name": target["name"],
+                    "role": target["role"],
+                    "region": target["region"],
+                    "size": target["size"],
+                    "kind": "role_mismatch",
+                    "message": (
+                        f"existing droplet has role {existing_role!r}, "
+                        f"expected {target['role']!r}"
+                    ),
+                }
+            )
+            continue
+        plan["reuse"].append(droplet_to_asset(existing_droplet))
+
+    # Validate the SSH key against DigitalOcean *before* the dry-run exit so
+    # misconfigured KRESKO_SSH_KEY_NAME fails loudly during planning, not
+    # mid-provision after some droplets are already up.
+    ssh_key: int | str | None = None
+    if plan["create"]:
+        ssh_selector = (spec.ssh or {}).get("key_name") or (spec.ssh or {}).get("ssh_key") or ""
+        if not ssh_selector:
+            raise DigitalOceanError(
+                "spec.ssh.key_name is required to create DigitalOcean droplets"
+            )
+        ssh_key = client.lookup_ssh_key(str(ssh_selector))
 
     if dry_run:
         return plan
@@ -259,12 +297,6 @@ def reconcile_droplets(
     if plan["duplicate"]:
         names = ", ".join(sorted({a["name"] for a in plan["duplicate"]}))
         raise DigitalOceanError(f"duplicate DigitalOcean droplets found for: {names}")
-
-    ssh_selector = (spec.ssh or {}).get("key_name") or (spec.ssh or {}).get("ssh_key") or ""
-    if not ssh_selector and plan["create"]:
-        raise DigitalOceanError("spec.ssh.key_name is required to create DigitalOcean droplets")
-
-    ssh_key = client.lookup_ssh_key(str(ssh_selector)) if plan["create"] else None
 
     for target in plan["create"]:
         request = create_droplet_request(
@@ -402,10 +434,19 @@ def destroy_assets(
     asset_list: list[dict[str, Any]],
     client: DigitalOceanClient,
     *,
-    required_tag: str,
+    required_tags: list[str],
     dry_run: bool = False,
 ) -> list[str]:
-    """Destroy each asset's droplet after validating tags. Returns provider IDs."""
+    """Destroy each asset's droplet after validating tags. Returns provider IDs.
+
+    Every tag in `required_tags` must be present on the droplet (in addition
+    to the mandatory `kresko` marker checked by `validate_kresko_droplet`).
+    Pass both the experiment tag and the run tag so a stale asset record
+    can't trick us into deleting a droplet from a different run.
+    """
+
+    if not required_tags:
+        raise DigitalOceanError("destroy_assets requires at least one required_tag")
 
     destroyed: list[str] = []
     for asset in asset_list:
@@ -413,7 +454,14 @@ def destroy_assets(
         if not provider_id:
             continue
         droplet = client.get_droplet(provider_id)
-        validate_kresko_droplet(droplet, required_tag, expected_name=asset.get("name"))
+        validate_kresko_droplet(droplet, required_tags[0], expected_name=asset.get("name"))
+        droplet_tags = set(droplet.get("tags") or [])
+        for tag in required_tags[1:]:
+            if tag not in droplet_tags:
+                raise DigitalOceanError(
+                    f"refusing to delete droplet {droplet.get('id')} "
+                    f"({droplet.get('name')!r}): missing required tag {tag!r}"
+                )
         destroyed.append(str(provider_id))
         if not dry_run:
             client.delete_droplet(provider_id)
@@ -424,9 +472,11 @@ def destroy_assets(
 def destroy_tagged_droplets(
     tag: str, client: DigitalOceanClient, dry_run: bool = False
 ) -> list[str]:
-    if tag == REQUIRED_TAG or not tag.startswith("kresko-"):
+    if tag == REQUIRED_TAG or not tag.startswith(KRESKO_TYPED_TAG_PREFIXES):
         raise DigitalOceanError(
-            f"refusing force-tag deletion for {tag!r}; use a specific tag like {EXPERIMENT_TAG_PREFIX}my-experiment"
+            f"refusing force-tag deletion for {tag!r}; use a specific tag like "
+            f"{EXPERIMENT_TAG_PREFIX}my-experiment, {ROLE_TAG_PREFIX}miner, or "
+            f"{RUN_TAG_PREFIX}r-20260507-141502"
         )
     droplets = client.list_droplets_by_tag(tag)
     destroyed: list[str] = []
