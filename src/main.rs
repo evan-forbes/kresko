@@ -152,6 +152,13 @@ enum Commands {
         directory: String,
     },
 
+    /// TOML-aware reads/writes against a deployed zebrad.toml.
+    /// Used by node_init.sh in place of awk/sed string surgery.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+
     /// Run PoW miner locally (intended to run on remote nodes)
     Mine {
         /// RPC endpoint
@@ -397,6 +404,44 @@ enum Commands {
         /// Consider non-ready status stale after this many seconds
         #[arg(long, default_value_t = 120)]
         stall_secs: i64,
+    },
+}
+
+#[derive(Subcommand, Clone, Debug)]
+enum ConfigCommand {
+    /// Print mining.miner_address from a zebrad.toml. Empty output if unset.
+    GetMinerAddress {
+        /// Path to zebrad.toml
+        path: String,
+    },
+    /// Write mining.miner_address. May be passed multiple --path values to
+    /// keep zebrad.toml and zebrad.bootstrap.toml in sync atomically.
+    SetMinerAddress {
+        /// New miner_address to write.
+        #[arg(long)]
+        address: String,
+        /// Path(s) to zebrad.toml-style files to update.
+        #[arg(long)]
+        path: Vec<String>,
+    },
+    /// Print network.testnet_parameters.genesis_hash (lowercased) from a config.
+    GetGenesisHash {
+        /// Path to zebrad.toml
+        path: String,
+    },
+    /// Strip the optional `network.testnet_parameters.genesis_block_path`.
+    StripGenesisBlockPath {
+        /// Path to zebrad.toml
+        path: String,
+    },
+    /// Render a bootstrap config (P2P-disabled) from an existing zebrad.toml.
+    /// Writes to --out (defaults to <input>.bootstrap.toml).
+    RenderBootstrap {
+        /// Source zebrad.toml.
+        path: String,
+        /// Where to write the bootstrap config.
+        #[arg(long)]
+        out: Option<String>,
     },
 }
 
@@ -718,6 +763,7 @@ impl Commands {
     fn directory(&self) -> Option<&str> {
         match self {
             Commands::Init { .. }
+            | Commands::Config { .. }
             | Commands::Mine { .. }
             | Commands::PowSimulate { .. }
             | Commands::PowBench { .. }
@@ -731,6 +777,59 @@ impl Commands {
             | Commands::Txblast { directory, .. } => Some(directory),
         }
     }
+}
+
+fn run_config_command(command: ConfigCommand) -> Result<()> {
+    use anyhow::Context;
+    match command {
+        ConfigCommand::GetMinerAddress { path } => {
+            let contents = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {path}"))?;
+            if let Some(address) = zebra_config::read_miner_address(&contents)? {
+                println!("{address}");
+            }
+        }
+        ConfigCommand::SetMinerAddress { address, path } => {
+            if path.is_empty() {
+                anyhow::bail!("--path must be supplied at least once");
+            }
+            for p in &path {
+                let contents =
+                    std::fs::read_to_string(p).with_context(|| format!("reading {p}"))?;
+                let updated = zebra_config::set_miner_address(&contents, &address)?;
+                std::fs::write(p, updated).with_context(|| format!("writing {p}"))?;
+            }
+        }
+        ConfigCommand::GetGenesisHash { path } => {
+            let contents = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {path}"))?;
+            if let Some(hash) = zebra_config::read_genesis_hash(&contents)? {
+                println!("{hash}");
+            }
+        }
+        ConfigCommand::StripGenesisBlockPath { path } => {
+            let contents = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {path}"))?;
+            let stripped = zebra_config::strip_genesis_block_path(&contents)?;
+            std::fs::write(&path, stripped).with_context(|| format!("writing {path}"))?;
+        }
+        ConfigCommand::RenderBootstrap { path, out } => {
+            let contents = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {path}"))?;
+            let bootstrap = zebra_config::bootstrap_config_for_isolated_rpc(&contents)?;
+            let dest = out.unwrap_or_else(|| {
+                let p = std::path::Path::new(&path);
+                let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("zebrad");
+                parent
+                    .join(format!("{stem}.bootstrap.toml"))
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            std::fs::write(&dest, bootstrap).with_context(|| format!("writing {dest}"))?;
+        }
+    }
+    Ok(())
 }
 
 async fn run_txblast_command(command: TxblastCommand, directory: &str) -> Result<()> {
@@ -1075,6 +1174,9 @@ async fn main() -> Result<()> {
             directory,
         } => {
             commands::status::run(json, summary, deep, ssh_key_path.as_deref(), &directory).await?;
+        }
+        Commands::Config { command } => {
+            run_config_command(command)?;
         }
         Commands::Mine {
             rpc_endpoint,

@@ -174,11 +174,30 @@ if __name__ == "__main__":
 ```
 
 `run_experiment()` parses the standard verbs (`plan / up / deploy / run /
-collect / down`) plus anything you register in `extra_actions`, dispatches
-to the matching `Experiment` method, prints the result as JSON, and exits
-non-zero when `result["ok"]` is false. Shared flags include `--dry-run`,
-`--retry-failed`, `--role`, `--name`, `--pattern`, `--failed-from`,
-`--command`, `--path`, `--dest`, `--force-tag`.
+reset / collect / down`) plus anything you register in `extra_actions`,
+dispatches to the matching `Experiment` method, prints the result as
+JSON, and exits non-zero when `result["ok"]` is false. Shared flags
+include `--dry-run`, `--retry-failed`, `--role`, `--name`, `--pattern`,
+`--failed-from`, `--command`, `--path`, `--dest`, `--force-tag`.
+
+`reset` wipes Zebra state, configs, logs, and known kresko tmux sessions
+(`zebra`, `app`, `mine`, `txblast`) on the selected nodes, leaving the
+droplets themselves running. Use it to start the next deploy from a
+clean slate without re-provisioning.
+
+### Provider-shape overrides
+
+Droplet size / image / region / count are first-class CLI flags so a run
+can be retuned without editing the experiment script:
+
+```bash
+kresko run nu7-pow-4node -- up --size miner=s-8vcpu-16gb --count miner=8
+kresko run nu7-pow-4node -- up --image miner=ubuntu-25-04-x64
+kresko run nu7-pow-4node -- up --region ams3        # bare value = all roles
+```
+
+Each flag accepts `role=value` or just `value` (apply to all roles), and
+unknown roles fail loudly so a typo cannot silently no-op.
 
 To call the Rust binary from inside a verb handler:
 

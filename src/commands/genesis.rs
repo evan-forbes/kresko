@@ -149,7 +149,17 @@ pub fn run(
             zebra_config::apply_local_testnet_parameters(&node_config, &prepared.local_testnet)?;
         zebra_config::verify_local_testnet_parameters(&node_config, &prepared.local_testnet)
             .with_context(|| format!("rendered invalid zebrad.toml for node {node_name}"))?;
+        // Strip optional fields that older zebrad versions reject. Doing
+        // this in Rust (TOML-aware) replaces a sed line in node_init.sh.
+        node_config = zebra_config::strip_genesis_block_path(&node_config)?;
         std::fs::write(node_dir.join("zebrad.toml"), &node_config)?;
+        // Pre-render the isolated-RPC bootstrap config alongside zebrad.toml
+        // so node_init.sh doesn't have to munge TOML at runtime.
+        let bootstrap_config = zebra_config::bootstrap_config_for_isolated_rpc(&node_config)
+            .with_context(|| {
+                format!("failed to render bootstrap zebrad.toml for node {node_name}")
+            })?;
+        std::fs::write(node_dir.join("zebrad.bootstrap.toml"), &bootstrap_config)?;
         std::fs::write(
             node_dir.join("funded_key.json"),
             serde_json::to_vec_pretty(funded_key)?,
@@ -196,9 +206,12 @@ pub fn run(
     if !zebrad_path.exists() {
         anyhow::bail!("zebrad binary not found at {}", zebrad_binary);
     }
-    std::fs::copy(zebrad_path, bin_dir.join("zebrad"))
+    let zebrad_dest = bin_dir.join("zebrad");
+    std::fs::copy(zebrad_path, &zebrad_dest)
         .with_context(|| format!("failed to copy zebrad from {}", zebrad_binary))?;
-    println!("Copied zebrad binary from {zebrad_binary}");
+    let zebrad_sha256 = sha256_file(&zebrad_dest)
+        .with_context(|| format!("failed to hash zebrad at {}", zebrad_dest.display()))?;
+    println!("Copied zebrad binary from {zebrad_binary} (sha256={zebrad_sha256})");
 
     let kresko_binary_path = kresko_binary
         .map(std::path::PathBuf::from)
@@ -213,13 +226,32 @@ pub fn run(
             kresko_binary_path.display()
         );
     }
-    std::fs::copy(&kresko_binary_path, bin_dir.join("kresko")).with_context(|| {
+    let kresko_dest = bin_dir.join("kresko");
+    std::fs::copy(&kresko_binary_path, &kresko_dest).with_context(|| {
         format!(
             "failed to copy kresko from {}",
             kresko_binary_path.display()
         )
     })?;
-    println!("Copied kresko binary from {}", kresko_binary_path.display());
+    let kresko_sha256 = sha256_file(&kresko_dest)
+        .with_context(|| format!("failed to hash kresko at {}", kresko_dest.display()))?;
+    println!(
+        "Copied kresko binary from {} (sha256={kresko_sha256})",
+        kresko_binary_path.display()
+    );
+
+    // Manifest read by node_init.sh to verify what was installed matches what
+    // genesis built. Sha256 in hex; flat keys so awk/jq parsing in shell stays
+    // trivial without pulling in a TOML reader on the node.
+    let manifest_lines = format!(
+        "zebrad_sha256={}\nkresko_sha256={}\nzebrad_source={}\nkresko_source={}\n",
+        zebrad_sha256,
+        kresko_sha256,
+        zebrad_path.display(),
+        kresko_binary_path.display(),
+    );
+    std::fs::write(bin_dir.join("manifest.txt"), manifest_lines)
+        .context("failed to write payload binary manifest")?;
 
     let mut vars_content = format!(
         r#"#!/bin/bash
@@ -378,6 +410,11 @@ fn prepare_generated_local_genesis(
             slow_start_interval: local_genesis.slow_start_interval,
             pre_blossom_halving_interval: local_genesis.pre_blossom_halving_interval,
             activation_height: local_genesis.activation_heights.overwinter,
+            // Local genesis intentionally skips NU6.1, so there is nothing
+            // to disburse. zebra falls back to Mainnet's NU6_1 disbursement
+            // list if this field is missing — emitting an empty array is
+            // what overrides that to "no disbursements expected".
+            lockbox_disbursements: Vec::new(),
             post_blossom_pow_target_spacing: None,
             daa,
             pow_start_height: None,
@@ -501,6 +538,28 @@ fn local_network_name(chain_id: &str) -> String {
     }
 
     name
+}
+
+/// SHA-256 a file's contents and return the lowercase hex digest. Streams
+/// in 64 KiB chunks so we don't need to load the binary into memory.
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn to_hex(bytes: &[u8]) -> String {

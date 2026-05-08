@@ -51,7 +51,7 @@ from kresko_py.sync import report_to_dict, sync_all
 
 ExperimentAction = Callable[[Experiment, argparse.Namespace], dict[str, Any]]
 ExperimentFactory = Callable[[], Experiment]
-DEFAULT_ACTIONS = ("plan", "up", "deploy", "run", "collect", "down")
+DEFAULT_ACTIONS = ("plan", "up", "deploy", "run", "reset", "collect", "down")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -324,6 +324,7 @@ def run_experiment(
     args = parser.parse_args(argv)
 
     experiment = build_experiment()
+    _apply_provider_overrides(experiment, args, parser)
 
     action = args.action
     if action in extra_actions:
@@ -365,6 +366,14 @@ def run_experiment(
             dest=args.dest,
             dry_run=args.dry_run,
         )
+    elif action == "reset":
+        result = experiment.reset(
+            role=args.role,
+            name=args.name,
+            pattern=args.pattern,
+            failed_from=args.failed_from,
+            dry_run=args.dry_run,
+        )
     elif action == "down":
         result = experiment.down(dry_run=args.dry_run, force_tag=args.force_tag)
     else:
@@ -373,6 +382,58 @@ def run_experiment(
 
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
     return 0 if result.get("ok", False) else 1
+
+
+def _apply_provider_overrides(
+    experiment: Experiment,
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> None:
+    """Apply --size/--image/--count/--region overrides to the built experiment.
+
+    Each flag accepts `role=value` (per-role) or just `value` (all roles).
+    Roles that don't exist in the experiment surface as a parser error so a
+    typo doesn't silently no-op.
+    """
+    if not (args.size or args.image or args.count or args.region):
+        return
+
+    if not hasattr(experiment, "override"):
+        # Stubs in tests may not implement override(); skip silently.
+        return
+
+    known_roles = {node.role for node, _ in getattr(experiment, "_node_specs", [])}
+
+    def _parsed(values: list[str] | None, parse_value: Callable[[str], Any]) -> list[tuple[str | None, Any]]:
+        out: list[tuple[str | None, Any]] = []
+        for raw in values or []:
+            if "=" in raw:
+                role, value = raw.split("=", 1)
+                role = role.strip() or None
+            else:
+                role, value = None, raw
+            if role is not None and known_roles and role not in known_roles:
+                parser.error(
+                    f"unknown role {role!r} (experiment defines: {sorted(known_roles)})"
+                )
+            out.append((role, parse_value(value)))
+        return out
+
+    def _int(value: str) -> int:
+        try:
+            return int(value)
+        except ValueError:
+            parser.error(f"--count value must be an integer (got {value!r})")
+            raise  # appease type checker; parser.error exits
+
+    for role, size in _parsed(args.size, str):
+        experiment.override(role, size=size)
+    for role, image in _parsed(args.image, str):
+        experiment.override(role, image=image)
+    for role, region in _parsed(args.region, str):
+        experiment.override(role, region=region)
+    for role, count in _parsed(args.count, _int):
+        experiment.override(role, count=count)
 
 
 def _build_experiment_parser(extra_verbs: Any) -> argparse.ArgumentParser:
@@ -405,6 +466,41 @@ def _build_experiment_parser(extra_verbs: Any) -> argparse.ArgumentParser:
         help="for `collect`: remote path to pull (repeat)",
     )
     parser.add_argument("--dest", help="for `collect`: local destination directory")
+
+    # Provider-shape overrides. These let `kresko run <exp> -- up --size ...`
+    # retune a run without editing run.py. build_experiment() must opt into
+    # them by reading from `args` (see `apply_provider_overrides`).
+    parser.add_argument(
+        "--size",
+        action="append",
+        default=None,
+        metavar="role=slug",
+        help=(
+            "override droplet size for a role (e.g. miner=s-8vcpu-16gb). "
+            "Repeat for multiple roles. Without role= applies to all."
+        ),
+    )
+    parser.add_argument(
+        "--image",
+        action="append",
+        default=None,
+        metavar="role=image",
+        help="override droplet image for a role. Repeat for multiple roles.",
+    )
+    parser.add_argument(
+        "--count",
+        action="append",
+        default=None,
+        metavar="role=N",
+        help="override node count for a role (e.g. miner=8). Repeat for roles.",
+    )
+    parser.add_argument(
+        "--region",
+        action="append",
+        default=None,
+        metavar="role=slug",
+        help="override droplet region for a role.",
+    )
     return parser
 
 

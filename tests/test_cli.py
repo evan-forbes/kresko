@@ -148,6 +148,41 @@ def test_run_experiment_collect_requires_path(capsys):
         run_experiment(lambda: stub, argv=["collect"])
 
 
+def test_run_experiment_applies_provider_overrides(capsys):
+    """--size/--image/--count/--region flags must reach Experiment.override."""
+    overrides: list[tuple] = []
+
+    class OverridableStub(StubExperiment):
+        _node_specs = [(type("N", (), {"role": "miner"})(), 1)]
+
+        def override(self, role=None, **kw):
+            overrides.append((role, kw))
+
+    rc = run_experiment(
+        lambda: OverridableStub(),
+        argv=["up", "--size", "miner=s-8vcpu-16gb", "--count", "miner=8", "--region", "ams3"],
+    )
+    capsys.readouterr()
+    assert rc == 0
+    # --size and --count are role-scoped; bare --region applies to all roles (None).
+    assert ("miner", {"size": "s-8vcpu-16gb"}) in overrides
+    assert (None, {"region": "ams3"}) in overrides
+    assert ("miner", {"count": 8}) in overrides
+
+
+def test_run_experiment_rejects_unknown_role_in_overrides(capsys):
+    class OverridableStub(StubExperiment):
+        _node_specs = [(type("N", (), {"role": "miner"})(), 1)]
+
+        def override(self, role=None, **kw):
+            pass
+
+    with pytest.raises(SystemExit):
+        run_experiment(lambda: OverridableStub(), argv=["up", "--size", "rpc=foo"])
+    err = capsys.readouterr().err
+    assert "unknown role" in err and "rpc" in err
+
+
 def test_run_executes_copied_run_py(home, capsys):
     src = paths.experiment_dir("hello")
     src.mkdir(parents=True)

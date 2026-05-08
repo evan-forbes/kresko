@@ -123,8 +123,9 @@ mkdir -p /root/.config
 cp "${node_payload_dir}/zebrad.toml" /root/.config/zebrad.toml
 
 # The deployed zebrad binary can lag behind payload config generation.
-# Remove this optional key to keep old and new zebrad versions compatible.
-sed -i -E '/^[[:space:]]*genesis_block_path[[:space:]]*=.*$/d' /root/.config/zebrad.toml
+# Remove this optional key TOML-aware so an unrelated key with a similar
+# name can never be deleted by accident.
+kresko config strip-genesis-block-path /root/.config/zebrad.toml
 
 if [ "$KRESKO_NETWORK_KIND" = "mainnet" ]; then
     require_line '^[[:space:]]*network[[:space:]]*=[[:space:]]*"Mainnet"' /root/.config/zebrad.toml "mainnet network"
@@ -161,10 +162,31 @@ for _kresko_idx in "${!_SAVED_ZEBRA_TRACE_NAMES[@]}"; do
     esac
 done
 
-LOG_FILE="/root/logs"
+mkdir -p /root/logs
+LOG_FILE="/root/logs/zebrad.log"
 set +e
-zebrad -c /root/.config/zebrad.toml start 2>&1 | tee -a "$LOG_FILE"
-zebrad_exit=${PIPESTATUS[0]}
+zebrad -c /root/.config/zebrad.toml start 2>&1 | tee -a "$LOG_FILE" &
+zebrad_pid=$!
+
+# Surface a fast-fail: a public-network zebrad that dies in the first
+# ~10 seconds (e.g. address-already-in-use, malformed config) should
+# fail the deploy with the log tail rather than dropping into bash.
+for _ in $(seq 1 5); do
+    sleep 2
+    if ! kill -0 "$zebrad_pid" 2>/dev/null; then
+        wait "$zebrad_pid" 2>/dev/null
+        zebrad_exit=$?
+        echo "=== zebrad exited within 10s with code $zebrad_exit ===" >&2
+        if [ -f "$LOG_FILE" ]; then
+            echo "=== Tail of $LOG_FILE ===" >&2
+            tail -n 200 "$LOG_FILE" >&2 || true
+        fi
+        exit "$zebrad_exit"
+    fi
+done
+
+wait "$zebrad_pid"
+zebrad_exit=$?
 set -e
 
 echo "=== zebrad exited with code $zebrad_exit ==="

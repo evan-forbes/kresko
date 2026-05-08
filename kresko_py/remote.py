@@ -9,10 +9,21 @@ def shell_join(parts: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in parts)
 
 
+KRESKO_ENV_FILE = "/root/.kresko/env"
+
+
 def tmux_start_command(session: str, command: str, log_path: str | None = None) -> str:
     if log_path:
         command = f"{command} > {shlex.quote(log_path)} 2>&1"
-    return shell_join(["tmux", "new-session", "-d", "-s", session, command])
+    # Wrap the payload in a login shell that auto-exports the kresko env file
+    # written by node_init.sh. Without this, sessions started over the wire
+    # (pyinfra, ad-hoc ssh) miss KRESKO_RPC_URL/PORT and tools default to a
+    # bogus localhost port.
+    wrapped = (
+        f"set -a; [ -f {shlex.quote(KRESKO_ENV_FILE)} ] && . {shlex.quote(KRESKO_ENV_FILE)}; "
+        f"set +a; {command}"
+    )
+    return shell_join(["tmux", "new-session", "-d", "-s", session, "bash", "-lc", wrapped])
 
 
 def tmux_kill_command(session: str) -> str:
@@ -23,12 +34,80 @@ def render_command_plan(nodes: list[dict[str, Any]], command: str) -> list[str]:
     return [f"{node['name']} ({node['public_ip']}): {command}" for node in nodes]
 
 
+# tmux sessions kresko launches: zebra/app for the daemon, mine for kresko mine,
+# txblast for the tx blaster. `kresko reset` should kill them all.
+RESET_TMUX_SESSIONS = ("zebra", "app", "mine", "txblast")
+
+
+def reset_command(
+    *,
+    tmux_sessions: tuple[str, ...] = RESET_TMUX_SESSIONS,
+    zebra_state_dir: str = "/root/.cache/zebra",
+    zebra_config_dir: str = "/root/.config",
+    log_dir: str = "/root/logs",
+) -> str:
+    """Render the shell command that resets a node to a clean pre-deploy state.
+
+    Kills known tmux sessions, stops any stray zebrad/kresko processes, then
+    wipes state, configs, and logs. Idempotent: missing sessions/files are
+    not errors.
+    """
+    parts = [
+        # Kill tmux sessions if present.
+        *[
+            f"tmux kill-session -t {shlex.quote(name)} 2>/dev/null || true"
+            for name in tmux_sessions
+        ],
+        # Drop the tmux server entirely so global env (KRESKO_RPC_*) does
+        # not leak across deploys.
+        "tmux kill-server 2>/dev/null || true",
+        # Stop any leftover daemons that might keep the state dir busy.
+        "pkill -f zebrad 2>/dev/null || true",
+        "pkill -f 'kresko mine' 2>/dev/null || true",
+        # Wipe Zebra state.
+        f"rm -rf {shlex.quote(zebra_state_dir)}",
+        # Wipe deployed configs (matches what node_init.sh writes).
+        f"rm -f {shlex.quote(zebra_config_dir)}/zebrad.toml "
+        f"{shlex.quote(zebra_config_dir)}/zebrad.bootstrap.toml "
+        f"{shlex.quote(zebra_config_dir)}/funded_key.json",
+        # Wipe the unified log tree plus the kresko helper dir.
+        f"rm -rf {shlex.quote(log_dir)} /root/.kresko",
+        # Legacy paths from earlier deploy layouts; harmless when missing.
+        "rm -f /root/kresko-mine.log /root/kresko-mine-wait.sh "
+        "/root/logs.bootstrap /root/payload.tar.gz",
+    ]
+    return " ; ".join(parts)
+
+
+APT_LOCK_WAIT = (
+    # Fresh DO droplets run unattended-upgrades on first boot, which holds
+    # the dpkg + apt-lists locks. Block until both are free before any
+    # apt operations so pyinfra doesn't race with the cloud-init upgrade.
+    "for _ in $(seq 1 90); do "
+    "  if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 "
+    "     && ! fuser /var/lib/dpkg/lock >/dev/null 2>&1 "
+    "     && ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1 "
+    "     && ! pgrep -x unattended-upgr >/dev/null 2>&1 "
+    "     && ! pgrep -x apt-get >/dev/null 2>&1 "
+    "     && ! pgrep -x dpkg >/dev/null 2>&1; then "
+    "    exit 0; "
+    "  fi; "
+    "  sleep 5; "
+    "done; "
+    "echo 'apt locks still held after 7.5 minutes' >&2; exit 1"
+)
+
+
 def pyinfra_deploy_base(payload_paths: list[str], remote_root: str = "/root/kresko") -> None:
     """Run common deploy mutations inside a pyinfra deploy file."""
 
     from pyinfra import host
     from pyinfra.operations import apt, files, server
 
+    server.shell(
+        name="Wait for apt/dpkg locks (cloud-init unattended-upgrades)",
+        commands=[APT_LOCK_WAIT],
+    )
     apt.packages(
         name="Install Kresko base packages",
         packages=["tmux", "curl", "tar", "rsync"],

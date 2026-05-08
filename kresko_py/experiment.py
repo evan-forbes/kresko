@@ -25,7 +25,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -41,7 +41,7 @@ from kresko_py.digitalocean import (
 )
 from kresko_py.env import load_experiment_env
 from kresko_py.inventory import write_pyinfra_inventory
-from kresko_py.remote import render_command_plan, tmux_start_command
+from kresko_py.remote import RESET_TMUX_SESSIONS, render_command_plan, reset_command, tmux_start_command
 from kresko_py.runs import (
     ENV_EXPERIMENT,
     ENV_RUN_DIR,
@@ -187,6 +187,40 @@ class Experiment:
         self._node_specs.append((node, count))
 
     add_nodes = add
+
+    def override(
+        self,
+        role: str | None = None,
+        *,
+        size: str | None = None,
+        image: str | None = None,
+        count: int | None = None,
+        region: str | None = None,
+    ) -> None:
+        """Patch already-added node specs.
+
+        `role=None` matches every spec; otherwise only specs whose role
+        equals `role` are patched. Pass any of `size`/`image`/`region` to
+        override that NodeType field, or `count` to override the spec's
+        count. Useful for retuning a run from CLI flags without editing
+        the experiment script.
+        """
+        new_specs: list[tuple[DigitalOceanNodeType, int]] = []
+        for node, current_count in self._node_specs:
+            if role is not None and node.role != role:
+                new_specs.append((node, current_count))
+                continue
+            new_node = replace(
+                node,
+                size=size if size is not None else node.size,
+                image=image if image is not None else node.image,
+                region=region if region is not None else node.region,
+            )
+            new_count = count if count is not None else current_count
+            if new_count < 0:
+                raise ValueError("node count must be non-negative")
+            new_specs.append((new_node, new_count))
+        self._node_specs = new_specs
 
     def spec(self) -> ExperimentSpec:
         ssh = dict(self.ssh)
@@ -352,10 +386,21 @@ class Experiment:
                 f"pyinfra_deploy_base({payload_paths!r})\n",
                 nodes,
             )
-            plan = {"nodes": [a["name"] for a in nodes], "payload_paths": payload_paths}
+            local_provenance = _read_local_binary_provenance(payload_paths)
+            plan: dict[str, Any] = {
+                "nodes": [a["name"] for a in nodes],
+                "payload_paths": payload_paths,
+                "binary_provenance_local": local_provenance,
+            }
             if dry_run:
                 return self._success_result(stage, True, plan)
-            return self._run_pyinfra_stage(stage, inventory, deploy_file, plan)
+            return self._run_pyinfra_stage(
+                stage,
+                inventory,
+                deploy_file,
+                plan,
+                post_process=_attach_remote_provenance,
+            )
         except Exception as exc:
             self._write_failure(stage, stage, exc)
             raise
@@ -447,6 +492,33 @@ class Experiment:
             self._write_failure(stage, stage, exc)
             raise
 
+    def reset(
+        self,
+        *,
+        role: str | list[str] | None = None,
+        name: str | list[str] | None = None,
+        pattern: str | list[str] | None = None,
+        failed_from: str | Path | None = None,
+        tmux_sessions: tuple[str, ...] = RESET_TMUX_SESSIONS,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Wipe Zebra state, configs, logs, and kresko tmux sessions on selected nodes.
+
+        Use this to start the next deploy from a clean slate without
+        re-provisioning droplets. The droplets themselves are untouched —
+        run `down` for that.
+        """
+        command = reset_command(tmux_sessions=tmux_sessions)
+        return self.run_command(
+            command,
+            role=role,
+            name=name,
+            pattern=pattern,
+            failed_from=failed_from,
+            dry_run=dry_run,
+            stage="reset",
+        )
+
     def down(
         self,
         *,
@@ -529,12 +601,15 @@ class Experiment:
         deploy_file: Path,
         extra: dict[str, Any],
         command: str | None = None,
+        post_process: Callable[[dict[str, Any], str, str], None] | None = None,
     ) -> dict[str, Any]:
         result = self._pyinfra_runner(inventory, deploy_file, False)
         stdout_path = self.run_dir / f"pyinfra.{stage}.stdout.log"
         stderr_path = self.run_dir / f"pyinfra.{stage}.stderr.log"
-        stdout_path.write_text(result.stdout or "", encoding="utf-8")
-        stderr_path.write_text(result.stderr or "", encoding="utf-8")
+        stdout_text = result.stdout or ""
+        stderr_text = result.stderr or ""
+        stdout_path.write_text(stdout_text, encoding="utf-8")
+        stderr_path.write_text(stderr_text, encoding="utf-8")
         failures: list[dict[str, Any]] = []
         if result.returncode != 0:
             failures.append(
@@ -557,6 +632,8 @@ class Experiment:
             "stdout_path": str(stdout_path),
             "stderr_path": str(stderr_path),
         }
+        if post_process is not None:
+            post_process(payload, stdout_text, stderr_text)
         write_result(
             self.run_dir, stage, result.returncode == 0, failures=failures, extra=payload
         )
@@ -581,3 +658,100 @@ class Experiment:
 
 def _plan_to_jsonable(plan: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
     return {key: list(value) for key, value in plan.items()}
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _parse_payload_manifest(manifest_path: Path) -> dict[str, str]:
+    """Read the flat key=value manifest written by `kresko genesis`."""
+    fields: dict[str, str] = {}
+    for line in manifest_path.read_text(encoding="utf-8").splitlines():
+        if "=" not in line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        fields[key.strip()] = value.strip()
+    return fields
+
+
+def _read_local_binary_provenance(payload_paths: list[str]) -> dict[str, Any]:
+    """Locate `<payload>/build/{manifest.txt,zebrad,kresko}` and return what
+    we know locally: the manifest's recorded hashes plus our own re-hash of
+    the staged files. Both are returned so a tampered payload directory is
+    visible (manifest_sha256 != staged_sha256).
+    """
+    out: dict[str, Any] = {}
+    for payload in payload_paths:
+        build_dir = Path(payload) / "build"
+        manifest = build_dir / "manifest.txt"
+        if not manifest.exists():
+            continue
+        manifest_fields = _parse_payload_manifest(manifest)
+        binaries: dict[str, dict[str, str]] = {}
+        for binary in ("zebrad", "kresko"):
+            staged = build_dir / binary
+            if not staged.exists():
+                continue
+            binaries[binary] = {
+                "manifest_sha256": manifest_fields.get(f"{binary}_sha256", ""),
+                "staged_sha256": _sha256_file(staged),
+                "source": manifest_fields.get(f"{binary}_source", ""),
+            }
+        out["build_dir"] = str(build_dir)
+        out["binaries"] = binaries
+        return out
+    return out
+
+
+def _attach_remote_provenance(
+    payload: dict[str, Any], stdout_text: str, _stderr_text: str
+) -> None:
+    """Post-processor for `Experiment.deploy` that surfaces node_init.sh's
+    PROVENANCE lines in the result, so a redeploy makes binary swaps obvious.
+    """
+    payload["binary_provenance_remote"] = _parse_remote_provenance(stdout_text)
+
+
+def _parse_remote_provenance(stdout_text: str) -> dict[str, list[dict[str, str]]]:
+    """Group `PROVENANCE: <name> <state> ...` lines emitted by node_init.sh.
+
+    Returns {"changed": [...], "unchanged": [...], "installed": [...]} so a
+    redeploy makes it obvious which nodes saw a binary swap.
+    """
+    buckets: dict[str, list[dict[str, str]]] = {
+        "changed": [],
+        "unchanged": [],
+        "installed": [],
+    }
+    for raw in stdout_text.splitlines():
+        line = raw.strip()
+        marker = "PROVENANCE:"
+        idx = line.find(marker)
+        if idx == -1:
+            continue
+        rest = line[idx + len(marker) :].strip()
+        # Shapes:
+        #   zebrad CHANGED (was=..., now=...)
+        #   zebrad unchanged (sha256=...)
+        #   zebrad installed (sha256=..., no previous binary)
+        parts = rest.split(None, 2)
+        if len(parts) < 2:
+            continue
+        binary, state = parts[0], parts[1]
+        detail = parts[2] if len(parts) == 3 else ""
+        bucket = (
+            "changed"
+            if state.lower() == "changed"
+            else "installed"
+            if state.lower() == "installed"
+            else "unchanged"
+        )
+        buckets[bucket].append({"binary": binary, "detail": detail})
+    return buckets

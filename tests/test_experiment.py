@@ -169,6 +169,33 @@ def test_experiment_run_tmux_uses_runner_hook(home, monkeypatch):
     assert (experiment.run_dir / "pyinfra.run.stdout.log").read_text() == "ok"
 
 
+def test_experiment_reset_dispatches_to_remote_command(home, monkeypatch):
+    fake = FakeDigitalOcean()
+    experiment = make_experiment(
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+    )
+    experiment.add(miner_type(), count=1)
+    experiment.up()
+
+    captured: dict[str, str] = {}
+
+    def runner(inventory, deploy_file, dry_run):
+        captured["body"] = deploy_file.read_text()
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    experiment._pyinfra_runner = runner
+    result = experiment.reset(role="miner")
+
+    assert result["ok"] is True
+    assert result["stage"] == "reset"
+    body = captured["body"]
+    # The remote command must wipe state, configs, logs, and known tmux sessions.
+    assert "rm -rf /root/.cache/zebra" in body
+    assert "rm -rf /root/logs" in body
+    assert "tmux kill-session -t zebra" in body
+    assert "tmux kill-session -t mine" in body
+
+
 def test_experiment_down_dry_run_validates_assets(home, monkeypatch):
     fake = FakeDigitalOcean()
     experiment = make_experiment(
@@ -284,6 +311,132 @@ def test_experiment_up_retry_failed_clears_marker(home, monkeypatch):
     asset = assets_store.read_asset("digitalocean", "1")
     assert asset["status"] == "active"
     assert "failure_reason" not in asset
+
+
+def test_override_patches_size_image_region_for_role(home, monkeypatch):
+    fake = FakeDigitalOcean()
+    experiment = make_experiment(home, monkeypatch, digitalocean_client=fake)
+    experiment.add(miner_type(), count=2)
+
+    experiment.override("miner", size="s-8vcpu-16gb", image="ubuntu-25-04-x64", region="ams3")
+
+    spec = experiment.spec()
+    miner_group = next(g for g in spec.node_groups if g.role == "miner")
+    assert miner_group.size == "s-8vcpu-16gb"
+    assert miner_group.image == "ubuntu-25-04-x64"
+    assert miner_group.region == "ams3"
+    assert miner_group.count == 2
+
+
+def test_override_patches_count(home, monkeypatch):
+    fake = FakeDigitalOcean()
+    experiment = make_experiment(home, monkeypatch, digitalocean_client=fake)
+    experiment.add(miner_type(), count=4)
+
+    experiment.override("miner", count=8)
+
+    miner_group = next(g for g in experiment.spec().node_groups if g.role == "miner")
+    assert miner_group.count == 8
+
+
+def test_override_skips_other_roles(home, monkeypatch):
+    fake = FakeDigitalOcean()
+    experiment = make_experiment(home, monkeypatch, digitalocean_client=fake)
+    experiment.add(miner_type(), count=1)
+    rpc = DigitalOceanNodeType(
+        role="rpc",
+        region="nyc3",
+        size="s-1vcpu-1gb",
+        image="ubuntu-24-04-x64",
+        payload_paths=["payload"],
+    )
+    experiment.add(rpc, count=2)
+
+    experiment.override("miner", size="s-99vcpu")
+
+    by_role = {g.role: g for g in experiment.spec().node_groups}
+    assert by_role["miner"].size == "s-99vcpu"
+    assert by_role["rpc"].size == "s-1vcpu-1gb"
+
+
+def test_deploy_records_local_binary_provenance_from_payload_manifest(home, monkeypatch):
+    fake = FakeDigitalOcean()
+    experiment = make_experiment(
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+    )
+    experiment.add(miner_type(), count=1)
+    experiment.up()
+
+    # Stage a payload-style build dir under the experiment payload path.
+    payload_root = experiment.run_dir / "payload"
+    build_dir = payload_root / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    (build_dir / "zebrad").write_bytes(b"fake-zebrad-bytes")
+    (build_dir / "kresko").write_bytes(b"fake-kresko-bytes")
+    # Manifest hashes match the staged files (provenance OK).
+    import hashlib
+    z_sha = hashlib.sha256(b"fake-zebrad-bytes").hexdigest()
+    k_sha = hashlib.sha256(b"fake-kresko-bytes").hexdigest()
+    (build_dir / "manifest.txt").write_text(
+        f"zebrad_sha256={z_sha}\nkresko_sha256={k_sha}\n"
+        f"zebrad_source=/build/zebra\nkresko_source=/build/kresko\n",
+        encoding="utf-8",
+    )
+
+    experiment._pyinfra_runner = lambda i, d, dr: subprocess.CompletedProcess([], 0, "", "")
+    result = experiment.deploy(role="miner")
+
+    binaries = result["binary_provenance_local"]["binaries"]
+    assert binaries["zebrad"]["manifest_sha256"] == z_sha
+    assert binaries["zebrad"]["staged_sha256"] == z_sha
+    assert binaries["kresko"]["manifest_sha256"] == k_sha
+    # Source paths from the manifest are surfaced so the deploy log says where
+    # the bytes came from.
+    assert binaries["zebrad"]["source"] == "/build/zebra"
+
+
+def test_deploy_parses_remote_provenance_lines(home, monkeypatch):
+    fake = FakeDigitalOcean()
+    experiment = make_experiment(
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+    )
+    experiment.add(miner_type(), count=1)
+    experiment.up()
+
+    fake_stdout = (
+        "[miner-0] >>> Step: server.shell\n"
+        "[miner-0] PROVENANCE: zebrad CHANGED (was=aaaa, now=bbbb)\n"
+        "[miner-0] PROVENANCE: kresko unchanged (sha256=cccc)\n"
+        "[miner-0] >>> done\n"
+    )
+    experiment._pyinfra_runner = lambda i, d, dr: subprocess.CompletedProcess(
+        [], 0, fake_stdout, ""
+    )
+    result = experiment.deploy(role="miner")
+
+    remote = result["binary_provenance_remote"]
+    assert any(b["binary"] == "zebrad" for b in remote["changed"])
+    assert any(b["binary"] == "kresko" for b in remote["unchanged"])
+    assert remote["installed"] == []
+
+
+def test_deploy_provenance_buckets_first_install(home, monkeypatch):
+    fake = FakeDigitalOcean()
+    experiment = make_experiment(
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+    )
+    experiment.add(miner_type(), count=1)
+    experiment.up()
+
+    experiment._pyinfra_runner = lambda i, d, dr: subprocess.CompletedProcess(
+        [],
+        0,
+        "[miner-0] PROVENANCE: zebrad installed (sha256=abcd, no previous binary)\n",
+        "",
+    )
+    result = experiment.deploy(role="miner")
+
+    assert result["binary_provenance_remote"]["installed"][0]["binary"] == "zebrad"
 
 
 def test_run_pyinfra_passes_y_flag(monkeypatch):

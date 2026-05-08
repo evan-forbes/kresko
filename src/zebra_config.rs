@@ -1,8 +1,57 @@
 use anyhow::{Context, Result};
+use std::str::FromStr;
 use toml::map::Map;
+use zebra_chain::transparent::Address as TransparentAddress;
 
 use crate::config::Instance;
 use crate::config::{DaaConfig, NetworkKind};
+
+/// A single one-time NU6.1 lockbox disbursement entry, matching zebra's
+/// `[[network.testnet_parameters.lockbox_disbursements]]` schema.
+///
+/// Validation enforces P2SH on construction — P2PKH disbursements caused
+/// zebrad to panic during NU6.1 activation, so no non-P2SH entry should
+/// ever leave kresko.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockboxDisbursement {
+    pub address: String,
+    pub amount_zats: u64,
+}
+
+impl LockboxDisbursement {
+    /// Construct a disbursement, asserting the address is a transparent P2SH
+    /// address (`t3...` mainnet / `t2...` testnet).
+    pub fn new_p2sh(address: impl Into<String>, amount_zats: u64) -> Result<Self> {
+        let address = address.into();
+        ensure_address_is_p2sh(&address)?;
+        Ok(Self {
+            address,
+            amount_zats,
+        })
+    }
+}
+
+/// Reject anything that isn't a transparent P2SH address. P2PKH (`t1`/`tm`)
+/// makes zebrad panic at NU6.1 activation; Tex addresses are a separate
+/// shape that zebra's lockbox validator does not accept.
+fn ensure_address_is_p2sh(address: &str) -> Result<()> {
+    let parsed = TransparentAddress::from_str(address).with_context(|| {
+        format!(
+            "lockbox disbursement address {address} is not a valid transparent address"
+        )
+    })?;
+    match parsed {
+        TransparentAddress::PayToScriptHash { .. } => Ok(()),
+        TransparentAddress::PayToPublicKeyHash { .. } => anyhow::bail!(
+            "lockbox disbursement address {address} is P2PKH; zebrad panics on \
+             non-P2SH disbursements at NU6.1 activation. Use a P2SH (t2/t3) address."
+        ),
+        TransparentAddress::Tex { .. } => anyhow::bail!(
+            "lockbox disbursement address {address} is a Tex address; only P2SH \
+             (t2/t3) is accepted in lockbox_disbursements."
+        ),
+    }
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -16,6 +65,11 @@ pub struct LocalTestnetParameters {
     pub slow_start_interval: u32,
     pub pre_blossom_halving_interval: u32,
     pub activation_height: u32,
+    /// One-time NU6.1 lockbox disbursements emitted in
+    /// `[[network.testnet_parameters.lockbox_disbursements]]`. Empty by
+    /// default — kresko does not activate NU6.1 unless an experiment opts
+    /// in. Every entry is required to be P2SH (see `LockboxDisbursement`).
+    pub lockbox_disbursements: Vec<LockboxDisbursement>,
     /// Legacy knobs kept in metadata for old generated configs. Zebra's NU7
     /// testnet config does not accept these fields, so rendering skips them.
     pub post_blossom_pow_target_spacing: Option<u32>,
@@ -66,7 +120,6 @@ pub fn template_for(network_kind: NetworkKind) -> Result<String> {
             );
             set_path(&mut config, &["rpc", "parallel_cpu_threads"], 1.into());
             set_path(&mut config, &["sync", "parallel_cpu_threads"], 1.into());
-            set_path(&mut config, &["tracing", "use_color"], false.into());
         }
         NetworkKind::PublicTestnet => {
             set_path(&mut config, &["network", "network"], "Testnet".into());
@@ -82,7 +135,6 @@ pub fn template_for(network_kind: NetworkKind) -> Result<String> {
             );
             set_path(&mut config, &["rpc", "listen_addr"], "0.0.0.0:18232".into());
             set_path(&mut config, &["rpc", "enable_cookie_auth"], false.into());
-            set_path(&mut config, &["tracing", "use_color"], false.into());
         }
         NetworkKind::Mainnet => {
             set_path(&mut config, &["network", "network"], "Mainnet".into());
@@ -98,7 +150,6 @@ pub fn template_for(network_kind: NetworkKind) -> Result<String> {
             );
             set_path(&mut config, &["rpc", "listen_addr"], "0.0.0.0:8232".into());
             set_path(&mut config, &["rpc", "enable_cookie_auth"], false.into());
-            set_path(&mut config, &["tracing", "use_color"], false.into());
         }
     }
 
@@ -260,6 +311,75 @@ fn initial_peers_from_template(template: &str, peer_key: &str) -> Result<Vec<Str
         .collect()
 }
 
+/// Produce a bootstrap variant of `config` with all P2P peering disabled.
+///
+/// The bootstrap config is what node_init.sh hands to a short-lived `zebrad`
+/// process when it needs to do RPC work (e.g. generate a wallet address or
+/// seed local-genesis blocks) before joining the fleet. We need to:
+///
+/// - Bind the P2P listener to `127.0.0.1:0` so the bootstrap node never
+///   announces itself on the public IP.
+/// - Empty `initial_testnet_peers` / `initial_mainnet_peers` so it doesn't
+///   try to dial the (still-being-provisioned) fleet.
+///
+/// Doing this in Rust at payload-build time means node_init.sh no longer
+/// has to munge TOML with awk.
+pub fn bootstrap_config_for_isolated_rpc(config: &str) -> Result<String> {
+    let mut parsed: toml::Value = toml::from_str(config).context("failed to parse zebrad.toml")?;
+    set_path(
+        &mut parsed,
+        &["network", "listen_addr"],
+        "127.0.0.1:0".into(),
+    );
+    set_path(
+        &mut parsed,
+        &["network", "initial_testnet_peers"],
+        toml::Value::Array(Vec::new()),
+    );
+    set_path(
+        &mut parsed,
+        &["network", "initial_mainnet_peers"],
+        toml::Value::Array(Vec::new()),
+    );
+    toml::to_string_pretty(&parsed).context("failed to serialize bootstrap zebrad.toml")
+}
+
+/// Strip the optional `network.testnet_parameters.genesis_block_path` key
+/// from a rendered config. Older zebrad versions reject the field, so we
+/// remove it for forward/backward compatibility.
+pub fn strip_genesis_block_path(config: &str) -> Result<String> {
+    let mut parsed: toml::Value = toml::from_str(config).context("failed to parse zebrad.toml")?;
+    if let Some(testnet_params) = parsed
+        .get_mut("network")
+        .and_then(|n| n.get_mut("testnet_parameters"))
+        .and_then(|tp| tp.as_table_mut())
+    {
+        testnet_params.remove("genesis_block_path");
+    }
+    toml::to_string_pretty(&parsed).context("failed to serialize zebrad.toml")
+}
+
+/// Read `network.testnet_parameters.genesis_hash` from a rendered config.
+pub fn read_genesis_hash(config: &str) -> Result<Option<String>> {
+    let parsed: toml::Value = toml::from_str(config).context("failed to parse zebrad.toml")?;
+    Ok(parsed
+        .get("network")
+        .and_then(|n| n.get("testnet_parameters"))
+        .and_then(|tp| tp.get("genesis_hash"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_lowercase))
+}
+
+/// Read `mining.miner_address` from a rendered config.
+pub fn read_miner_address(config: &str) -> Result<Option<String>> {
+    let parsed: toml::Value = toml::from_str(config).context("failed to parse zebrad.toml")?;
+    Ok(parsed
+        .get("mining")
+        .and_then(|m| m.get("miner_address"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_string))
+}
+
 /// Set `mining.miner_address` to a concrete address in a rendered zebrad.toml.
 pub fn set_miner_address(config: &str, miner_address: &str) -> Result<String> {
     let mut parsed: toml::Value = toml::from_str(config).context("failed to parse zebrad.toml")?;
@@ -310,9 +430,36 @@ pub fn apply_local_testnet_parameters(
         "pre_blossom_halving_interval".to_string(),
         i64::from(params.pre_blossom_halving_interval).into(),
     );
+    let mut disbursement_entries: Vec<toml::Value> = Vec::with_capacity(
+        params.lockbox_disbursements.len(),
+    );
+    for disbursement in &params.lockbox_disbursements {
+        // Belt-and-braces: even if the caller built the struct directly,
+        // refuse to write a config that zebrad will refuse to load.
+        ensure_address_is_p2sh(&disbursement.address).with_context(|| {
+            format!(
+                "lockbox disbursement {} failed P2SH validation",
+                disbursement.address
+            )
+        })?;
+        let mut entry = Map::new();
+        entry.insert("address".into(), disbursement.address.clone().into());
+        entry.insert(
+            "amount".into(),
+            i64::try_from(disbursement.amount_zats)
+                .with_context(|| {
+                    format!(
+                        "lockbox disbursement amount {} does not fit in i64",
+                        disbursement.amount_zats
+                    )
+                })?
+                .into(),
+        );
+        disbursement_entries.push(toml::Value::Table(entry));
+    }
     testnet_params.insert(
         "lockbox_disbursements".to_string(),
-        toml::Value::Array(Vec::new()),
+        toml::Value::Array(disbursement_entries),
     );
     // Local genesis generation clears funding streams; mirror that here to avoid
     // default Testnet recipient validation for short custom halving intervals.
@@ -371,6 +518,16 @@ fn empty_recipients_table() -> toml::Value {
 
 /// Parse and validate the rendered config so experiment-specific testnet
 /// parameters cannot be silently dropped during templating.
+///
+/// Catches three classes of inconsistency that would otherwise only surface
+/// at `zebrad start` time:
+///
+/// 1. The rendered target_difficulty_limit / genesis_hash do not match the
+///    values the genesis builder produced — i.e. the on-disk chain does not
+///    match the on-disk config.
+/// 2. The activation_heights table is missing entries the genesis builder
+///    relied on (e.g. NU7).
+/// 3. Any lockbox disbursement entry that survived rendering is non-P2SH.
 pub fn verify_local_testnet_parameters(
     config: &str,
     params: &LocalTestnetParameters,
@@ -392,6 +549,62 @@ pub fn verify_local_testnet_parameters(
             params.target_difficulty_limit,
             actual_target,
         );
+    }
+
+    let actual_genesis = testnet_params
+        .get("genesis_hash")
+        .and_then(toml::Value::as_str)
+        .context("missing network.testnet_parameters.genesis_hash")?;
+    if !actual_genesis.eq_ignore_ascii_case(&params.genesis_hash) {
+        anyhow::bail!(
+            "rendered genesis_hash mismatch: generated chain has {}, but rendered \
+             config has {}. Re-run `kresko genesis` so the config matches the chain.",
+            params.genesis_hash,
+            actual_genesis,
+        );
+    }
+
+    let activation = testnet_params
+        .get("activation_heights")
+        .and_then(toml::Value::as_table)
+        .context("missing network.testnet_parameters.activation_heights table")?;
+    for upgrade in [
+        "Overwinter", "Sapling", "Blossom", "Heartwood", "Canopy", "NU5", "NU6", "NU7",
+    ] {
+        let height = activation
+            .get(upgrade)
+            .and_then(toml::Value::as_integer)
+            .with_context(|| {
+                format!("missing activation height for {upgrade} in rendered config")
+            })?;
+        if height != i64::from(params.activation_height) {
+            anyhow::bail!(
+                "rendered activation height for {upgrade} is {height}, expected {}",
+                params.activation_height,
+            );
+        }
+    }
+
+    if let Some(rendered) = testnet_params
+        .get("lockbox_disbursements")
+        .and_then(toml::Value::as_array)
+    {
+        if rendered.len() != params.lockbox_disbursements.len() {
+            anyhow::bail!(
+                "rendered lockbox_disbursements length mismatch: expected {}, got {}",
+                params.lockbox_disbursements.len(),
+                rendered.len(),
+            );
+        }
+        for entry in rendered {
+            let address = entry
+                .get("address")
+                .and_then(toml::Value::as_str)
+                .context("rendered lockbox disbursement entry missing address")?;
+            ensure_address_is_p2sh(address).with_context(|| {
+                format!("rendered config has non-P2SH lockbox disbursement {address}")
+            })?;
+        }
     }
 
     Ok(())
@@ -486,11 +699,17 @@ fn extract_miner_address(template: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalTestnetParameters, apply_local_testnet_parameters, ensure_miner_address_is_set,
-        generate_node_config, set_miner_address, template_for, testnet_toml_parameters,
-        verify_local_testnet_parameters,
+        LocalTestnetParameters, LockboxDisbursement, apply_local_testnet_parameters,
+        bootstrap_config_for_isolated_rpc, ensure_miner_address_is_set, generate_node_config,
+        read_genesis_hash, read_miner_address, set_miner_address, strip_genesis_block_path,
+        template_for, testnet_toml_parameters, verify_local_testnet_parameters,
     };
     use crate::config::{DaaConfig, Instance, NetworkKind, NodeType, Provider};
+
+    // Known-valid testnet P2SH and P2PKH addresses borrowed from
+    // zebra-chain's own test vectors.
+    const P2SH_TESTNET: &str = "t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz";
+    const P2PKH_TESTNET: &str = "tmTc6trRhbv96kGfA99i7vrFwb5p7BVFwc3";
 
     fn miner(name: &str, ip: &str) -> Instance {
         Instance {
@@ -556,6 +775,33 @@ mod tests {
                 .and_then(|rpc| rpc.get("debug_force_finished_sync"))
                 .and_then(toml::Value::as_bool),
             Some(true),
+        );
+    }
+
+    #[test]
+    fn generated_local_template_does_not_overlay_tracing_section() {
+        // Trust ZebradConfig::default() for the [tracing] section. Kresko
+        // should not enable, disable, or recolour tracing on the testnet
+        // path unless an experiment explicitly asks for it.
+        let default_config = parsed(
+            &toml::to_string_pretty(
+                &toml::Value::try_from(zebrad::config::ZebradConfig::default())
+                    .expect("zebra default should serialize"),
+            )
+            .expect("zebra default should re-serialize"),
+        );
+        let generated = parsed(
+            &template_for(NetworkKind::LocalGenesis).expect("template generation"),
+        );
+        let default_tracing = default_config
+            .get("tracing")
+            .expect("zebra default has [tracing]");
+        let generated_tracing = generated
+            .get("tracing")
+            .expect("generated template has [tracing]");
+        assert_eq!(
+            default_tracing, generated_tracing,
+            "kresko must not overlay zebra's default [tracing] section",
         );
     }
 
@@ -703,6 +949,341 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_config_isolates_rpc_from_fleet() {
+        let template = template_for(NetworkKind::PublicTestnet)
+            .expect("public testnet template generation");
+        let bootstrap = bootstrap_config_for_isolated_rpc(&template)
+            .expect("bootstrap config generation");
+        let parsed = parsed(&bootstrap);
+        assert_eq!(
+            parsed
+                .get("network")
+                .and_then(|n| n.get("listen_addr"))
+                .and_then(toml::Value::as_str),
+            Some("127.0.0.1:0"),
+        );
+        assert!(
+            parsed
+                .get("network")
+                .and_then(|n| n.get("initial_testnet_peers"))
+                .and_then(toml::Value::as_array)
+                .map(Vec::is_empty)
+                .unwrap_or(false),
+            "initial_testnet_peers must be empty in bootstrap config",
+        );
+        assert!(
+            parsed
+                .get("network")
+                .and_then(|n| n.get("initial_mainnet_peers"))
+                .and_then(toml::Value::as_array)
+                .map(Vec::is_empty)
+                .unwrap_or(false),
+            "initial_mainnet_peers must be empty in bootstrap config",
+        );
+    }
+
+    #[test]
+    fn bootstrap_config_handles_multiline_peer_arrays() {
+        // A previous shell-based bootstrap path crashed on multiline peer
+        // arrays because it sed-deleted only the first line of the array.
+        // The TOML-aware path must round-trip a multiline array cleanly.
+        let multiline = r#"[network]
+network = "Testnet"
+listen_addr = "0.0.0.0:18233"
+initial_testnet_peers = [
+    "1.1.1.1:18233",
+    "2.2.2.2:18233",
+    "3.3.3.3:18233",
+]
+initial_mainnet_peers = []
+"#;
+        let bootstrap = bootstrap_config_for_isolated_rpc(multiline)
+            .expect("bootstrap from multiline-peer config");
+        let parsed = parsed(&bootstrap);
+        assert_eq!(
+            parsed
+                .get("network")
+                .and_then(|n| n.get("initial_testnet_peers"))
+                .and_then(toml::Value::as_array)
+                .map(Vec::len),
+            Some(0),
+            "multiline peer array must be cleared in bootstrap, not partially edited",
+        );
+        assert_eq!(
+            parsed
+                .get("network")
+                .and_then(|n| n.get("listen_addr"))
+                .and_then(toml::Value::as_str),
+            Some("127.0.0.1:0"),
+        );
+    }
+
+    #[test]
+    fn strip_genesis_block_path_is_idempotent() {
+        let template = template_for(NetworkKind::LocalGenesis).expect("template");
+        let mut config = template.clone();
+        config.push_str(
+            "[network.testnet_parameters]\ngenesis_block_path = \"/tmp/genesis\"\n",
+        );
+        let stripped = strip_genesis_block_path(&config).expect("strip");
+        assert!(!stripped.contains("genesis_block_path"));
+        // Idempotent: stripping again is a no-op.
+        let again = strip_genesis_block_path(&stripped).expect("strip again");
+        assert!(!again.contains("genesis_block_path"));
+    }
+
+    #[test]
+    fn read_miner_address_and_genesis_hash_round_trip_through_toml() {
+        let template = template_for(NetworkKind::LocalGenesis).expect("template");
+        let with_address =
+            set_miner_address(&template, "tmExampleAddress").expect("set miner address");
+        assert_eq!(
+            read_miner_address(&with_address).expect("read miner address"),
+            Some("tmExampleAddress".to_string()),
+        );
+        let params = LocalTestnetParameters {
+            network_name: "ReadTestNet".to_string(),
+            network_magic: [1, 2, 3, 4],
+            target_difficulty_limit: "0x0f".to_string(),
+            disable_pow: false,
+            genesis_hash: "AB".repeat(32),
+            checkpoints_path: "/tmp/checkpoints".to_string(),
+            slow_start_interval: 0,
+            pre_blossom_halving_interval: 144,
+            activation_height: 1,
+            lockbox_disbursements: Vec::new(),
+            post_blossom_pow_target_spacing: None,
+            daa: DaaConfig::default(),
+            pow_start_height: None,
+        };
+        let with_params = apply_local_testnet_parameters(&with_address, &params)
+            .expect("apply local testnet parameters");
+        // Lowercased so the equality check matches `expected_genesis_hash`
+        // computed by node_init.sh's RPC response normalisation.
+        assert_eq!(
+            read_genesis_hash(&with_params).expect("read genesis hash"),
+            Some("ab".repeat(32)),
+        );
+    }
+
+    #[test]
+    fn template_is_built_from_zebrad_default_config() {
+        // Trust upstream Zebra to define what fields a config has — kresko
+        // only ever overlays a few mining-friendly knobs.
+        let default_serialized = toml::to_string_pretty(
+            &toml::Value::try_from(zebrad::config::ZebradConfig::default())
+                .expect("zebra default should serialize"),
+        )
+        .expect("zebra default should re-serialize");
+        let default_config = parsed(&default_serialized);
+        let generated = parsed(
+            &template_for(NetworkKind::LocalGenesis).expect("template generation"),
+        );
+        // Every section that ZebradConfig::default() declares must still
+        // exist in the generated template, so we never drop sections by
+        // accident.
+        let default_table = default_config
+            .as_table()
+            .expect("zebra default is a TOML table");
+        for (section, _) in default_table {
+            assert!(
+                generated.get(section).is_some(),
+                "kresko template dropped Zebra default section [{section}]",
+            );
+        }
+    }
+
+    #[test]
+    fn local_testnet_preserves_required_fields() {
+        // Required testnet identity (network_name, magic, genesis hash,
+        // target limit, checkpoints, activation heights) must round-trip
+        // through apply_local_testnet_parameters intact.
+        let params = LocalTestnetParameters {
+            network_name: "RequiredFieldsNet".to_string(),
+            network_magic: [9, 8, 7, 6],
+            target_difficulty_limit: "0x1f".to_string(),
+            disable_pow: false,
+            genesis_hash: "11".repeat(32),
+            checkpoints_path: "/root/payload/local_genesis/checkpoints.txt".to_string(),
+            slow_start_interval: 0,
+            pre_blossom_halving_interval: 144,
+            activation_height: 5,
+            lockbox_disbursements: Vec::new(),
+            post_blossom_pow_target_spacing: None,
+            daa: DaaConfig::default(),
+            pow_start_height: None,
+        };
+        let template = template_for(NetworkKind::LocalGenesis).expect("template generation");
+        let generated = apply_local_testnet_parameters(&template, &params)
+            .expect("apply_local_testnet_parameters");
+        let parsed = parsed(&generated);
+        let testnet_params = parsed
+            .get("network")
+            .and_then(|n| n.get("testnet_parameters"))
+            .expect("testnet_parameters present");
+        assert_eq!(
+            testnet_params.get("network_name").and_then(toml::Value::as_str),
+            Some("RequiredFieldsNet"),
+        );
+        assert_eq!(
+            testnet_params
+                .get("target_difficulty_limit")
+                .and_then(toml::Value::as_str),
+            Some("0x1f"),
+        );
+        assert_eq!(
+            testnet_params
+                .get("genesis_hash")
+                .and_then(toml::Value::as_str),
+            Some("11".repeat(32).as_str()),
+        );
+        assert_eq!(
+            testnet_params
+                .get("checkpoints")
+                .and_then(toml::Value::as_str),
+            Some("/root/payload/local_genesis/checkpoints.txt"),
+        );
+        let magic_bytes: Vec<i64> = testnet_params
+            .get("network_magic")
+            .and_then(toml::Value::as_array)
+            .expect("network_magic")
+            .iter()
+            .map(|v| v.as_integer().expect("byte"))
+            .collect();
+        assert_eq!(magic_bytes, vec![9, 8, 7, 6]);
+        // Activation heights table must exist and cover Overwinter..NU7.
+        let activation = testnet_params
+            .get("activation_heights")
+            .and_then(toml::Value::as_table)
+            .expect("activation_heights");
+        for upgrade in ["Overwinter", "Sapling", "Blossom", "Heartwood", "Canopy", "NU5", "NU6", "NU7"] {
+            assert!(
+                activation.contains_key(upgrade),
+                "activation height {upgrade} must be set",
+            );
+        }
+    }
+
+    fn local_testnet_params_with(
+        genesis_hash: &str,
+        activation_height: u32,
+        lockbox: Vec<LockboxDisbursement>,
+    ) -> LocalTestnetParameters {
+        LocalTestnetParameters {
+            network_name: "CrossValTestNet".to_string(),
+            network_magic: [4, 3, 2, 1],
+            target_difficulty_limit: "0x0f".to_string(),
+            disable_pow: false,
+            genesis_hash: genesis_hash.to_string(),
+            checkpoints_path: "/root/payload/local_genesis/checkpoints.txt".to_string(),
+            slow_start_interval: 0,
+            pre_blossom_halving_interval: 144,
+            activation_height,
+            lockbox_disbursements: lockbox,
+            post_blossom_pow_target_spacing: None,
+            daa: DaaConfig::default(),
+            pow_start_height: None,
+        }
+    }
+
+    #[test]
+    fn lockbox_disbursement_constructor_rejects_p2pkh() {
+        // P2PKH crashes zebrad at NU6.1 activation, so the constructor must
+        // refuse to build one.
+        let err = LockboxDisbursement::new_p2sh(P2PKH_TESTNET, 0)
+            .expect_err("P2PKH must not be accepted as a disbursement address");
+        assert!(err.to_string().contains("P2PKH"), "{err}");
+    }
+
+    #[test]
+    fn lockbox_disbursement_constructor_accepts_p2sh() {
+        LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0).expect("P2SH testnet address must be accepted");
+    }
+
+    #[test]
+    fn apply_local_testnet_parameters_emits_lockbox_disbursements_as_toml_array_of_tables() {
+        let params = local_testnet_params_with(
+            &"aa".repeat(32),
+            5,
+            vec![LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0).unwrap()],
+        );
+        let template = template_for(NetworkKind::LocalGenesis).expect("template");
+        let rendered = apply_local_testnet_parameters(&template, &params)
+            .expect("apply with one P2SH disbursement");
+        let parsed = parsed(&rendered);
+        let entries = parsed
+            .get("network")
+            .and_then(|n| n.get("testnet_parameters"))
+            .and_then(|tp| tp.get("lockbox_disbursements"))
+            .and_then(toml::Value::as_array)
+            .expect("lockbox_disbursements rendered as array");
+        assert_eq!(entries.len(), 1);
+        let entry = entries[0].as_table().expect("entry is a table");
+        assert_eq!(entry.get("address").and_then(toml::Value::as_str), Some(P2SH_TESTNET));
+        assert_eq!(entry.get("amount").and_then(toml::Value::as_integer), Some(0));
+    }
+
+    #[test]
+    fn apply_local_testnet_parameters_rejects_p2pkh_lockbox() {
+        // Belt-and-braces: even if a caller sneaks a P2PKH entry past the
+        // constructor (e.g. via a serde round-trip), the renderer must
+        // reject it.
+        let mut params = local_testnet_params_with(&"aa".repeat(32), 5, Vec::new());
+        params.lockbox_disbursements.push(LockboxDisbursement {
+            address: P2PKH_TESTNET.to_string(),
+            amount_zats: 0,
+        });
+        let template = template_for(NetworkKind::LocalGenesis).expect("template");
+        let err = apply_local_testnet_parameters(&template, &params)
+            .expect_err("rendering must fail on a P2PKH lockbox entry");
+        assert!(err.to_string().contains("P2SH validation"), "{err}");
+    }
+
+    #[test]
+    fn verify_detects_genesis_hash_drift_between_chain_and_config() {
+        let chain_hash = "11".repeat(32);
+        let drifted_hash = "22".repeat(32);
+        let params = local_testnet_params_with(&chain_hash, 5, Vec::new());
+        let template = template_for(NetworkKind::LocalGenesis).expect("template");
+        // Render the config with the *drifted* hash, simulating a config
+        // that no longer matches the chain on disk.
+        let mut drifted_params = params.clone();
+        drifted_params.genesis_hash = drifted_hash;
+        let rendered = apply_local_testnet_parameters(&template, &drifted_params)
+            .expect("apply parameters");
+        let err = verify_local_testnet_parameters(&rendered, &params)
+            .expect_err("verify must catch the drift");
+        assert!(err.to_string().contains("genesis_hash mismatch"), "{err}");
+    }
+
+    #[test]
+    fn verify_detects_activation_height_drift_between_chain_and_config() {
+        let params = local_testnet_params_with(&"aa".repeat(32), 5, Vec::new());
+        let template = template_for(NetworkKind::LocalGenesis).expect("template");
+        let mut drifted = params.clone();
+        drifted.activation_height = 12;
+        let rendered = apply_local_testnet_parameters(&template, &drifted)
+            .expect("apply parameters");
+        let err = verify_local_testnet_parameters(&rendered, &params)
+            .expect_err("verify must catch the activation drift");
+        assert!(err.to_string().contains("activation height"), "{err}");
+    }
+
+    #[test]
+    fn verify_passes_when_chain_and_config_agree() {
+        let params = local_testnet_params_with(
+            &"aa".repeat(32),
+            5,
+            vec![LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0).unwrap()],
+        );
+        let template = template_for(NetworkKind::LocalGenesis).expect("template");
+        let rendered = apply_local_testnet_parameters(&template, &params)
+            .expect("apply parameters");
+        verify_local_testnet_parameters(&rendered, &params)
+            .expect("matching chain + config must pass cross-validation");
+    }
+
+    #[test]
     fn injects_local_testnet_parameters() {
         let params = LocalTestnetParameters {
             network_name: "LocalGenesisNet".to_string(),
@@ -714,6 +1295,7 @@ mod tests {
             slow_start_interval: 0,
             pre_blossom_halving_interval: 144,
             activation_height: 1,
+            lockbox_disbursements: Vec::new(),
             post_blossom_pow_target_spacing: Some(25),
             daa: DaaConfig {
                 pow_averaging_window: Some(8),

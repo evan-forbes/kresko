@@ -17,3 +17,5 @@ __pycache__/
 **/kresko/runs/
 **/.kresko/state.json
 **/.kresko/runs/
+**/.kresko/
+.kresko/
