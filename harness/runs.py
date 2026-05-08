@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from kresko_py import paths
+from harness import paths
 
 MANIFEST_FILENAME = "manifest.json"
 NODES_DIRNAME = "nodes"

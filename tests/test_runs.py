@@ -5,8 +5,8 @@ import os
 
 import pytest
 
-from kresko_py import paths
-from kresko_py.runs import (
+from harness import paths
+from harness.runs import (
     ENV_EXPERIMENT,
     ENV_RUN_DIR,
     ENV_RUN_NAME,

@@ -36,7 +36,7 @@ set -euo pipefail
 #
 # - Run from the experiment directory, or set EXPERIMENT_DIR below.
 # - The experiment was provisioned and deployed via the Python orchestration
-#   layer (`kresko_py`) for either `public-testnet` or `mainnet`.
+#   layer (`harness`) for either `public-testnet` or `mainnet`.
 # - Nodes have already been created/deployed/synced when you reach prepare/run.
 # - For public testnet, first practice the full lifecycle with small funds.
 # - Do not enable mainnet runs until public-testnet recovery drills pass.

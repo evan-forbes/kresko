@@ -80,7 +80,7 @@ def reset_command(
 
 
 APT_LOCK_WAIT = (
-    # Fresh DO droplets run unattended-upgrades on first boot, which holds
+    # Fresh Ubuntu cloud instances often run unattended-upgrades on first boot, which holds
     # the dpkg + apt-lists locks. Block until both are free before any
     # apt operations so pyinfra doesn't race with the cloud-init upgrade.
     "for _ in $(seq 1 90); do "

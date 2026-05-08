@@ -5,10 +5,11 @@ import subprocess
 
 import pytest
 
-from kresko_py import DigitalOceanNodeType, Experiment, paths
-from kresko_py import assets as assets_store
-from kresko_py.experiment import ENV_EXPERIMENT, ENV_RUN_DIR, ENV_RUN_NAME, run_pyinfra
-from kresko_py.runs import start_run
+from harness import Experiment, NodeType, paths
+from harness import assets as assets_store
+from harness.experiment import ENV_EXPERIMENT, ENV_RUN_DIR, ENV_RUN_NAME, run_pyinfra
+from harness.providers import DigitalOceanError, DigitalOceanProvider
+from harness.runs import start_run
 
 
 @pytest.fixture
@@ -49,7 +50,7 @@ class FakeDigitalOcean:
             self.droplets_by_tag.setdefault(tag, []).append(droplet)
         return droplet
 
-    def wait_for_ips(self, droplet_id):
+    def wait_for_ips(self, droplet_id, attempts=60, delay_secs=5.0):
         droplet = dict(self.droplets_by_id[str(droplet_id)])
         droplet["status"] = "active"
         droplet["networks"] = {
@@ -64,8 +65,9 @@ class FakeDigitalOcean:
         self.deleted.append(str(droplet_id))
 
 
-def miner_type() -> DigitalOceanNodeType:
-    return DigitalOceanNodeType(
+def miner_type() -> NodeType:
+    return NodeType(
+        provider="digitalocean",
         role="miner",
         region="nyc3",
         size="s-1vcpu-1gb",
@@ -73,6 +75,10 @@ def miner_type() -> DigitalOceanNodeType:
         payload_paths=["payload"],
         tags=["suite"],
     )
+
+
+def fake_provider(fake: FakeDigitalOcean) -> dict[str, DigitalOceanProvider]:
+    return {"digitalocean": DigitalOceanProvider(fake)}
 
 
 def make_experiment(home, monkeypatch, name="api-exp", run="api-exp", **kwargs) -> Experiment:
@@ -90,7 +96,7 @@ def make_experiment(home, monkeypatch, name="api-exp", run="api-exp", **kwargs) 
 def test_experiment_plan_creates_no_assets_but_writes_result(home, monkeypatch):
     fake = FakeDigitalOcean()
     experiment = make_experiment(
-        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, providers=fake_provider(fake)
     )
     experiment.add(miner_type(), count=2)
 
@@ -106,7 +112,7 @@ def test_experiment_plan_creates_no_assets_but_writes_result(home, monkeypatch):
 def test_experiment_up_writes_assets_and_node_snapshots(home, monkeypatch):
     fake = FakeDigitalOcean()
     experiment = make_experiment(
-        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, providers=fake_provider(fake)
     )
     experiment.add(miner_type(), count=1)
 
@@ -125,7 +131,7 @@ def test_experiment_up_writes_assets_and_node_snapshots(home, monkeypatch):
 def test_experiment_deploy_dry_run_writes_pyinfra_files(home, monkeypatch):
     fake = FakeDigitalOcean()
     experiment = make_experiment(
-        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, providers=fake_provider(fake)
     )
     experiment.add(miner_type(), count=1)
     experiment.up()
@@ -149,7 +155,7 @@ def test_experiment_deploy_dry_run_writes_pyinfra_files(home, monkeypatch):
 def test_experiment_run_tmux_uses_runner_hook(home, monkeypatch):
     fake = FakeDigitalOcean()
     experiment = make_experiment(
-        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, providers=fake_provider(fake)
     )
     experiment.add(miner_type(), count=1)
     experiment.up()
@@ -172,7 +178,7 @@ def test_experiment_run_tmux_uses_runner_hook(home, monkeypatch):
 def test_experiment_reset_dispatches_to_remote_command(home, monkeypatch):
     fake = FakeDigitalOcean()
     experiment = make_experiment(
-        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, providers=fake_provider(fake)
     )
     experiment.add(miner_type(), count=1)
     experiment.up()
@@ -199,7 +205,7 @@ def test_experiment_reset_dispatches_to_remote_command(home, monkeypatch):
 def test_experiment_down_dry_run_validates_assets(home, monkeypatch):
     fake = FakeDigitalOcean()
     experiment = make_experiment(
-        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, providers=fake_provider(fake)
     )
     experiment.add(miner_type(), count=1)
     experiment.up()
@@ -219,7 +225,7 @@ def test_experiment_down_dry_run_validates_assets(home, monkeypatch):
 
 def test_experiment_shell_tees_into_run_dir(home, monkeypatch):
     fake = FakeDigitalOcean()
-    experiment = make_experiment(home, monkeypatch, digitalocean_client=fake)
+    experiment = make_experiment(home, monkeypatch, providers=fake_provider(fake))
 
     experiment.shell(["echo", "hello"])
 
@@ -229,8 +235,6 @@ def test_experiment_shell_tees_into_run_dir(home, monkeypatch):
 
 
 def test_experiment_up_returns_partial_success_on_create_failure(home, monkeypatch):
-    from kresko_py.digitalocean import DigitalOceanError
-
     class CapacityFake(FakeDigitalOcean):
         def create_droplet(self, request):
             if request["name"] == "miner-1":
@@ -239,7 +243,7 @@ def test_experiment_up_returns_partial_success_on_create_failure(home, monkeypat
 
     fake = CapacityFake()
     experiment = make_experiment(
-        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, providers=fake_provider(fake)
     )
     experiment.add(miner_type(), count=2)
 
@@ -258,17 +262,15 @@ def test_experiment_up_returns_partial_success_on_create_failure(home, monkeypat
 
 
 def test_experiment_deploy_skips_failed_nodes(home, monkeypatch):
-    from kresko_py.digitalocean import DigitalOceanError
-
     class TimeoutFake(FakeDigitalOcean):
-        def wait_for_ips(self, droplet_id):
+        def wait_for_ips(self, droplet_id, attempts=60, delay_secs=5.0):
             if str(droplet_id) == "1":
                 raise DigitalOceanError(f"timed out waiting for droplet {droplet_id} IP")
             return super().wait_for_ips(droplet_id)
 
     fake = TimeoutFake()
     experiment = make_experiment(
-        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, providers=fake_provider(fake)
     )
     experiment.add(miner_type(), count=2)
     up = experiment.up()
@@ -285,19 +287,17 @@ def test_experiment_deploy_skips_failed_nodes(home, monkeypatch):
 
 
 def test_experiment_up_retry_failed_clears_marker(home, monkeypatch):
-    from kresko_py.digitalocean import DigitalOceanError
-
     state = {"timeout_for": {"1"}}
 
     class FlakyFake(FakeDigitalOcean):
-        def wait_for_ips(self, droplet_id):
+        def wait_for_ips(self, droplet_id, attempts=60, delay_secs=5.0):
             if str(droplet_id) in state["timeout_for"]:
                 raise DigitalOceanError(f"timed out waiting for droplet {droplet_id} IP")
             return super().wait_for_ips(droplet_id)
 
     fake = FlakyFake()
     experiment = make_experiment(
-        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, providers=fake_provider(fake)
     )
     experiment.add(miner_type(), count=1)
     first = experiment.up()
@@ -315,7 +315,7 @@ def test_experiment_up_retry_failed_clears_marker(home, monkeypatch):
 
 def test_override_patches_size_image_region_for_role(home, monkeypatch):
     fake = FakeDigitalOcean()
-    experiment = make_experiment(home, monkeypatch, digitalocean_client=fake)
+    experiment = make_experiment(home, monkeypatch, providers=fake_provider(fake))
     experiment.add(miner_type(), count=2)
 
     experiment.override("miner", size="s-8vcpu-16gb", image="ubuntu-25-04-x64", region="ams3")
@@ -330,7 +330,7 @@ def test_override_patches_size_image_region_for_role(home, monkeypatch):
 
 def test_override_patches_count(home, monkeypatch):
     fake = FakeDigitalOcean()
-    experiment = make_experiment(home, monkeypatch, digitalocean_client=fake)
+    experiment = make_experiment(home, monkeypatch, providers=fake_provider(fake))
     experiment.add(miner_type(), count=4)
 
     experiment.override("miner", count=8)
@@ -341,9 +341,10 @@ def test_override_patches_count(home, monkeypatch):
 
 def test_override_skips_other_roles(home, monkeypatch):
     fake = FakeDigitalOcean()
-    experiment = make_experiment(home, monkeypatch, digitalocean_client=fake)
+    experiment = make_experiment(home, monkeypatch, providers=fake_provider(fake))
     experiment.add(miner_type(), count=1)
-    rpc = DigitalOceanNodeType(
+    rpc = NodeType(
+        provider="digitalocean",
         role="rpc",
         region="nyc3",
         size="s-1vcpu-1gb",
@@ -362,7 +363,7 @@ def test_override_skips_other_roles(home, monkeypatch):
 def test_deploy_records_local_binary_provenance_from_payload_manifest(home, monkeypatch):
     fake = FakeDigitalOcean()
     experiment = make_experiment(
-        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, providers=fake_provider(fake)
     )
     experiment.add(miner_type(), count=1)
     experiment.up()
@@ -398,7 +399,7 @@ def test_deploy_records_local_binary_provenance_from_payload_manifest(home, monk
 def test_deploy_parses_remote_provenance_lines(home, monkeypatch):
     fake = FakeDigitalOcean()
     experiment = make_experiment(
-        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, providers=fake_provider(fake)
     )
     experiment.add(miner_type(), count=1)
     experiment.up()
@@ -423,7 +424,7 @@ def test_deploy_parses_remote_provenance_lines(home, monkeypatch):
 def test_deploy_provenance_buckets_first_install(home, monkeypatch):
     fake = FakeDigitalOcean()
     experiment = make_experiment(
-        home, monkeypatch, ssh={"key_name": "kresko-key"}, digitalocean_client=fake
+        home, monkeypatch, ssh={"key_name": "kresko-key"}, providers=fake_provider(fake)
     )
     experiment.add(miner_type(), count=1)
     experiment.up()

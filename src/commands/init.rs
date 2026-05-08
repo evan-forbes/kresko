@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 
 const ENV_STUB: &str = "# Kresko credentials. Uncomment and fill in for the providers you use.
 # DIGITALOCEAN_TOKEN=
+# VULTR_API_KEY=
 # AWS_ACCESS_KEY_ID=
 # AWS_SECRET_ACCESS_KEY=
 # KRESKO_S3_BUCKET=

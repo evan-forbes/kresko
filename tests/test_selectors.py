@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from kresko_py.selectors import select
+from harness.selectors import select
 
 
 def sample_assets():

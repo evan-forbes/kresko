@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import pytest
 
-from kresko_py import assets, paths
-from kresko_py.digitalocean import (
+from harness import assets, paths
+from harness.providers import (
     DigitalOceanClient,
     DigitalOceanError,
+    DigitalOceanProvider,
+    ProviderError,
     create_droplet_request,
-    destroy_assets,
-    destroy_tagged_droplets,
     droplet_to_asset,
-    reconcile_droplets,
     tag_value,
 )
-from kresko_py.spec import ExperimentSpec, NodeGroup
+from harness.reconcile import reconcile_instances
+from harness.spec import ExperimentSpec, NodeGroup
 
 
 @pytest.fixture
@@ -125,7 +125,7 @@ class FakeClient:
         self.droplets_by_id[str(droplet_id)] = droplet
         return droplet
 
-    def wait_for_ips(self, droplet_id):
+    def wait_for_ips(self, droplet_id, attempts=60, delay_secs=5.0):
         droplet = dict(self.droplets_by_id[str(droplet_id)])
         droplet["status"] = "active"
         droplet["networks"] = {
@@ -148,7 +148,13 @@ def test_reconcile_droplets_dry_run_returns_plan(home):
     )
     client = FakeClient()
 
-    plan = reconcile_droplets(spec, experiment="smoke", run_name="smoke", client=client, dry_run=True)
+    plan = reconcile_instances(
+        spec,
+        experiment="smoke",
+        run_name="smoke",
+        providers={"digitalocean": DigitalOceanProvider(client)},
+        dry_run=True,
+    )
 
     assert [a["name"] for a in plan["create"]] == ["miner-0", "miner-1"]
     assert plan["create"][0]["tags"] == sorted(
@@ -165,7 +171,12 @@ def test_reconcile_droplets_creates_and_writes_assets(home):
     )
     client = FakeClient()
 
-    plan = reconcile_droplets(spec, experiment="smoke", run_name="smoke", client=client)
+    plan = reconcile_instances(
+        spec,
+        experiment="smoke",
+        run_name="smoke",
+        providers={"digitalocean": DigitalOceanProvider(client)},
+    )
 
     assert [a["name"] for a in plan["create"]] == ["miner-0"]
     assert len(client.created) == 1
@@ -196,7 +207,12 @@ def test_reconcile_droplets_reuses_by_name(home):
         }
     ]
 
-    plan = reconcile_droplets(spec, experiment="smoke", run_name="smoke", client=client)
+    plan = reconcile_instances(
+        spec,
+        experiment="smoke",
+        run_name="smoke",
+        providers={"digitalocean": DigitalOceanProvider(client)},
+    )
 
     assert plan["create"] == []
     assert [a["name"] for a in plan["reuse"]] == ["miner-0"]
@@ -218,11 +234,11 @@ def test_reconcile_droplets_dry_run_validates_ssh_key(home):
             raise DigitalOceanError(f"SSH key {selector!r} not found")
 
     with pytest.raises(DigitalOceanError):
-        reconcile_droplets(
+        reconcile_instances(
             spec,
             experiment="smoke",
             run_name="smoke",
-            client=MissingKeyClient(),
+            providers={"digitalocean": DigitalOceanProvider(MissingKeyClient())},
             dry_run=True,
         )
 
@@ -249,7 +265,12 @@ def test_reconcile_droplets_refuses_role_mismatch_on_reuse(home):
         }
     ]
 
-    plan = reconcile_droplets(spec, experiment="smoke", run_name="smoke", client=client)
+    plan = reconcile_instances(
+        spec,
+        experiment="smoke",
+        run_name="smoke",
+        providers={"digitalocean": DigitalOceanProvider(client)},
+    )
 
     assert plan["reuse"] == []
     assert [f["kind"] for f in plan["failed"]] == ["role_mismatch"]
@@ -271,11 +292,11 @@ def test_destroy_assets_validates_required_tag(home):
         "tags": ["kresko", "experiment-smoke", "run-smoke"],
     }
 
-    destroyed = destroy_assets(
-        [asset], client, required_tags=["experiment-smoke", "run-smoke"]
+    destroyed = DigitalOceanProvider(client).delete(
+        asset, required_tags=["experiment-smoke", "run-smoke"]
     )
 
-    assert destroyed == ["42"]
+    assert destroyed == "42"
     assert client.deleted == ["42"]
 
 
@@ -289,8 +310,8 @@ def test_destroy_assets_refuses_when_tag_missing(home):
     client = FakeClient()
     client.droplets_by_id["42"] = {"id": 42, "name": "miner-0", "tags": ["kresko"]}
 
-    with pytest.raises(DigitalOceanError):
-        destroy_assets([asset], client, required_tags=["experiment-smoke"])
+    with pytest.raises(ProviderError):
+        DigitalOceanProvider(client).delete(asset, required_tags=["experiment-smoke"])
     assert client.deleted == []
 
 
@@ -311,9 +332,9 @@ def test_destroy_assets_refuses_when_run_tag_missing(home):
         "tags": ["kresko", "experiment-smoke", "run-other"],
     }
 
-    with pytest.raises(DigitalOceanError):
-        destroy_assets(
-            [asset], client, required_tags=["experiment-smoke", "run-mine"]
+    with pytest.raises(ProviderError):
+        DigitalOceanProvider(client).delete(
+            asset, required_tags=["experiment-smoke", "run-mine"]
         )
     assert client.deleted == []
 
@@ -326,8 +347,8 @@ def test_destroy_tagged_droplets_refuses_kresko_tag():
         def delete_droplet(self, droplet_id):
             pass
 
-    with pytest.raises(DigitalOceanError):
-        destroy_tagged_droplets("kresko", _Client())
+    with pytest.raises(ProviderError):
+        DigitalOceanProvider(_Client()).delete_tagged("kresko")
 
 
 def test_reconcile_droplets_marks_create_failures(home):
@@ -344,7 +365,12 @@ def test_reconcile_droplets_marks_create_failures(home):
             return super().create_droplet(request)
 
     client = CapacityClient()
-    plan = reconcile_droplets(spec, experiment="smoke", run_name="smoke", client=client)
+    plan = reconcile_instances(
+        spec,
+        experiment="smoke",
+        run_name="smoke",
+        providers={"digitalocean": DigitalOceanProvider(client)},
+    )
 
     assert [a["name"] for a in plan["create"]] == ["miner-0", "miner-1"]
     assert len(plan["failed"]) == 1
@@ -367,13 +393,18 @@ def test_reconcile_droplets_marks_wait_timeouts_as_failed(home):
     )
 
     class TimeoutClient(FakeClient):
-        def wait_for_ips(self, droplet_id):
+        def wait_for_ips(self, droplet_id, attempts=60, delay_secs=5.0):
             if str(droplet_id) == "1":
                 raise DigitalOceanError(f"timed out waiting for droplet {droplet_id} IP")
             return super().wait_for_ips(droplet_id)
 
     client = TimeoutClient()
-    plan = reconcile_droplets(spec, experiment="smoke", run_name="smoke", client=client)
+    plan = reconcile_instances(
+        spec,
+        experiment="smoke",
+        run_name="smoke",
+        providers={"digitalocean": DigitalOceanProvider(client)},
+    )
 
     assert len(plan["failed"]) == 1
     failure = plan["failed"][0]
@@ -421,7 +452,12 @@ def test_reconcile_droplets_preserves_failed_marker_without_retry(home):
         }
     )
 
-    plan = reconcile_droplets(spec, experiment="smoke", run_name="smoke", client=client)
+    plan = reconcile_instances(
+        spec,
+        experiment="smoke",
+        run_name="smoke",
+        providers={"digitalocean": DigitalOceanProvider(client)},
+    )
 
     assert plan["failed"] == []
     asset = assets.read_asset("digitalocean", "9")
@@ -458,8 +494,12 @@ def test_reconcile_droplets_retry_failed_clears_marker_when_active(home):
         }
     )
 
-    plan = reconcile_droplets(
-        spec, experiment="smoke", run_name="smoke", client=client, retry_failed=True
+    plan = reconcile_instances(
+        spec,
+        experiment="smoke",
+        run_name="smoke",
+        providers={"digitalocean": DigitalOceanProvider(client)},
+        retry_failed=True,
     )
 
     assert plan["failed"] == []

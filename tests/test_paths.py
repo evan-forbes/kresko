@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from kresko_py import paths
+from harness import paths
 
 
 def test_kresko_home_uses_env_override(monkeypatch, tmp_path):

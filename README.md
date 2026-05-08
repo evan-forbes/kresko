@@ -9,7 +9,7 @@ Kresko is split into a Rust binary and a Python orchestration layer.
 - **Rust `kresko`** — Zcash- and protocol-specific tooling: `genesis`,
   `txblast-local`, `mine`. Stays a standalone binary; experiment scripts
   invoke it as a subprocess.
-- **Python `kresko_py` / `kresko` CLI** — experiment lifecycle, provisioning,
+- **Python `harness` / `kresko` CLI** — experiment lifecycle, provisioning,
   asset tracking, deploy, tmux, collect, sync, teardown.
 
 ## `~/.kresko/` is the home
@@ -56,7 +56,7 @@ Every kresko-managed cloud asset carries:
 
 The typed prefixes are intentionally short and provider-portable; the
 `kresko` marker exists separately so a colliding `experiment-foo` tag from
-some other tool can't trick us into deleting unrelated droplets.
+some other tool can't trick us into deleting unrelated cloud instances.
 
 ### Run naming
 
@@ -129,8 +129,9 @@ see "Writing an experiment".
   set. The `--` is required before forwarded args. By default the spawned
   `run.py` runs through `uv run --project <kresko-repo>` so pyinfra and
   the other repo deps are available; pass `--python <path>` to bypass uv.
-- `kresko sync` — refresh `~/.kresko/assets/` from configured cloud
-  providers (currently DigitalOcean).
+- `kresko sync [--provider <name>]` — refresh `~/.kresko/assets/` from cloud
+  providers. By default this tries every known provider and reports auth/API
+  errors per provider; repeat `--provider` to limit the run.
 - `kresko assets list [--tag <tag>] [--provider <name>]` — list assets,
   filtered by tag (repeat `--tag` for AND).
 - `kresko assets show <provider> <provider_id>` — print one asset.
@@ -144,7 +145,7 @@ it to `run_experiment()`, which gives you the standard verbs for free:
 
 ```python
 import os, sys
-from kresko_py import DigitalOcean, Experiment, node_type, run_experiment
+from harness import DigitalOcean, Experiment, Vultr, node_type, run_experiment
 
 
 def build_experiment() -> Experiment:
@@ -153,8 +154,15 @@ def build_experiment() -> Experiment:
         provider=DigitalOcean(region="nyc3", size="s-1vcpu-1gb"),
         payload=["payload"],
     )
+    rpc = node_type(
+        role="rpc",
+        provider=Vultr(region="ord", size="vc2-1c-1gb", image="os:1743"),
+        name_prefix="vultr-rpc",
+        payload=["payload"],
+    )
     exp = Experiment.current()         # picks up the run dir from env vars
     exp.add(miner, count=4)
+    exp.add(rpc, count=1)
     return exp
 
 
@@ -182,13 +190,24 @@ include `--dry-run`, `--retry-failed`, `--role`, `--name`, `--pattern`,
 
 `reset` wipes Zebra state, configs, logs, and known kresko tmux sessions
 (`zebra`, `app`, `mine`, `txblast`) on the selected nodes, leaving the
-droplets themselves running. Use it to start the next deploy from a
+cloud instances themselves running. Use it to start the next deploy from a
 clean slate without re-provisioning.
 
-### Provider-shape overrides
+### Providers and overrides
 
-Droplet size / image / region / count are first-class CLI flags so a run
-can be retuned without editing the experiment script:
+DigitalOcean and Vultr can be used in the same experiment. Every node has a
+provider, and names must be unique within the run; if you split one role across
+providers, give one side a distinct `name_prefix`.
+
+Vultr images must use explicit selectors because Vultr IDs are not
+human-readable: `os:<id>`, `image:<uuid>`, `snapshot:<id>`, `app:<id>`, or
+`iso:<id>`. Vultr `user_data` is accepted as plain text and encoded by the
+adapter. IPv6 is off by default on Vultr; pass `enable_ipv6=True` if an
+experiment requires it. Vultr `private_ip` is empty unless the instance is
+attached to a VPC with `vpc_ids=[...]`.
+
+Cloud size / image / region / count are first-class CLI flags so a run can be
+retuned without editing the experiment script:
 
 ```bash
 kresko run nu7-pow-4node -- up --size miner=s-8vcpu-16gb --count miner=8
@@ -198,6 +217,8 @@ kresko run nu7-pow-4node -- up --region ams3        # bare value = all roles
 
 Each flag accepts `role=value` or just `value` (apply to all roles), and
 unknown roles fail loudly so a typo cannot silently no-op.
+These overrides are role-scoped, not provider-scoped; v1 assumes each role uses
+one provider when using provider-specific size, image, or region slugs.
 
 To call the Rust binary from inside a verb handler:
 
@@ -233,7 +254,7 @@ Two failure shapes:
 
 - **Create-time** (e.g. region capacity exhausted): no asset is written for
   the failed node; the failure is recorded in the run's `result.json`.
-- **Wait-timeout** (droplet created but never reported an IP): the asset is
+- **Wait-timeout** (instance created but never reported an IP): the asset is
   written with `status: "failed"` and a structured `failure_reason`. The
   selector layer treats `status: "failed"` as inactive, so subsequent
   `deploy / run / collect / down` automatically skip it.
@@ -254,7 +275,7 @@ the `open_run` context manager. It allocates a run dir, sets the
 exit:
 
 ```python
-from kresko_py import open_run
+from harness import open_run
 from experiments.my_exp.run import build_experiment
 
 with open_run("my-exp", name="auto-001"):

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from kresko_py.paths import asset_path, assets_dir
+from harness.paths import asset_path, assets_dir
 
 REQUIRED_TAG = "kresko"
 ASSET_SCHEMA_VERSION = 1

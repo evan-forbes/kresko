@@ -3,7 +3,7 @@
 `Experiment.current()` returns an instance bound to the run dir set up by the
 CLI. Inside an experiment script, code looks like::
 
-    from kresko_py import DigitalOcean, Experiment, node_type
+    from harness import DigitalOcean, Experiment, node_type
 
     miner = node_type(role="miner", provider=DigitalOcean(...), payload=["payload"])
 
@@ -29,20 +29,22 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from kresko_py import assets as assets_store
-from kresko_py import paths
-from kresko_py.digitalocean import (
-    DigitalOceanClient,
-    destroy_assets,
-    destroy_tagged_droplets,
+from harness import assets as assets_store
+from harness import paths
+from harness.env import load_experiment_env
+from harness.inventory import write_pyinfra_inventory
+from harness.providers import (
+    CloudProvider,
+    DigitalOcean,
+    Vultr,
     experiment_tag,
-    reconcile_droplets,
+    get_provider,
+    known_provider_names,
     run_tag,
 )
-from kresko_py.env import load_experiment_env
-from kresko_py.inventory import write_pyinfra_inventory
-from kresko_py.remote import RESET_TMUX_SESSIONS, render_command_plan, reset_command, tmux_start_command
-from kresko_py.runs import (
+from harness.reconcile import reconcile_instances
+from harness.remote import RESET_TMUX_SESSIONS, render_command_plan, reset_command, tmux_start_command
+from harness.runs import (
     ENV_EXPERIMENT,
     ENV_RUN_DIR,
     ENV_RUN_NAME,
@@ -50,53 +52,60 @@ from kresko_py.runs import (
     write_node_snapshot,
     write_result,
 )
-from kresko_py.selectors import select
-from kresko_py.spec import ExperimentSpec, NodeGroup
+from harness.selectors import select
+from harness.spec import ExperimentSpec, NodeGroup
 
 PyinfraRunner = Callable[[Path, Path, bool], subprocess.CompletedProcess[str]]
 
 __all__ = [
     "DigitalOcean",
-    "DigitalOceanNodeType",
     "ENV_EXPERIMENT",
     "ENV_RUN_DIR",
     "ENV_RUN_NAME",
     "Experiment",
+    "NodeType",
+    "Vultr",
     "node_type",
     "run_pyinfra",
 ]
 
 
 @dataclass(frozen=True)
-class DigitalOcean:
-    region: str
-    size: str
-    image: str = "ubuntu-24-04-x64"
-    ssh_user: str = "root"
-    tags: list[str] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class DigitalOceanNodeType:
+class NodeType:
+    provider: str
     role: str
     region: str
     size: str
-    image: str = "ubuntu-24-04-x64"
+    image: str
     ssh_user: str = "root"
     payload_paths: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     name_prefix: str | None = None
+    provider_options: dict[str, Any] = field(default_factory=dict)
 
 
 def node_type(
     role: str,
-    provider: DigitalOcean,
+    provider: DigitalOcean | Vultr,
     payload: list[str] | None = None,
     tags: list[str] | None = None,
     name_prefix: str | None = None,
     ssh_user: str | None = None,
-) -> DigitalOceanNodeType:
-    return DigitalOceanNodeType(
+) -> NodeType:
+    if isinstance(provider, DigitalOcean):
+        provider_name = "digitalocean"
+        provider_options: dict[str, Any] = {}
+    elif isinstance(provider, Vultr):
+        provider_name = "vultr"
+        provider_options = {
+            "vpc_ids": list(provider.vpc_ids),
+            "enable_ipv6": provider.enable_ipv6,
+            "user_data": provider.user_data,
+        }
+    else:
+        raise TypeError(f"unsupported provider config {provider!r}")
+    return NodeType(
+        provider=provider_name,
         role=role,
         region=provider.region,
         size=provider.size,
@@ -105,6 +114,7 @@ def node_type(
         payload_paths=list(payload or []),
         tags=[*provider.tags, *(tags or [])],
         name_prefix=name_prefix,
+        provider_options=provider_options,
     )
 
 
@@ -130,16 +140,14 @@ class Experiment:
         run_name: str,
         run_path: Path,
         *,
-        provider: str = "digitalocean",
         tags: list[str] | None = None,
         ssh: dict[str, Any] | None = None,
-        digitalocean_client: DigitalOceanClient | None = None,
+        providers: dict[str, CloudProvider] | None = None,
         pyinfra_runner: PyinfraRunner | None = None,
     ) -> None:
         self.name = name
         self.run_name = run_name
         self.run_dir = Path(run_path).resolve()
-        self.provider = provider
         self.tags = list(tags or [])
         self.ssh = {
             "user": "root",
@@ -148,8 +156,8 @@ class Experiment:
             "key_name": "",
             **(ssh or {}),
         }
-        self._node_specs: list[tuple[DigitalOceanNodeType, int]] = []
-        self._digitalocean_client = digitalocean_client
+        self._node_specs: list[tuple[NodeType, int]] = []
+        self._providers = dict(providers or {})
         self._pyinfra_runner = pyinfra_runner or run_pyinfra
 
     @classmethod
@@ -158,8 +166,7 @@ class Experiment:
         *,
         tags: list[str] | None = None,
         ssh: dict[str, Any] | None = None,
-        provider: str = "digitalocean",
-        digitalocean_client: DigitalOceanClient | None = None,
+        providers: dict[str, CloudProvider] | None = None,
         pyinfra_runner: PyinfraRunner | None = None,
     ) -> "Experiment":
         name = os.environ.get(ENV_EXPERIMENT)
@@ -174,14 +181,13 @@ class Experiment:
             name=name,
             run_name=run_name,
             run_path=Path(run_dir),
-            provider=provider,
             tags=tags,
             ssh=ssh,
-            digitalocean_client=digitalocean_client,
+            providers=providers,
             pyinfra_runner=pyinfra_runner,
         )
 
-    def add(self, node: DigitalOceanNodeType, count: int = 1) -> None:
+    def add(self, node: NodeType, count: int = 1) -> None:
         if count < 0:
             raise ValueError("node count must be non-negative")
         self._node_specs.append((node, count))
@@ -205,7 +211,7 @@ class Experiment:
         count. Useful for retuning a run from CLI flags without editing
         the experiment script.
         """
-        new_specs: list[tuple[DigitalOceanNodeType, int]] = []
+        new_specs: list[tuple[NodeType, int]] = []
         for node, current_count in self._node_specs:
             if role is not None and node.role != role:
                 new_specs.append((node, current_count))
@@ -232,11 +238,11 @@ class Experiment:
                 break
         return ExperimentSpec(
             name=self.name,
-            provider=self.provider,
             tags=self.tags,
             ssh=ssh,
             node_groups=[
                 NodeGroup(
+                    provider=node.provider,
                     role=node.role,
                     count=count,
                     region=node.region,
@@ -245,6 +251,7 @@ class Experiment:
                     name_prefix=node.name_prefix,
                     tags=node.tags,
                     ssh_user=node.ssh_user,
+                    provider_options=node.provider_options,
                 )
                 for node, count in self._node_specs
             ],
@@ -328,11 +335,12 @@ class Experiment:
         stage: str = "up",
     ) -> dict[str, Any]:
         try:
-            plan = reconcile_droplets(
-                self.spec(),
+            spec = self.spec()
+            plan = reconcile_instances(
+                spec,
                 experiment=self.name,
                 run_name=self.run_name,
-                client=self._do_client(),
+                providers=self._providers_for_spec(spec),
                 dry_run=dry_run,
                 retry_failed=retry_failed,
             )
@@ -382,7 +390,7 @@ class Experiment:
             payload_paths = self._absolute_payload_paths()
             inventory, deploy_file = self._write_pyinfra_deploy(
                 "deploy_payload.py",
-                "from kresko_py.remote import pyinfra_deploy_base\n"
+                "from harness.remote import pyinfra_deploy_base\n"
                 f"pyinfra_deploy_base({payload_paths!r})\n",
                 nodes,
             )
@@ -443,7 +451,7 @@ class Experiment:
             nodes = self._select(role=role, name=name, pattern=pattern, failed_from=failed_from)
             inventory, deploy_file = self._write_pyinfra_deploy(
                 "run_command.py",
-                "from kresko_py.remote import pyinfra_run_command\n"
+                "from harness.remote import pyinfra_run_command\n"
                 f"pyinfra_run_command({command!r})\n",
                 nodes,
             )
@@ -476,7 +484,7 @@ class Experiment:
             destination = str(dest or (self.run_dir / "data"))
             inventory, deploy_file = self._write_pyinfra_deploy(
                 "collect.py",
-                "from kresko_py.remote import pyinfra_collect\n"
+                "from harness.remote import pyinfra_collect\n"
                 f"pyinfra_collect({paths_to_collect!r}, {destination!r})\n",
                 nodes,
             )
@@ -505,7 +513,7 @@ class Experiment:
         """Wipe Zebra state, configs, logs, and kresko tmux sessions on selected nodes.
 
         Use this to start the next deploy from a clean slate without
-        re-provisioning droplets. The droplets themselves are untouched —
+        re-provisioning instances. The cloud instances themselves are untouched —
         run `down` for that.
         """
         command = reset_command(tmux_sessions=tmux_sessions)
@@ -527,35 +535,93 @@ class Experiment:
     ) -> dict[str, Any]:
         stage = "down"
         try:
-            client = self._do_client()
+            destroyed: dict[str, list[str]] = {}
+            errors: list[str] = []
             if force_tag:
-                destroyed = destroy_tagged_droplets(force_tag, client, dry_run=dry_run)
+                load_experiment_env(self.run_dir)
+                for name in known_provider_names():
+                    try:
+                        provider = self._providers.get(name) or get_provider(name)
+                        self._providers[name] = provider
+                    except Exception as exc:
+                        errors.append(f"{name}: {exc}")
+                        continue
+                    try:
+                        destroyed[name] = provider.delete_tagged(force_tag, dry_run=dry_run)
+                    except Exception as exc:
+                        errors.append(f"{name}: {exc}")
             else:
-                destroyed = destroy_assets(
-                    self.run_assets(),
-                    client,
-                    required_tags=[
-                        self.experiment_tag_value,
-                        run_tag(self.run_name),
+                providers = self._providers_for_down()
+                for asset in self.run_assets():
+                    provider_name = asset.get("provider", "")
+                    provider = providers.get(provider_name)
+                    if provider is None:
+                        errors.append(f"{provider_name}: provider is not configured")
+                        continue
+                    try:
+                        provider_id = provider.delete(
+                            asset,
+                            required_tags=[
+                                self.experiment_tag_value,
+                                run_tag(self.run_name),
+                            ],
+                            dry_run=dry_run,
+                        )
+                    except Exception as exc:
+                        errors.append(f"{provider_name}: {exc}")
+                        continue
+                    if provider_id:
+                        destroyed.setdefault(provider_name, []).append(provider_id)
+            payload = {
+                "destroyed_provider_ids": [
+                    provider_id
+                    for ids in destroyed.values()
+                    for provider_id in ids
+                ],
+                "destroyed": destroyed,
+                "errors": errors,
+            }
+            if errors:
+                payload = {"stage": stage, "ok": False, "dry_run": dry_run, **payload}
+                write_result(
+                    self.run_dir,
+                    stage,
+                    False,
+                    failures=[
+                        node_failure("all", stage, "down", retryable=True)
+                        for _ in errors
                     ],
-                    dry_run=dry_run,
+                    extra=payload,
                 )
-            return self._success_result(
-                stage,
-                dry_run,
-                {"destroyed_provider_ids": destroyed},
-            )
+                return payload
+            return self._success_result(stage, dry_run, payload)
         except Exception as exc:
             self._write_failure(stage, stage, exc)
             raise
 
     # internals -----------------------------------------------------------
 
-    def _do_client(self) -> DigitalOceanClient:
-        if self._digitalocean_client is None:
-            load_experiment_env(self.run_dir)
-            self._digitalocean_client = DigitalOceanClient()
-        return self._digitalocean_client
+    def _providers_for_spec(self, spec: ExperimentSpec) -> dict[str, CloudProvider]:
+        names = {group.provider for group in spec.node_groups if group.count > 0}
+        return self._providers_for_names(names)
+
+    def _providers_for_down(self) -> dict[str, CloudProvider]:
+        return self._providers_for_names(
+            {asset.get("provider", "") for asset in self.run_assets() if asset.get("provider")}
+        )
+
+    def _providers_for_names(
+        self,
+        names: set[str],
+    ) -> dict[str, CloudProvider]:
+        load_experiment_env(self.run_dir)
+        out = dict(self._providers)
+        for name in sorted(names):
+            if name in out:
+                continue
+            out[name] = get_provider(name)
+        self._providers.update(out)
+        return {name: out[name] for name in names if name in out}
 
     def _select(
         self,

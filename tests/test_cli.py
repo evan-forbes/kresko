@@ -7,8 +7,8 @@ import textwrap
 
 import pytest
 
-from kresko_py import assets, paths
-from kresko_py.cli import main, run_experiment
+from harness import assets, paths
+from harness.cli import main, run_experiment
 
 
 @pytest.fixture
@@ -61,6 +61,25 @@ def test_assets_show_outputs_full_asset(home, capsys):
     asset = json.loads(captured.out)
     assert asset["name"] == "miner-0"
     assert asset["public_ip"] == "203.0.113.1"
+
+
+def test_sync_passes_provider_filter(monkeypatch, home, capsys):
+    seen = {}
+
+    def fake_sync_all(*, providers=None):
+        from harness.sync import SyncReport
+
+        seen["providers"] = providers
+        return [SyncReport(provider="vultr", upserted=[], pruned=[], errors=[])]
+
+    monkeypatch.setattr("harness.cli.sync_all", fake_sync_all)
+
+    rc = main(["sync", "--provider", "vultr"])
+    out = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert seen["providers"] == ["vultr"]
+    assert out[0]["provider"] == "vultr"
 
 
 def test_runs_list_returns_empty_when_no_runs(home, capsys):
@@ -231,10 +250,10 @@ def test_run_default_name_is_short_timestamped_slug(home, capsys):
 
 
 def test_build_run_command_defaults_to_uv_run(monkeypatch, tmp_path):
-    from kresko_py.cli import _build_run_command
+    from harness.cli import _build_run_command
 
-    monkeypatch.setattr("kresko_py.cli._kresko_project_root", lambda: tmp_path)
-    monkeypatch.setattr("kresko_py.cli._which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("harness.cli._kresko_project_root", lambda: tmp_path)
+    monkeypatch.setattr("harness.cli._which", lambda name: f"/usr/bin/{name}")
 
     cmd = _build_run_command(None, tmp_path / "run.py", ["launch"])
 
@@ -244,10 +263,10 @@ def test_build_run_command_defaults_to_uv_run(monkeypatch, tmp_path):
 
 
 def test_build_run_command_falls_back_when_uv_missing(monkeypatch, tmp_path):
-    from kresko_py.cli import _build_run_command
+    from harness.cli import _build_run_command
 
-    monkeypatch.setattr("kresko_py.cli._kresko_project_root", lambda: tmp_path)
-    monkeypatch.setattr("kresko_py.cli._which", lambda name: None)
+    monkeypatch.setattr("harness.cli._kresko_project_root", lambda: tmp_path)
+    monkeypatch.setattr("harness.cli._which", lambda name: None)
 
     cmd = _build_run_command(None, tmp_path / "run.py", [])
 
@@ -255,7 +274,7 @@ def test_build_run_command_falls_back_when_uv_missing(monkeypatch, tmp_path):
 
 
 def test_build_run_command_explicit_python_skips_uv(tmp_path):
-    from kresko_py.cli import _build_run_command
+    from harness.cli import _build_run_command
 
     cmd = _build_run_command("/custom/python", tmp_path / "run.py", ["a"])
 

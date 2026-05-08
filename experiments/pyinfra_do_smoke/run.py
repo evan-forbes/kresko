@@ -6,7 +6,7 @@ verbs (plan, up, deploy, run, collect, down) plus `smoke` and `rust-help`.
 
 For automation that bypasses the CLI entirely::
 
-    from kresko_py import open_run
+    from harness import open_run
     from experiments.pyinfra_do_smoke.run import build_experiment
 
     with open_run("pyinfra_do_smoke", name="auto-001"):
@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 import sys
 
-from kresko_py import DigitalOcean, Experiment, node_type, run_experiment
+from harness import DigitalOcean, Experiment, node_type, run_experiment
 
 
 def _env_int(name: str, default: int) -> int:

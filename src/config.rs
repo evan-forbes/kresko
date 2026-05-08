@@ -159,6 +159,7 @@ pub enum Provider {
     DigitalOcean,
     GoogleCloud,
     Linode,
+    Vultr,
 }
 
 impl std::fmt::Display for Provider {
@@ -167,6 +168,7 @@ impl std::fmt::Display for Provider {
             Provider::DigitalOcean => write!(f, "digitalocean"),
             Provider::GoogleCloud => write!(f, "googlecloud"),
             Provider::Linode => write!(f, "linode"),
+            Provider::Vultr => write!(f, "vultr"),
         }
     }
 }
@@ -178,6 +180,7 @@ impl std::str::FromStr for Provider {
             "digitalocean" | "do" => Ok(Provider::DigitalOcean),
             "googlecloud" | "gcp" | "google" => Ok(Provider::GoogleCloud),
             "linode" => Ok(Provider::Linode),
+            "vultr" => Ok(Provider::Vultr),
             other => anyhow::bail!("unknown provider: {other}"),
         }
     }

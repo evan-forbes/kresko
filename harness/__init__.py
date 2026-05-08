@@ -1,14 +1,15 @@
 """Python orchestration helpers for Kresko experiments."""
 
-from kresko_py.env import find_repo_root, load_experiment_env
-from kresko_py.experiment import (
+from harness.env import find_repo_root, load_experiment_env
+from harness.experiment import (
     DigitalOcean,
-    DigitalOceanNodeType,
     Experiment,
+    NodeType,
+    Vultr,
     node_type,
     run_pyinfra,
 )
-from kresko_py.paths import (
+from harness.paths import (
     asset_path,
     assets_dir,
     cache_dir,
@@ -21,12 +22,13 @@ from kresko_py.paths import (
     run_dir,
     runs_dir,
 )
-from kresko_py.runs import open_run
+from harness.runs import open_run
 
 __all__ = [
     "DigitalOcean",
-    "DigitalOceanNodeType",
     "Experiment",
+    "NodeType",
+    "Vultr",
     "asset_path",
     "assets_dir",
     "cache_dir",
@@ -48,10 +50,10 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    # Lazy import so `from kresko_py import run_experiment` works without
+    # Lazy import so `from harness import run_experiment` works without
     # pulling in the heavier CLI machinery on package import.
     if name == "run_experiment":
-        from kresko_py.cli import run_experiment
+        from harness.cli import run_experiment
 
         return run_experiment
-    raise AttributeError(f"module 'kresko_py' has no attribute {name!r}")
+    raise AttributeError(f"module 'harness' has no attribute {name!r}")

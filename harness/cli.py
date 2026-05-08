@@ -37,17 +37,17 @@ import threading
 from pathlib import Path
 from typing import IO, Any, Callable
 
-from kresko_py import assets, paths
-from kresko_py.env import load_experiment_env
-from kresko_py.experiment import ENV_EXPERIMENT, ENV_RUN_DIR, ENV_RUN_NAME, Experiment
-from kresko_py.runs import (
+from harness import assets, paths
+from harness.env import load_experiment_env
+from harness.experiment import ENV_EXPERIMENT, ENV_RUN_DIR, ENV_RUN_NAME, Experiment
+from harness.runs import (
     MANIFEST_FILENAME,
     RESULT_FILENAME,
     list_runs,
     read_manifest,
     start_run,
 )
-from kresko_py.sync import report_to_dict, sync_all
+from harness.sync import report_to_dict, sync_all
 
 ExperimentAction = Callable[[Experiment, argparse.Namespace], dict[str, Any]]
 ExperimentFactory = Callable[[], Experiment]
@@ -80,12 +80,18 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "python interpreter used to launch run.py. Defaults to "
-            "`uv run python` from the kresko_py project root so pyinfra and "
+            "`uv run python` from the harness project root so pyinfra and "
             "other deps are present. Pass an explicit path to bypass uv."
         ),
     )
 
-    sub.add_parser("sync", help="Refresh ~/.kresko/assets/ from the cloud")
+    p_sync = sub.add_parser("sync", help="Refresh ~/.kresko/assets/ from the cloud")
+    p_sync.add_argument(
+        "--provider",
+        action="append",
+        default=None,
+        help="provider to sync (repeatable; defaults to all known providers)",
+    )
 
     p_assets = sub.add_parser("assets", help="Inspect the asset store")
     p_assets_sub = p_assets.add_subparsers(dest="assets_command", required=True)
@@ -204,7 +210,7 @@ def _build_run_command(
 
 
 def _kresko_project_root() -> Path | None:
-    """Find the kresko_py project root (the directory holding pyproject.toml)."""
+    """Find the harness project root (the directory holding pyproject.toml)."""
     candidate = Path(__file__).resolve().parent.parent
     if (candidate / "pyproject.toml").exists():
         return candidate
@@ -223,7 +229,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         experiment_root=paths.kresko_home(),
         repo_root=paths.kresko_home(),
     )
-    reports = sync_all()
+    reports = sync_all(providers=args.provider)
     out = [report_to_dict(report) for report in reports]
     print(json.dumps(out, indent=2, sort_keys=True))
     return 0 if all(not r.errors for r in reports) else 1
@@ -455,7 +461,7 @@ def _build_experiment_parser(extra_verbs: Any) -> argparse.ArgumentParser:
         "--failed-from",
         help="path to a result.json; deploy only the nodes that failed there",
     )
-    parser.add_argument("--force-tag", help="for `down`: destroy all droplets with this tag")
+    parser.add_argument("--force-tag", help="for `down`: destroy all instances with this tag")
     parser.add_argument(
         "--command", help="for `run`: shell command to execute on selected nodes"
     )
@@ -476,7 +482,7 @@ def _build_experiment_parser(extra_verbs: Any) -> argparse.ArgumentParser:
         default=None,
         metavar="role=slug",
         help=(
-            "override droplet size for a role (e.g. miner=s-8vcpu-16gb). "
+            "override cloud size/plan for a role (e.g. miner=s-8vcpu-16gb). "
             "Repeat for multiple roles. Without role= applies to all."
         ),
     )
@@ -485,7 +491,7 @@ def _build_experiment_parser(extra_verbs: Any) -> argparse.ArgumentParser:
         action="append",
         default=None,
         metavar="role=image",
-        help="override droplet image for a role. Repeat for multiple roles.",
+        help="override cloud image for a role. Repeat for multiple roles.",
     )
     parser.add_argument(
         "--count",
@@ -499,7 +505,7 @@ def _build_experiment_parser(extra_verbs: Any) -> argparse.ArgumentParser:
         action="append",
         default=None,
         metavar="role=slug",
-        help="override droplet region for a role.",
+        help="override cloud region for a role.",
     )
     return parser
 

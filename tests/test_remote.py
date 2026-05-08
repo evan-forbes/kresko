@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from kresko_py.remote import APT_LOCK_WAIT, tmux_kill_command, tmux_start_command
+from harness.remote import APT_LOCK_WAIT, tmux_kill_command, tmux_start_command
 
 
 def test_tmux_command_rendering_quotes_session_and_logs():
@@ -16,7 +16,7 @@ def test_tmux_kill_command():
 
 
 def test_reset_command_kills_known_sessions_and_wipes_state():
-    from kresko_py.remote import RESET_TMUX_SESSIONS, reset_command
+    from harness.remote import RESET_TMUX_SESSIONS, reset_command
 
     cmd = reset_command()
     for session in RESET_TMUX_SESSIONS:

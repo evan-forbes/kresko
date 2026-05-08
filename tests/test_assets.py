@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from kresko_py import assets, paths
+from harness import assets, paths
 
 
 @pytest.fixture

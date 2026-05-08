@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from kresko_py.inventory import pyinfra_groups
+from harness.inventory import pyinfra_groups
 
 
 def _miner_asset() -> dict:
