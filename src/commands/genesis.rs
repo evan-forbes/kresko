@@ -410,11 +410,7 @@ fn prepare_generated_local_genesis(
             slow_start_interval: local_genesis.slow_start_interval,
             pre_blossom_halving_interval: local_genesis.pre_blossom_halving_interval,
             activation_height: local_genesis.activation_heights.overwinter,
-            // Local genesis intentionally skips NU6.1, so there is nothing
-            // to disburse. zebra falls back to Mainnet's NU6_1 disbursement
-            // list if this field is missing — emitting an empty array is
-            // what overrides that to "no disbursements expected".
-            lockbox_disbursements: Vec::new(),
+            lockbox_disbursements: zebra_config::default_nu6_1_lockbox_disbursements()?,
             post_blossom_pow_target_spacing: None,
             daa,
             pow_start_height: None,

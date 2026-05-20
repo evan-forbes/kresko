@@ -132,6 +132,14 @@ see "Writing an experiment".
 - `kresko sync [--provider <name>]` — refresh `~/.kresko/assets/` from cloud
   providers. By default this tries every known provider and reports auth/API
   errors per provider; repeat `--provider` to limit the run.
+- `kresko status [--experiment <name>] [--run <name>] [--role <role>]
+  [--provider <name>] [--tag <tag>] [--name <node>] [--pattern <glob>]
+  [--rpc-port <port>] [--timeout <secs>] [--summary] [--json]` — read the
+  asset store, select the active nodes, and query each one's RPC for block
+  height + sync progress (concurrently). Defaults to a table; `--summary`
+  prints aggregate height stats with buckets. The RPC port defaults to
+  `$KRESKO_RPC_PORT` or 8232 (mainnet/public); pass `--rpc-port 18232` for
+  local-genesis nodes.
 - `kresko assets list [--tag <tag>] [--provider <name>]` — list assets,
   filtered by tag (repeat `--tag` for AND).
 - `kresko assets show <provider> <provider_id>` — print one asset.
@@ -232,6 +240,69 @@ exp.shell([
 
 `exp.shell()` tees stdout/stderr into the run dir. The Rust binary stays
 unaware of `~/.kresko/`; pass `--out` paths it should write to.
+
+### Block explorer
+
+Any experiment can ship a co-located Zcash block explorer (the
+[devdotbo/zcash-explorer](https://github.com/devdotbo/zcash-explorer) Phoenix
+app) by adding one line to `build_experiment()`:
+
+```python
+exp.add_explorer(node="miner-0")
+```
+
+It then pops up during launch: once the target node is up, the explorer is
+deployed there with `docker compose` and reaches that node's Zebra RPC
+locally through `host.docker.internal`. The public URL is
+`http://<node-ip>:20001` (testnet), recorded in the run dir's `explorer.json`.
+
+Source delivery follows the S3 contract: the operator tars the explorer
+source, uploads it to S3, and the node `curl`s a short-lived presigned URL —
+never scp/rsync. This needs `AWS_S3_BUCKET` (plus AWS creds, and optionally
+`AWS_S3_ENDPOINT`) in your `.env`. The container's secret `.env` is written
+over the SSH session's stdin, so credentials never touch S3.
+
+`add_explorer()` accepts overrides (each also settable via a
+`KRESKO_EXPLORER_*` env var): `source`, `network` (`testnet` / `mainnet`),
+`node`, `role`, `public_port`, `rpc_port`, `compose_service`,
+`lightwalletd_enabled`.
+
+For a testnet faucet, pass `faucet_enabled=True` or set
+`KRESKO_EXPLORER_FAUCET_ENABLED=true`. Kresko discovers the selected node's
+public funded/miner address from `/root/.config/funded_key.json` (falling back
+to `mining.miner_address` in `/root/.config/zebrad.toml`) and writes the
+explorer's faucet env:
+
+```text
+FAUCET_ENABLED=true
+FAUCET_SOURCE_ADDRESS=<selected miner address>
+FAUCET_AMOUNT=0.1
+FAUCET_DAILY_IP_LIMIT=10
+FAUCET_WINDOW_SECONDS=86400
+FAUCET_MIN_CONFIRMATIONS=1
+```
+
+The faucet is refused for mainnet. The explorer still expects its configured
+RPC endpoint to be able to sign wallet spends from `FAUCET_SOURCE_ADDRESS`; if
+the node only exposes Zebra's read/mining RPC, the page can be configured but
+faucet sends will fail until a wallet-capable RPC service owns that key.
+
+Register the ops verbs by merging `explorer_actions()` into `extra_actions`:
+
+```python
+from harness import explorer_actions
+...
+run_experiment(build_experiment, extra_actions={**explorer_actions(), "smoke": smoke})
+```
+
+This adds `explorer-deploy`, `explorer-redeploy`, `explorer-status`,
+`explorer-logs`, `explorer-stop`, and `explorer-plan`:
+
+```bash
+kresko run nu7-pow-4node --run-name r1 -- explorer-status
+kresko run nu7-pow-4node --run-name r1 -- explorer-logs
+kresko run nu7-pow-4node --run-name r1 -- explorer-redeploy   # after a source change
+```
 
 ### Failure handling
 

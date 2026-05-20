@@ -62,8 +62,8 @@ def reset_command(
         # not leak across deploys.
         "tmux kill-server 2>/dev/null || true",
         # Stop any leftover daemons that might keep the state dir busy.
-        "pkill -f zebrad 2>/dev/null || true",
-        "pkill -f 'kresko mine' 2>/dev/null || true",
+        "pkill -x zebrad 2>/dev/null || true",
+        "pkill -f '[k]resko mine' 2>/dev/null || true",
         # Wipe Zebra state.
         f"rm -rf {shlex.quote(zebra_state_dir)}",
         # Wipe deployed configs (matches what node_init.sh writes).
@@ -87,7 +87,6 @@ APT_LOCK_WAIT = (
     "  if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 "
     "     && ! fuser /var/lib/dpkg/lock >/dev/null 2>&1 "
     "     && ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1 "
-    "     && ! pgrep -x unattended-upgr >/dev/null 2>&1 "
     "     && ! pgrep -x apt-get >/dev/null 2>&1 "
     "     && ! pgrep -x dpkg >/dev/null 2>&1; then "
     "    exit 0; "

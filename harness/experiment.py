@@ -159,6 +159,9 @@ class Experiment:
         self._node_specs: list[tuple[NodeType, int]] = []
         self._providers = dict(providers or {})
         self._pyinfra_runner = pyinfra_runner or run_pyinfra
+        # Optional co-located block explorer (see harness.explorer). Populated
+        # by add_explorer(); None means the explorer verbs/deploy are no-ops.
+        self._explorer: Any = None
 
     @classmethod
     def current(
@@ -598,6 +601,55 @@ class Experiment:
         except Exception as exc:
             self._write_failure(stage, stage, exc)
             raise
+
+    # block explorer -------------------------------------------------------
+
+    def add_explorer(self, node: str = "miner-0", **kwargs: Any) -> Any:
+        """Attach a co-located block explorer to this experiment (declarative).
+
+        Call from `build_experiment()`; the explorer then comes up during the
+        launch flow when `deploy_explorer()` runs, and the `explorer-*` verbs
+        operate on it. `node` is the target node name within the current run;
+        extra kwargs (source, network, ports, …) are forwarded to
+        `ExplorerSpec.create`. See `harness.explorer`.
+        """
+        from harness.explorer import ExplorerSpec
+
+        self._explorer = ExplorerSpec.create(node=node, **kwargs)
+        return self._explorer
+
+    def deploy_explorer(self, *, dry_run: bool = False) -> dict[str, Any]:
+        return self._explorer_op("deploy", dry_run=dry_run)
+
+    def redeploy_explorer(self, *, dry_run: bool = False) -> dict[str, Any]:
+        return self._explorer_op("redeploy", dry_run=dry_run)
+
+    def plan_explorer(self) -> dict[str, Any]:
+        return self._explorer_op("plan")
+
+    def explorer_status(self) -> dict[str, Any]:
+        return self._explorer_op("status")
+
+    def explorer_logs(self) -> dict[str, Any]:
+        return self._explorer_op("logs")
+
+    def explorer_stop(self) -> dict[str, Any]:
+        return self._explorer_op("stop")
+
+    def _explorer_op(self, op: str, **kwargs: Any) -> dict[str, Any]:
+        if self._explorer is None:
+            # No explorer configured: a clean no-op so launch flows can call
+            # deploy_explorer() unconditionally.
+            return {
+                "stage": f"explorer-{op}",
+                "ok": True,
+                "skipped": True,
+                "reason": "no explorer configured (call exp.add_explorer(...) in build_experiment)",
+            }
+        from harness.explorer import ExplorerDeployment
+
+        deployment = ExplorerDeployment(self, self._explorer)
+        return getattr(deployment, op)(**kwargs)
 
     # internals -----------------------------------------------------------
 

@@ -37,6 +37,7 @@ __all__ = [
     "env_file",
     "experiment_dir",
     "experiments_dir",
+    "explorer_actions",
     "find_repo_root",
     "kresko_home",
     "load_experiment_env",
@@ -56,4 +57,8 @@ def __getattr__(name: str):
         from harness.cli import run_experiment
 
         return run_experiment
+    if name == "explorer_actions":
+        from harness.explorer import explorer_actions
+
+        return explorer_actions
     raise AttributeError(f"module 'harness' has no attribute {name!r}")

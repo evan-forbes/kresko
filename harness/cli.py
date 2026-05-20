@@ -4,6 +4,7 @@ Top-level `kresko` subcommands::
 
     kresko run <experiment> [--run-name <slug>] -- [args...]
     kresko sync
+    kresko status [--experiment exp] [--role r] [--rpc-port N] [--summary]
     kresko assets list [--tag tag] [--provider name]
     kresko assets show <provider> <provider_id>
     kresko runs list <experiment>
@@ -37,7 +38,7 @@ import threading
 from pathlib import Path
 from typing import IO, Any, Callable
 
-from harness import assets, paths
+from harness import assets, paths, selectors, status
 from harness.env import load_experiment_env
 from harness.experiment import ENV_EXPERIMENT, ENV_RUN_DIR, ENV_RUN_NAME, Experiment
 from harness.runs import (
@@ -93,6 +94,33 @@ def main(argv: list[str] | None = None) -> int:
         help="provider to sync (repeatable; defaults to all known providers)",
     )
 
+    p_status = sub.add_parser(
+        "status", help="Query node block heights over RPC (reads the asset store)"
+    )
+    p_status.add_argument("--tag", action="append", default=[], help="filter by tag (repeat for AND)")
+    p_status.add_argument("--provider", help="filter by provider name")
+    p_status.add_argument("--role", action="append", default=None, help="filter by role (repeat)")
+    p_status.add_argument("--experiment", help="filter by experiment name")
+    p_status.add_argument("--run", help="filter by run name")
+    p_status.add_argument("--name", action="append", default=None, help="filter by node name (repeat)")
+    p_status.add_argument(
+        "--pattern", action="append", default=None, help="fnmatch pattern over node names (repeat)"
+    )
+    p_status.add_argument(
+        "--rpc-port",
+        type=int,
+        default=int(os.environ.get("KRESKO_RPC_PORT", status.DEFAULT_RPC_PORT)),
+        help=(
+            "RPC port to query (default: $KRESKO_RPC_PORT or "
+            f"{status.DEFAULT_RPC_PORT}; local-genesis nodes use 18232)"
+        ),
+    )
+    p_status.add_argument(
+        "--timeout", type=float, default=status.DEFAULT_TIMEOUT, help="per-node RPC timeout in seconds"
+    )
+    p_status.add_argument("--summary", action="store_true", help="print aggregate height stats only")
+    p_status.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+
     p_assets = sub.add_parser("assets", help="Inspect the asset store")
     p_assets_sub = p_assets.add_subparsers(dest="assets_command", required=True)
     p_assets_list = p_assets_sub.add_parser("list", help="List assets, optionally filtered")
@@ -124,6 +152,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_run(args, forwarded)
     if args.command == "sync":
         return cmd_sync(args)
+    if args.command == "status":
+        return cmd_status(args)
     if args.command == "assets":
         return cmd_assets(args)
     if args.command == "runs":
@@ -233,6 +263,31 @@ def cmd_sync(args: argparse.Namespace) -> int:
     out = [report_to_dict(report) for report in reports]
     print(json.dumps(out, indent=2, sort_keys=True))
     return 0 if all(not r.errors for r in reports) else 1
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    paths.ensure_home()
+    items = assets.list_assets(tags=args.tag, provider=args.provider)
+    items = selectors.select(
+        items,
+        roles=args.role,
+        names=args.name,
+        patterns=args.pattern,
+        run_name=args.run,
+    )
+    if args.experiment:
+        items = [a for a in items if a.get("experiment") == args.experiment]
+
+    report = status.query_status(items, rpc_port=args.rpc_port, timeout=args.timeout)
+
+    if args.json:
+        payload = status.summarize(report) if args.summary else report.to_dict()
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    elif args.summary:
+        print(status.render_summary(status.summarize(report)))
+    else:
+        print(status.render_report(report))
+    return 0
 
 
 def cmd_assets(args: argparse.Namespace) -> int:

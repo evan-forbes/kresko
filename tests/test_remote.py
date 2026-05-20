@@ -29,8 +29,8 @@ def test_reset_command_kills_known_sessions_and_wipes_state():
     assert "/root/.config/zebrad.toml" in cmd
     assert "/root/.config/zebrad.bootstrap.toml" in cmd
     assert "rm -rf /root/logs /root/.kresko" in cmd
-    assert "pkill -f zebrad" in cmd
-    assert "pkill -f 'kresko mine'" in cmd
+    assert "pkill -x zebrad" in cmd
+    assert "pkill -f '[k]resko mine'" in cmd
     # Idempotence: tmux/pkill failures must not fail the whole reset.
     assert "|| true" in cmd
 
@@ -58,7 +58,6 @@ def test_apt_lock_wait_checks_known_lock_files_and_processes():
         "/var/lib/dpkg/lock-frontend",
         "/var/lib/dpkg/lock",
         "/var/lib/apt/lists/lock",
-        "unattended-upgr",
         "apt-get",
         "dpkg",
     ):

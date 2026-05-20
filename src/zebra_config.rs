@@ -6,6 +6,13 @@ use zebra_chain::transparent::Address as TransparentAddress;
 use crate::config::Instance;
 use crate::config::{DaaConfig, NetworkKind};
 
+/// Synthetic P2SH recipient used for local-genesis NU6.1 activation.
+///
+/// Kresko local genesis does not fund the NU6.1 lockbox, so the default
+/// disbursement amount is zero. Zebra still needs an explicit config entry
+/// when NU6.1 is activated before NU7.
+pub const DEFAULT_NU6_1_LOCKBOX_ADDRESS: &str = "t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz";
+
 /// A single one-time NU6.1 lockbox disbursement entry, matching zebra's
 /// `[[network.testnet_parameters.lockbox_disbursements]]` schema.
 ///
@@ -31,14 +38,19 @@ impl LockboxDisbursement {
     }
 }
 
+pub fn default_nu6_1_lockbox_disbursements() -> Result<Vec<LockboxDisbursement>> {
+    Ok(vec![LockboxDisbursement::new_p2sh(
+        DEFAULT_NU6_1_LOCKBOX_ADDRESS,
+        0,
+    )?])
+}
+
 /// Reject anything that isn't a transparent P2SH address. P2PKH (`t1`/`tm`)
 /// makes zebrad panic at NU6.1 activation; Tex addresses are a separate
 /// shape that zebra's lockbox validator does not accept.
 fn ensure_address_is_p2sh(address: &str) -> Result<()> {
     let parsed = TransparentAddress::from_str(address).with_context(|| {
-        format!(
-            "lockbox disbursement address {address} is not a valid transparent address"
-        )
+        format!("lockbox disbursement address {address} is not a valid transparent address")
     })?;
     match parsed {
         TransparentAddress::PayToScriptHash { .. } => Ok(()),
@@ -66,9 +78,9 @@ pub struct LocalTestnetParameters {
     pub pre_blossom_halving_interval: u32,
     pub activation_height: u32,
     /// One-time NU6.1 lockbox disbursements emitted in
-    /// `[[network.testnet_parameters.lockbox_disbursements]]`. Empty by
-    /// default — kresko does not activate NU6.1 unless an experiment opts
-    /// in. Every entry is required to be P2SH (see `LockboxDisbursement`).
+    /// `[[network.testnet_parameters.lockbox_disbursements]]`. Kresko's
+    /// default local-genesis path uses a zero-zat synthetic P2SH entry so
+    /// Zebra has explicit NU6.1 disbursement config before NU7.
     pub lockbox_disbursements: Vec<LockboxDisbursement>,
     /// Legacy knobs kept in metadata for old generated configs. Zebra's NU7
     /// testnet config does not accept these fields, so rendering skips them.
@@ -104,7 +116,11 @@ pub fn template_for(network_kind: NetworkKind) -> Result<String> {
                 &["network", "peerset_initial_target_size"],
                 4.into(),
             );
-            set_path(&mut config, &["mempool", "debug_enable_at_height"], 0.into());
+            set_path(
+                &mut config,
+                &["mempool", "debug_enable_at_height"],
+                0.into(),
+            );
             set_path(&mut config, &["mining", "miner_address"], "auto".into());
             set_path(
                 &mut config,
@@ -430,9 +446,8 @@ pub fn apply_local_testnet_parameters(
         "pre_blossom_halving_interval".to_string(),
         i64::from(params.pre_blossom_halving_interval).into(),
     );
-    let mut disbursement_entries: Vec<toml::Value> = Vec::with_capacity(
-        params.lockbox_disbursements.len(),
-    );
+    let mut disbursement_entries: Vec<toml::Value> =
+        Vec::with_capacity(params.lockbox_disbursements.len());
     for disbursement in &params.lockbox_disbursements {
         // Belt-and-braces: even if the caller built the struct directly,
         // refuse to write a config that zebrad will refuse to load.
@@ -477,10 +492,9 @@ pub fn apply_local_testnet_parameters(
     );
 
     let mut activation_heights = Map::new();
-    // NU6.1 is the one-time ZIP-271 lockbox disbursement event from mainnet; activating it on a
-    // local testnet would require synthesising disbursement outputs in the activation-block
-    // coinbase (and a deferred-pool balance to cover them), which kresko does not produce.
-    // Skipping it lets NU7 activate directly without tripping the lockbox-disbursements rule.
+    // NU6.1 is the one-time ZIP-271 lockbox disbursement event. Local genesis
+    // activates it at the same height as NU7 with a zero-zat synthetic
+    // disbursement so Zebra's NU6.1 config validation is explicit.
     for upgrade in [
         "Overwinter",
         "Sapling",
@@ -489,6 +503,7 @@ pub fn apply_local_testnet_parameters(
         "Canopy",
         "NU5",
         "NU6",
+        "NU6.1",
         "NU7",
     ] {
         activation_heights.insert(
@@ -569,7 +584,15 @@ pub fn verify_local_testnet_parameters(
         .and_then(toml::Value::as_table)
         .context("missing network.testnet_parameters.activation_heights table")?;
     for upgrade in [
-        "Overwinter", "Sapling", "Blossom", "Heartwood", "Canopy", "NU5", "NU6", "NU7",
+        "Overwinter",
+        "Sapling",
+        "Blossom",
+        "Heartwood",
+        "Canopy",
+        "NU5",
+        "NU6",
+        "NU6.1",
+        "NU7",
     ] {
         let height = activation
             .get(upgrade)
@@ -596,7 +619,7 @@ pub fn verify_local_testnet_parameters(
                 rendered.len(),
             );
         }
-        for entry in rendered {
+        for (entry, expected) in rendered.iter().zip(&params.lockbox_disbursements) {
             let address = entry
                 .get("address")
                 .and_then(toml::Value::as_str)
@@ -604,6 +627,24 @@ pub fn verify_local_testnet_parameters(
             ensure_address_is_p2sh(address).with_context(|| {
                 format!("rendered config has non-P2SH lockbox disbursement {address}")
             })?;
+            if address != expected.address {
+                anyhow::bail!(
+                    "rendered lockbox disbursement address mismatch: expected {}, got {}",
+                    expected.address,
+                    address,
+                );
+            }
+            let amount = entry
+                .get("amount")
+                .and_then(toml::Value::as_integer)
+                .context("rendered lockbox disbursement entry missing amount")?;
+            if amount != i64::try_from(expected.amount_zats)? {
+                anyhow::bail!(
+                    "rendered lockbox disbursement amount mismatch: expected {}, got {}",
+                    expected.amount_zats,
+                    amount,
+                );
+            }
         }
     }
 
@@ -699,8 +740,9 @@ fn extract_miner_address(template: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalTestnetParameters, LockboxDisbursement, apply_local_testnet_parameters,
-        bootstrap_config_for_isolated_rpc, ensure_miner_address_is_set, generate_node_config,
+        DEFAULT_NU6_1_LOCKBOX_ADDRESS, LocalTestnetParameters, LockboxDisbursement,
+        apply_local_testnet_parameters, bootstrap_config_for_isolated_rpc,
+        default_nu6_1_lockbox_disbursements, ensure_miner_address_is_set, generate_node_config,
         read_genesis_hash, read_miner_address, set_miner_address, strip_genesis_block_path,
         template_for, testnet_toml_parameters, verify_local_testnet_parameters,
     };
@@ -708,7 +750,7 @@ mod tests {
 
     // Known-valid testnet P2SH and P2PKH addresses borrowed from
     // zebra-chain's own test vectors.
-    const P2SH_TESTNET: &str = "t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz";
+    const P2SH_TESTNET: &str = DEFAULT_NU6_1_LOCKBOX_ADDRESS;
     const P2PKH_TESTNET: &str = "tmTc6trRhbv96kGfA99i7vrFwb5p7BVFwc3";
 
     fn miner(name: &str, ip: &str) -> Instance {
@@ -790,9 +832,8 @@ mod tests {
             )
             .expect("zebra default should re-serialize"),
         );
-        let generated = parsed(
-            &template_for(NetworkKind::LocalGenesis).expect("template generation"),
-        );
+        let generated =
+            parsed(&template_for(NetworkKind::LocalGenesis).expect("template generation"));
         let default_tracing = default_config
             .get("tracing")
             .expect("zebra default has [tracing]");
@@ -950,10 +991,10 @@ mod tests {
 
     #[test]
     fn bootstrap_config_isolates_rpc_from_fleet() {
-        let template = template_for(NetworkKind::PublicTestnet)
-            .expect("public testnet template generation");
-        let bootstrap = bootstrap_config_for_isolated_rpc(&template)
-            .expect("bootstrap config generation");
+        let template =
+            template_for(NetworkKind::PublicTestnet).expect("public testnet template generation");
+        let bootstrap =
+            bootstrap_config_for_isolated_rpc(&template).expect("bootstrap config generation");
         let parsed = parsed(&bootstrap);
         assert_eq!(
             parsed
@@ -1022,9 +1063,7 @@ initial_mainnet_peers = []
     fn strip_genesis_block_path_is_idempotent() {
         let template = template_for(NetworkKind::LocalGenesis).expect("template");
         let mut config = template.clone();
-        config.push_str(
-            "[network.testnet_parameters]\ngenesis_block_path = \"/tmp/genesis\"\n",
-        );
+        config.push_str("[network.testnet_parameters]\ngenesis_block_path = \"/tmp/genesis\"\n");
         let stripped = strip_genesis_block_path(&config).expect("strip");
         assert!(!stripped.contains("genesis_block_path"));
         // Idempotent: stripping again is a no-op.
@@ -1076,9 +1115,8 @@ initial_mainnet_peers = []
         )
         .expect("zebra default should re-serialize");
         let default_config = parsed(&default_serialized);
-        let generated = parsed(
-            &template_for(NetworkKind::LocalGenesis).expect("template generation"),
-        );
+        let generated =
+            parsed(&template_for(NetworkKind::LocalGenesis).expect("template generation"));
         // Every section that ZebradConfig::default() declares must still
         // exist in the generated template, so we never drop sections by
         // accident.
@@ -1122,7 +1160,9 @@ initial_mainnet_peers = []
             .and_then(|n| n.get("testnet_parameters"))
             .expect("testnet_parameters present");
         assert_eq!(
-            testnet_params.get("network_name").and_then(toml::Value::as_str),
+            testnet_params
+                .get("network_name")
+                .and_then(toml::Value::as_str),
             Some("RequiredFieldsNet"),
         );
         assert_eq!(
@@ -1151,12 +1191,23 @@ initial_mainnet_peers = []
             .map(|v| v.as_integer().expect("byte"))
             .collect();
         assert_eq!(magic_bytes, vec![9, 8, 7, 6]);
-        // Activation heights table must exist and cover Overwinter..NU7.
+        // Activation heights table must exist and cover Overwinter..NU7,
+        // including the explicit NU6.1 lockbox event.
         let activation = testnet_params
             .get("activation_heights")
             .and_then(toml::Value::as_table)
             .expect("activation_heights");
-        for upgrade in ["Overwinter", "Sapling", "Blossom", "Heartwood", "Canopy", "NU5", "NU6", "NU7"] {
+        for upgrade in [
+            "Overwinter",
+            "Sapling",
+            "Blossom",
+            "Heartwood",
+            "Canopy",
+            "NU5",
+            "NU6",
+            "NU6.1",
+            "NU7",
+        ] {
             assert!(
                 activation.contains_key(upgrade),
                 "activation height {upgrade} must be set",
@@ -1197,7 +1248,17 @@ initial_mainnet_peers = []
 
     #[test]
     fn lockbox_disbursement_constructor_accepts_p2sh() {
-        LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0).expect("P2SH testnet address must be accepted");
+        LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0)
+            .expect("P2SH testnet address must be accepted");
+    }
+
+    #[test]
+    fn default_nu6_1_lockbox_disbursement_is_zero_zat_p2sh() {
+        let entries = default_nu6_1_lockbox_disbursements()
+            .expect("default NU6.1 lockbox disbursement must be valid");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].address, P2SH_TESTNET);
+        assert_eq!(entries[0].amount_zats, 0);
     }
 
     #[test]
@@ -1219,8 +1280,14 @@ initial_mainnet_peers = []
             .expect("lockbox_disbursements rendered as array");
         assert_eq!(entries.len(), 1);
         let entry = entries[0].as_table().expect("entry is a table");
-        assert_eq!(entry.get("address").and_then(toml::Value::as_str), Some(P2SH_TESTNET));
-        assert_eq!(entry.get("amount").and_then(toml::Value::as_integer), Some(0));
+        assert_eq!(
+            entry.get("address").and_then(toml::Value::as_str),
+            Some(P2SH_TESTNET)
+        );
+        assert_eq!(
+            entry.get("amount").and_then(toml::Value::as_integer),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1249,8 +1316,8 @@ initial_mainnet_peers = []
         // that no longer matches the chain on disk.
         let mut drifted_params = params.clone();
         drifted_params.genesis_hash = drifted_hash;
-        let rendered = apply_local_testnet_parameters(&template, &drifted_params)
-            .expect("apply parameters");
+        let rendered =
+            apply_local_testnet_parameters(&template, &drifted_params).expect("apply parameters");
         let err = verify_local_testnet_parameters(&rendered, &params)
             .expect_err("verify must catch the drift");
         assert!(err.to_string().contains("genesis_hash mismatch"), "{err}");
@@ -1262,8 +1329,8 @@ initial_mainnet_peers = []
         let template = template_for(NetworkKind::LocalGenesis).expect("template");
         let mut drifted = params.clone();
         drifted.activation_height = 12;
-        let rendered = apply_local_testnet_parameters(&template, &drifted)
-            .expect("apply parameters");
+        let rendered =
+            apply_local_testnet_parameters(&template, &drifted).expect("apply parameters");
         let err = verify_local_testnet_parameters(&rendered, &params)
             .expect_err("verify must catch the activation drift");
         assert!(err.to_string().contains("activation height"), "{err}");
@@ -1277,8 +1344,8 @@ initial_mainnet_peers = []
             vec![LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0).unwrap()],
         );
         let template = template_for(NetworkKind::LocalGenesis).expect("template");
-        let rendered = apply_local_testnet_parameters(&template, &params)
-            .expect("apply parameters");
+        let rendered =
+            apply_local_testnet_parameters(&template, &params).expect("apply parameters");
         verify_local_testnet_parameters(&rendered, &params)
             .expect("matching chain + config must pass cross-validation");
     }
@@ -1349,9 +1416,22 @@ initial_mainnet_peers = []
                 .and_then(toml::Value::as_array)
                 .is_some_and(Vec::is_empty)
         );
-        assert!(generated.contains("NU6 = 1"));
-        assert!(!generated.contains("NU6.1"));
-        assert!(generated.contains("NU7 = 1"));
+        let activation = testnet_params
+            .get("activation_heights")
+            .and_then(toml::Value::as_table)
+            .expect("activation_heights");
+        assert_eq!(
+            activation.get("NU6").and_then(toml::Value::as_integer),
+            Some(1)
+        );
+        assert_eq!(
+            activation.get("NU6.1").and_then(toml::Value::as_integer),
+            Some(1)
+        );
+        assert_eq!(
+            activation.get("NU7").and_then(toml::Value::as_integer),
+            Some(1)
+        );
         verify_local_testnet_parameters(&generated, &params)
             .expect("rendered config should preserve local testnet parameters");
     }
