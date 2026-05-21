@@ -70,7 +70,7 @@ jobs:
 
       - name: Upload binary as workflow artifact (manual runs)
         if: github.event_name != 'release'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.pkg.outputs.name }}
           path: |
