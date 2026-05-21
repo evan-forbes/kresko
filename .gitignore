@@ -1,6 +1,9 @@
 /target
 /build
 
+# Local Zebra co-development override; see .cargo/config.toml.example
+/.cargo/config.toml
+
 __pycache__/
 *.py[cod]
 .venv/

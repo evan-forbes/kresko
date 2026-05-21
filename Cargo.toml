@@ -24,9 +24,12 @@ secp256k1 = "0.29"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 chrono = { version = "0.4", default-features = false }
-zebra-chain = { path = "../nu7-testnet/zebra-chain", features = ["internal-miner"] }
-zebrad = { path = "../nu7-testnet/zebrad" }
-zebra-jsonl-trace = { path = "../nu7-testnet/zebra-jsonl-trace", version = "0.1.0" }
+# NU7 testnet Zebra crates, pinned to a tagged release so Cargo fetches them
+# directly (no sibling checkout needed). Cargo.lock pins the exact commit.
+# For local Zebra co-development, see .cargo/config.toml.example.
+zebra-chain = { git = "https://github.com/valargroup/zebra", tag = "nu7-testnet-v0.1.0", features = ["internal-miner"] }
+zebrad = { git = "https://github.com/valargroup/zebra", tag = "nu7-testnet-v0.1.0" }
+zebra-jsonl-trace = { git = "https://github.com/valargroup/zebra", tag = "nu7-testnet-v0.1.0", version = "0.1.0" }
 zcash_primitives = { version = "0.26", features = ["transparent-inputs"] }
 zcash_protocol = "0.7"
 zcash_address = "0.10"

@@ -1,0 +1,15 @@
+# Local Zebra co-development override.
+#
+# kresko pins zebra-chain / zebrad / zebra-jsonl-trace as git dependencies
+# against a tagged Zebra release (see Cargo.toml). To build kresko against a
+# local Zebra checkout instead — e.g. when editing Zebra and kresko together —
+# copy this file to .cargo/config.toml (which is gitignored) and adjust the
+# path if your checkout lives elsewhere:
+#
+#     cp .cargo/config.toml.example .cargo/config.toml
+#
+# `paths` overrides the matching crates by name + version using the local
+# Zebra workspace, without modifying Cargo.toml or Cargo.lock, so it never
+# leaks into commits or CI. Remove .cargo/config.toml to go back to the
+# pinned git dependency.
+paths = ["../nu7-testnet"]
