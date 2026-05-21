@@ -101,10 +101,35 @@ This should print nothing.
 
 ## 5. Publish The Bundle
 
-Upload `$BUNDLE_TGZ` to an HTTPS-accessible location such as S3, Spaces, or any
-static file host.
+The bundle is run-specific (it embeds the genesis/seed blocks and the live
+bootstrap-peer IPs from this run), so publishing it is an operator step run from
+the run dir — the release build CI cannot produce it.
 
-Record:
+### Option A — attach it to the kresko release (stable URL)
+
+`scripts/publish-join-bundle.sh` does steps 4 and 5 in one shot: it generates the
+bundle, compresses it to `nu7-join-bundle.tar.gz` (+ `.sha256`), validates it with
+`join-nu7-testnet.sh --dry-run`, and `gh release upload`s it.
+
+```bash
+scripts/publish-join-bundle.sh --run-dir "$RUN_DIR" --tag v0.1.0
+```
+
+Joiners then use a stable URL:
+
+```text
+https://github.com/valargroup/kresko/releases/download/v0.1.0/nu7-join-bundle.tar.gz
+```
+
+Re-run with `--clobber` semantics (the script passes `--clobber`) whenever the
+run's genesis or peers change. Pass `--skip-upload` to only build the tarball, or
+forward extra `kresko join-bundle` flags after `--`.
+
+### Option B — host it yourself (e.g. S3/Spaces)
+
+Upload `$BUNDLE_TGZ` to any HTTPS location and hand out that URL instead.
+
+Record either way:
 
 ```bash
 sha256sum "$BUNDLE_TGZ"
@@ -123,14 +148,14 @@ Observer-only:
 ```bash
 curl -fsSLO https://github.com/valargroup/kresko/releases/download/v0.1.0/join-nu7-testnet.sh
 bash join-nu7-testnet.sh \
-  --bundle-url https://example.com/nu7-join-bundle.tar.gz
+  --bundle-url https://github.com/valargroup/kresko/releases/download/v0.1.0/nu7-join-bundle.tar.gz
 ```
 
 Mining:
 
 ```bash
 bash join-nu7-testnet.sh \
-  --bundle-url https://example.com/nu7-join-bundle.tar.gz \
+  --bundle-url https://github.com/valargroup/kresko/releases/download/v0.1.0/nu7-join-bundle.tar.gz \
   --mine
 ```
 
@@ -138,7 +163,7 @@ Mining with a spendable supplied recipient:
 
 ```bash
 bash join-nu7-testnet.sh \
-  --bundle-url https://example.com/nu7-join-bundle.tar.gz \
+  --bundle-url https://github.com/valargroup/kresko/releases/download/v0.1.0/nu7-join-bundle.tar.gz \
   --mine \
   --miner-address t2...
 ```
