@@ -14,6 +14,12 @@ OUT_DIR=/tmp/nu7-join-bundle
 BUNDLE_TGZ=/tmp/nu7-join-bundle.tar.gz
 ```
 
+The join flow now downloads **prebuilt binaries** from GitHub releases instead
+of building Zebra or Kresko from source. The bundle is data-only (genesis seed
+blocks, the runtime `zebrad.join.toml`, and a manifest); the join script
+(`scripts/join-nu7-testnet.sh`) reads the release coordinates from the manifest
+and `curl`s the matching `zebrad` and `kresko` binaries.
+
 ## 1. Check The Run Payload
 
 The run must already have the generated local-genesis payload:
@@ -27,27 +33,24 @@ test -f "$RUN_DIR/payload/local_genesis/checkpoints.txt"
 
 Do not package `payload/local_genesis/funded_keys.json` or any per-node
 `funded_key.json` files. The join bundle must only contain public chain data,
-config, and scripts.
+config, and the manifest.
 
-## 2. Verify Downloadable Source Refs
+## 2. Verify The Release Tags
 
-The join machine builds from public Git URLs. Make sure the refs match the
-network binaries you deployed.
+The join machine downloads released binaries. Make sure the release tags match
+the network binaries you deployed:
 
-For the current NU7 run, use `valargroup/zebra`; the same branch on
-`evan-forbes/zebra` was stale during testing, and `ZcashFoundation/zebra` did
-not expose this branch.
-
-The `evan/nu7/testnet` ref now also carries the `zebra-jsonl-trace` crate, so a
-single Zebra checkout supplies `zebra-chain`, `zebrad`, and `zebra-jsonl-trace`.
+- Zebra (zebrad): <https://github.com/valargroup/zebra/releases> — currently
+  `nu7-testnet-v0.1.0` (asset `zebra-<tag>-x86_64-unknown-linux-gnu.tar.gz`).
+- Kresko (miner): <https://github.com/valargroup/kresko/releases> — currently
+  `v0.1.0` (asset `kresko-<tag>-x86_64-linux-gnu`).
 
 ```bash
-git -C /home/evan/src/zcash/nu7-testnet rev-parse HEAD
-git ls-remote --heads https://github.com/valargroup/zebra.git evan/nu7/testnet
-git ls-remote --heads https://github.com/evan-forbes/kresko.git giga-refactor
+gh release view nu7-testnet-v0.1.0 --repo valargroup/zebra  --json assets --jq '.assets[].name'
+gh release view v0.1.0             --repo valargroup/kresko --json assets --jq '.assets[].name'
 ```
 
-The Zebra `ls-remote` SHA should match the local/deployed Zebra SHA.
+The deployed network must be running the same binaries these tags publish.
 
 ## 3. Build Kresko Locally
 
@@ -57,27 +60,31 @@ CXXFLAGS='-include cstdint' cargo build --release --bin kresko
 
 ## 4. Generate And Package The Bundle
 
+The release coordinates default to `valargroup/zebra @ nu7-testnet-v0.1.0` and
+`valargroup/kresko @ v0.1.0`; override them only if you cut new releases.
+
 ```bash
 rm -rf "$OUT_DIR" "$BUNDLE_TGZ"
 
 target/release/kresko join-bundle \
   --run-dir "$RUN_DIR" \
-  --zebra-git-url https://github.com/valargroup/zebra.git \
-  --zebra-ref evan/nu7/testnet \
-  --kresko-git-url https://github.com/evan-forbes/kresko.git \
-  --kresko-ref giga-refactor \
+  --zebra-repo valargroup/zebra \
+  --zebra-release-tag nu7-testnet-v0.1.0 \
+  --kresko-repo valargroup/kresko \
+  --kresko-release-tag v0.1.0 \
   --out "$OUT_DIR"
 
-bash "$OUT_DIR/join-nu7-testnet.sh" --dry-run
 tar -C "$OUT_DIR" -czf "$BUNDLE_TGZ" .
+
+# Validate the packaged bundle with the join script (no root needed).
+bash scripts/join-nu7-testnet.sh --bundle-url "$BUNDLE_TGZ" --dry-run
 sha256sum "$BUNDLE_TGZ"
 ```
 
-Expected bundle contents:
+Expected bundle contents (data-only — no script):
 
 ```text
 join-manifest.json
-join-nu7-testnet.sh
 zebrad.join.toml
 local_genesis/checkpoints.txt
 local_genesis/genesis.hex
@@ -101,22 +108,28 @@ Record:
 
 ```bash
 sha256sum "$BUNDLE_TGZ"
-jq '{genesis_hash, seeded_tip_hash, zebra_git_url, zebra_ref, kresko_git_url, kresko_ref, bootstrap_peers}' "$OUT_DIR/join-manifest.json"
+jq '{genesis_hash, seeded_tip_hash, zebra_release_repo, zebra_release_tag, kresko_release_repo, kresko_release_tag, bootstrap_peers}' "$OUT_DIR/join-manifest.json"
 ```
 
 ## 6. Join From A Fresh Ubuntu Host
 
+The join script is attached to every Kresko release. Download it and point it at
+the published bundle. It fetches the prebuilt `zebrad`/`kresko` binaries named in
+the bundle manifest, verifies their checksums, seeds the chain, and starts
+zebrad.
+
 Observer-only:
 
 ```bash
-bash scripts/join-nu7-testnet.sh \
+curl -fsSLO https://github.com/valargroup/kresko/releases/download/v0.1.0/join-nu7-testnet.sh
+bash join-nu7-testnet.sh \
   --bundle-url https://example.com/nu7-join-bundle.tar.gz
 ```
 
 Mining:
 
 ```bash
-bash scripts/join-nu7-testnet.sh \
+bash join-nu7-testnet.sh \
   --bundle-url https://example.com/nu7-join-bundle.tar.gz \
   --mine
 ```
@@ -124,26 +137,25 @@ bash scripts/join-nu7-testnet.sh \
 Mining with a spendable supplied recipient:
 
 ```bash
-bash scripts/join-nu7-testnet.sh \
+bash join-nu7-testnet.sh \
   --bundle-url https://example.com/nu7-join-bundle.tar.gz \
   --mine \
   --miner-address t2...
 ```
 
-If `--mine` is used without `--miner-address`, the generated join script creates
-a random local testnet P2SH recipient. That is fine for proving mining works,
-but it does not save a spend key. Use `--miner-address` when rewards need to be
-spendable.
+If `--mine` is used without `--miner-address`, the join script creates a random
+local testnet P2SH recipient. That is fine for proving mining works, but it does
+not save a spend key. Use `--miner-address` when rewards need to be spendable.
 
 ## 7. Runtime Locations On The Join Host
 
 ```text
-/opt/nu7-testnet                Zebra checkout, bundle, state, helper scripts
-/opt/nu7-join-src/kresko        Kresko source checkout used for --mine
-/opt/nu7-join-src/nu7-testnet   Symlink to the Zebra source checkout
-/opt/nu7-join-src/zebra         zebra-jsonl-trace source checkout
+/usr/local/bin/zebrad           Prebuilt zebrad downloaded from the zebra release
+/usr/local/bin/kresko           Prebuilt kresko downloaded from the kresko release (--mine only)
+/opt/nu7-testnet/bundle         Extracted join bundle (manifest, config, seed blocks)
+/opt/nu7-testnet/state          Zebra state cache
 /root/.config/zebrad.toml       Runtime Zebra config
-/var/log/nu7-testnet            Join, bootstrap, zebrad, and mining logs
+/var/log/nu7-testnet            Bootstrap, zebrad, and mining logs
 tmux session nu7-zebrad         Running Zebra node
 tmux session nu7-mine           Running Kresko miner, only with --mine
 ```
@@ -174,14 +186,11 @@ should show accepted submitted blocks.
 
 ## 9. Known Pitfalls
 
-- Do not use a Zebra Git URL/ref that differs from the deployed network binary.
-  A stale branch can build successfully but fail to sync with the running NU7
-  network.
+- Do not use release tags that differ from the deployed network binaries. A
+  mismatched build can start but fail to sync with the running NU7 network.
 - Do not reset the whole experiment when testing a join bundle. Reset or clear
   only the intended join-test node.
 - `payload/local_genesis/funded_keys.json` exists in the run payload, but the
   join bundle must not include it.
-- The join script builds Zebra from source. There is intentionally no prebuilt
-  Zebra binary path in the bundle.
-- Mining mode also builds Kresko from source and recreates Kresko's expected
-  sibling source layout because `giga-refactor` has local path dependencies.
+- The released binaries target `x86_64` Linux (glibc). For other architectures,
+  cut a matching release first or build from source manually.

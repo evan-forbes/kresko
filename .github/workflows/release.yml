@@ -59,13 +59,14 @@ jobs:
           file "$name"
           echo "name=${name}" >> "$GITHUB_OUTPUT"
 
-      - name: Attach binary to the release
+      - name: Attach binary + join script to the release
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ github.event.release.tag_name }}" \
             "${{ steps.pkg.outputs.name }}" "${{ steps.pkg.outputs.name }}.sha256" \
+            scripts/join-nu7-testnet.sh \
             --clobber --repo "${{ github.repository }}"
 
       - name: Upload binary as workflow artifact (manual runs)

@@ -119,27 +119,28 @@ enum Commands {
         directory: String,
     },
 
-    /// Generate a source-build join bundle for outside NU7 testnet observers
+    /// Generate a join bundle for outside NU7 testnet observers (binaries pulled
+    /// from GitHub releases by the join script; see scripts/join-nu7-testnet.sh)
     JoinBundle {
         /// Kresko experiment directory containing config.json and payload/local_genesis
         #[arg(long)]
         run_dir: String,
 
-        /// Zebra git repository URL used by the generated join script
-        #[arg(long, default_value = "https://github.com/ZcashFoundation/zebra.git")]
-        zebra_git_url: String,
+        /// Zebra GitHub release repo (owner/name) the join script downloads zebrad from
+        #[arg(long, default_value = "valargroup/zebra")]
+        zebra_repo: String,
 
-        /// Zebra git ref used by the generated join script
-        #[arg(long, default_value = "evan/nu7/testnet")]
-        zebra_ref: String,
+        /// Zebra GitHub release tag the join script downloads zebrad from
+        #[arg(long, default_value = "nu7-testnet-v0.1.0")]
+        zebra_release_tag: String,
 
-        /// Kresko git repository URL used by the generated join script when --mine is enabled
-        #[arg(long, default_value = "https://github.com/evan-forbes/kresko.git")]
-        kresko_git_url: String,
+        /// Kresko GitHub release repo (owner/name) the join script downloads kresko from when --mine is enabled
+        #[arg(long, default_value = "valargroup/kresko")]
+        kresko_repo: String,
 
-        /// Kresko git ref used by the generated join script when --mine is enabled
-        #[arg(long, default_value = "giga-refactor")]
-        kresko_ref: String,
+        /// Kresko GitHub release tag the join script downloads kresko from when --mine is enabled
+        #[arg(long, default_value = "v0.1.0")]
+        kresko_release_tag: String,
 
         /// Output directory for the generated join bundle
         #[arg(long)]
@@ -1193,18 +1194,18 @@ async fn main() -> Result<()> {
         }
         Commands::JoinBundle {
             run_dir,
-            zebra_git_url,
-            zebra_ref,
-            kresko_git_url,
-            kresko_ref,
+            zebra_repo,
+            zebra_release_tag,
+            kresko_repo,
+            kresko_release_tag,
             out,
         } => {
             commands::join_bundle::run(
                 &run_dir,
-                &zebra_git_url,
-                &zebra_ref,
-                &kresko_git_url,
-                &kresko_ref,
+                &zebra_repo,
+                &zebra_release_tag,
+                &kresko_repo,
+                &kresko_release_tag,
                 &out,
             )?;
         }
