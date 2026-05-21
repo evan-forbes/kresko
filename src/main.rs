@@ -119,6 +119,41 @@ enum Commands {
         directory: String,
     },
 
+    /// Generate a source-build join bundle for outside NU7 testnet observers
+    JoinBundle {
+        /// Kresko experiment directory containing config.json and payload/local_genesis
+        #[arg(long)]
+        run_dir: String,
+
+        /// Zebra git repository URL used by the generated join script
+        #[arg(long, default_value = "https://github.com/ZcashFoundation/zebra.git")]
+        zebra_git_url: String,
+
+        /// Zebra git ref used by the generated join script
+        #[arg(long, default_value = "evan/nu7/testnet")]
+        zebra_ref: String,
+
+        /// Kresko git repository URL used by the generated join script when --mine is enabled
+        #[arg(long, default_value = "https://github.com/evan-forbes/kresko.git")]
+        kresko_git_url: String,
+
+        /// Kresko git ref used by the generated join script when --mine is enabled
+        #[arg(long, default_value = "giga-refactor")]
+        kresko_ref: String,
+
+        /// Zebra repo containing zebra-jsonl-trace for building Kresko when --mine is enabled
+        #[arg(long, default_value = "https://github.com/evan-forbes/zebra.git")]
+        zebra_jsonl_trace_git_url: String,
+
+        /// Zebra ref containing zebra-jsonl-trace for building Kresko when --mine is enabled
+        #[arg(long, default_value = "evan/benchmark-worst-case-block-verification")]
+        zebra_jsonl_trace_ref: String,
+
+        /// Output directory for the generated join bundle
+        #[arg(long)]
+        out: String,
+    },
+
     /// Public-network txblast workflow (wallet, deposits, plan/prepare/run/stop/status/withdraw/recover)
     Txblast {
         #[command(subcommand)]
@@ -765,6 +800,7 @@ impl Commands {
             Commands::Init { .. }
             | Commands::Config { .. }
             | Commands::Mine { .. }
+            | Commands::JoinBundle { .. }
             | Commands::PowSimulate { .. }
             | Commands::PowBench { .. }
             | Commands::PowSimulateMatrix { .. }
@@ -783,8 +819,8 @@ fn run_config_command(command: ConfigCommand) -> Result<()> {
     use anyhow::Context;
     match command {
         ConfigCommand::GetMinerAddress { path } => {
-            let contents = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {path}"))?;
+            let contents =
+                std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
             if let Some(address) = zebra_config::read_miner_address(&contents)? {
                 println!("{address}");
             }
@@ -801,21 +837,21 @@ fn run_config_command(command: ConfigCommand) -> Result<()> {
             }
         }
         ConfigCommand::GetGenesisHash { path } => {
-            let contents = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {path}"))?;
+            let contents =
+                std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
             if let Some(hash) = zebra_config::read_genesis_hash(&contents)? {
                 println!("{hash}");
             }
         }
         ConfigCommand::StripGenesisBlockPath { path } => {
-            let contents = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {path}"))?;
+            let contents =
+                std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
             let stripped = zebra_config::strip_genesis_block_path(&contents)?;
             std::fs::write(&path, stripped).with_context(|| format!("writing {path}"))?;
         }
         ConfigCommand::RenderBootstrap { path, out } => {
-            let contents = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {path}"))?;
+            let contents =
+                std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
             let bootstrap = zebra_config::bootstrap_config_for_isolated_rpc(&contents)?;
             let dest = out.unwrap_or_else(|| {
                 let p = std::path::Path::new(&path);
@@ -1161,6 +1197,27 @@ async fn main() -> Result<()> {
                 &build_dir,
                 &scripts_dir,
                 &directory,
+            )?;
+        }
+        Commands::JoinBundle {
+            run_dir,
+            zebra_git_url,
+            zebra_ref,
+            kresko_git_url,
+            kresko_ref,
+            zebra_jsonl_trace_git_url,
+            zebra_jsonl_trace_ref,
+            out,
+        } => {
+            commands::join_bundle::run(
+                &run_dir,
+                &zebra_git_url,
+                &zebra_ref,
+                &kresko_git_url,
+                &kresko_ref,
+                &zebra_jsonl_trace_git_url,
+                &zebra_jsonl_trace_ref,
+                &out,
             )?;
         }
         Commands::Txblast { command, directory } => {

@@ -44,6 +44,21 @@ KRESKO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 NU7_ZEBRA_ROOT="$(cd "${NU7_ZEBRA_ROOT:-$KRESKO_ROOT/../nu7-testnet}" && pwd)"
 ZEBRA_ROOT="$(cd "${ZEBRA_ROOT:-$KRESKO_ROOT/../zebra}" && pwd)"
 
+if [ -L "$ZEBRA_ROOT/zebra-jsonl-trace" ]; then
+    resolved_trace="$(readlink -f "$ZEBRA_ROOT/zebra-jsonl-trace")"
+    resolved_zebra_root="$(cd "$(dirname "$resolved_trace")" && pwd)"
+    if [ "$resolved_zebra_root" != "$ZEBRA_ROOT" ] && [ -f "$resolved_zebra_root/Cargo.toml" ]; then
+        echo "Note: zebra-jsonl-trace is a symlink outside ZEBRA_ROOT; using $resolved_zebra_root for Docker."
+        ZEBRA_ROOT="$resolved_zebra_root"
+    fi
+fi
+
+if [ ! -f "$ZEBRA_ROOT/zebra-jsonl-trace/Cargo.toml" ]; then
+    echo "Error: missing zebra-jsonl-trace at $ZEBRA_ROOT/zebra-jsonl-trace" >&2
+    echo "Set ZEBRA_ROOT to a Zebra worktree containing zebra-jsonl-trace." >&2
+    exit 1
+fi
+
 BUILD_ZEBRAD=true
 BUILD_KRESKO=true
 OUTPUT_DIR="$KRESKO_ROOT/target/ubuntu"
