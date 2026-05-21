@@ -26,7 +26,7 @@ toml = "0.8"
 chrono = { version = "0.4", default-features = false }
 zebra-chain = { path = "../nu7-testnet/zebra-chain", features = ["internal-miner"] }
 zebrad = { path = "../nu7-testnet/zebrad" }
-zebra-jsonl-trace = { path = "../zebra/zebra-jsonl-trace", version = "0.1.0" }
+zebra-jsonl-trace = { path = "../nu7-testnet/zebra-jsonl-trace", version = "0.1.0" }
 zcash_primitives = { version = "0.26", features = ["transparent-inputs"] }
 zcash_protocol = "0.7"
 zcash_address = "0.10"

@@ -141,14 +141,6 @@ enum Commands {
         #[arg(long, default_value = "giga-refactor")]
         kresko_ref: String,
 
-        /// Zebra repo containing zebra-jsonl-trace for building Kresko when --mine is enabled
-        #[arg(long, default_value = "https://github.com/evan-forbes/zebra.git")]
-        zebra_jsonl_trace_git_url: String,
-
-        /// Zebra ref containing zebra-jsonl-trace for building Kresko when --mine is enabled
-        #[arg(long, default_value = "evan/benchmark-worst-case-block-verification")]
-        zebra_jsonl_trace_ref: String,
-
         /// Output directory for the generated join bundle
         #[arg(long)]
         out: String,
@@ -1205,8 +1197,6 @@ async fn main() -> Result<()> {
             zebra_ref,
             kresko_git_url,
             kresko_ref,
-            zebra_jsonl_trace_git_url,
-            zebra_jsonl_trace_ref,
             out,
         } => {
             commands::join_bundle::run(
@@ -1215,8 +1205,6 @@ async fn main() -> Result<()> {
                 &zebra_ref,
                 &kresko_git_url,
                 &kresko_ref,
-                &zebra_jsonl_trace_git_url,
-                &zebra_jsonl_trace_ref,
                 &out,
             )?;
         }

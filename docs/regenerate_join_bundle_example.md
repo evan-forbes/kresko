@@ -38,11 +38,13 @@ For the current NU7 run, use `valargroup/zebra`; the same branch on
 `evan-forbes/zebra` was stale during testing, and `ZcashFoundation/zebra` did
 not expose this branch.
 
+The `evan/nu7/testnet` ref now also carries the `zebra-jsonl-trace` crate, so a
+single Zebra checkout supplies `zebra-chain`, `zebrad`, and `zebra-jsonl-trace`.
+
 ```bash
 git -C /home/evan/src/zcash/nu7-testnet rev-parse HEAD
 git ls-remote --heads https://github.com/valargroup/zebra.git evan/nu7/testnet
 git ls-remote --heads https://github.com/evan-forbes/kresko.git giga-refactor
-git ls-remote --heads https://github.com/evan-forbes/zebra.git evan/benchmark-worst-case-block-verification
 ```
 
 The Zebra `ls-remote` SHA should match the local/deployed Zebra SHA.
@@ -64,8 +66,6 @@ target/release/kresko join-bundle \
   --zebra-ref evan/nu7/testnet \
   --kresko-git-url https://github.com/evan-forbes/kresko.git \
   --kresko-ref giga-refactor \
-  --zebra-jsonl-trace-git-url https://github.com/evan-forbes/zebra.git \
-  --zebra-jsonl-trace-ref evan/benchmark-worst-case-block-verification \
   --out "$OUT_DIR"
 
 bash "$OUT_DIR/join-nu7-testnet.sh" --dry-run

@@ -33,8 +33,6 @@ pub struct JoinManifest {
     pub zebra_ref: String,
     pub kresko_git_url: String,
     pub kresko_ref: String,
-    pub zebra_jsonl_trace_git_url: String,
-    pub zebra_jsonl_trace_ref: String,
     pub generated_at_unix_secs: u64,
     pub files: BTreeMap<String, String>,
 }
@@ -51,8 +49,6 @@ pub fn run(
     zebra_ref: &str,
     kresko_git_url: &str,
     kresko_ref: &str,
-    zebra_jsonl_trace_git_url: &str,
-    zebra_jsonl_trace_ref: &str,
     out: &str,
 ) -> Result<()> {
     let run_dir = Path::new(run_dir);
@@ -134,8 +130,6 @@ pub fn run(
         zebra_ref: zebra_ref.to_string(),
         kresko_git_url: kresko_git_url.to_string(),
         kresko_ref: kresko_ref.to_string(),
-        zebra_jsonl_trace_git_url: zebra_jsonl_trace_git_url.to_string(),
-        zebra_jsonl_trace_ref: zebra_jsonl_trace_ref.to_string(),
         generated_at_unix_secs,
         files,
     };
@@ -654,28 +648,19 @@ seed_local_genesis() {
 }
 
 prepare_kresko_source_layout() {
-    # kresko.giga-refactor currently has local path dependencies that match the
-    # developer checkout layout. Recreate that sibling layout without copying
-    # the Zebra workspace built above.
-    local trace_git_url trace_ref source_root trace_root zebra_link
-    trace_git_url="$(jq -r '.zebra_jsonl_trace_git_url' "$BUNDLE_DIR/join-manifest.json")"
-    trace_ref="$(jq -r '.zebra_jsonl_trace_ref' "$BUNDLE_DIR/join-manifest.json")"
+    # kresko has local path dependencies (../nu7-testnet/...) that match the
+    # developer checkout layout. Recreate that sibling layout by linking the
+    # already-built Zebra workspace, which now also provides zebra-jsonl-trace
+    # on the nu7 ref, so no second checkout is needed.
+    local source_root zebra_link
     source_root="$(dirname "$KRESKO_DIR")"
-    trace_root="$source_root/zebra"
     zebra_link="$source_root/nu7-testnet"
     mkdir -p "$source_root"
     if [ ! -e "$zebra_link" ]; then
         ln -s "$ZEBRA_DIR" "$zebra_link"
     fi
-    if [ ! -e "$trace_root/zebra-jsonl-trace" ]; then
-        if [ ! -d "$trace_root/.git" ]; then
-            git clone "$trace_git_url" "$trace_root"
-        fi
-        git -C "$trace_root" fetch origin "$trace_ref"
-        git -C "$trace_root" checkout --detach FETCH_HEAD
-    fi
-    if [ ! -d "$trace_root/zebra-jsonl-trace" ]; then
-        echo "zebra-jsonl-trace was not found in $trace_root after checkout" >&2
+    if [ ! -d "$zebra_link/zebra-jsonl-trace" ]; then
+        echo "zebra-jsonl-trace was not found in $ZEBRA_DIR; the Zebra ref must include it" >&2
         exit 1
     fi
 }
@@ -927,8 +912,6 @@ mod tests {
             "evan/nu7/testnet",
             "https://github.com/evan-forbes/kresko.git",
             "giga-refactor",
-            "https://github.com/evan-forbes/zebra.git",
-            "evan/benchmark-worst-case-block-verification",
             out_dir.to_str().expect("temp path is utf8"),
         )
         .expect("join bundle generation should succeed");
@@ -943,10 +926,6 @@ mod tests {
             vec!["1.1.1.1:18233", "2.2.2.2:18233"]
         );
         assert_eq!(manifest.kresko_ref, "giga-refactor");
-        assert_eq!(
-            manifest.zebra_jsonl_trace_ref,
-            "evan/benchmark-worst-case-block-verification"
-        );
         assert!(manifest.files.contains_key("local_genesis/genesis.hex"));
         assert!(!manifest.files.contains_key("join-manifest.json"));
 

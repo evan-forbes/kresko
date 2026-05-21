@@ -1,0 +1,107 @@
+name: Release binaries
+
+# Build the release binary and attach it to the GitHub Release that triggered
+# this run. `workflow_dispatch` is provided to smoke-test the build without
+# cutting a release (the binary is uploaded as a workflow artifact instead).
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      nu7_ref:
+        description: "Override the nu7 Zebra commit/ref to build against (defaults to NU7_ZEBRA_REF below)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  # kresko depends on zebra-chain, zebrad, and zebra-jsonl-trace via path
+  # dependencies (../nu7-testnet/...). They all live on the nu7 ref of this
+  # Zebra fork. Pinned to an exact commit for reproducible release builds;
+  # bump NU7_ZEBRA_REF when the nu7 Zebra source the release should track moves.
+  NU7_ZEBRA_REPO: valargroup/zebra
+  NU7_ZEBRA_REF: 0d9bf905fc0b4bbfcaee20bf15e9b01b8b6195b7
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux-x86_64:
+    name: Build kresko (x86_64 Ubuntu 22.04)
+    runs-on: ubuntu-22.04
+    steps:
+      # kresko and the Zebra workspace must be siblings so the
+      # ../nu7-testnet/... path dependencies in kresko/Cargo.toml resolve.
+      - name: Checkout kresko
+        uses: actions/checkout@v4
+        with:
+          path: kresko
+
+      - name: Resolve nu7 Zebra ref
+        id: nu7
+        run: |
+          ref="${{ github.event.inputs.nu7_ref }}"
+          echo "ref=${ref:-$NU7_ZEBRA_REF}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout nu7 Zebra (zebra-chain, zebrad, zebra-jsonl-trace)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.NU7_ZEBRA_REPO }}
+          ref: ${{ steps.nu7.outputs.ref }}
+          path: nu7-testnet
+
+      # Mirrors docker/ubuntu-builder.Dockerfile so the binary matches `make ubuntu`.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake libclang-dev pkg-config protobuf-compiler
+
+      - name: Install Rust 1.91
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+
+      - name: Cargo build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kresko
+
+      # CXXFLAGS / RUSTFLAGS mirror scripts/build-ubuntu.sh exactly.
+      - name: Build kresko (release)
+        working-directory: kresko
+        env:
+          CXXFLAGS: "-include cstdint"
+          RUSTFLAGS: '--cfg zcash_unstable="nu7" --cfg zcash_unstable="zip235"'
+        run: cargo build --locked --release --bin kresko
+
+      - name: Package binary + checksum
+        id: pkg
+        working-directory: kresko
+        run: |
+          version="${{ github.event.release.tag_name }}"
+          [ -n "$version" ] || version="${GITHUB_SHA::8}"
+          name="kresko-${version}-x86_64-linux-gnu"
+          install -m 0755 target/release/kresko "$name"
+          sha256sum "$name" > "${name}.sha256"
+          file "$name"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Attach binary to the release
+        if: github.event_name == 'release'
+        working-directory: kresko
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "${{ steps.pkg.outputs.name }}" "${{ steps.pkg.outputs.name }}.sha256" \
+            --clobber --repo "${{ github.repository }}"
+
+      - name: Upload binary as workflow artifact (manual runs)
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: |
+            kresko/${{ steps.pkg.outputs.name }}
+            kresko/${{ steps.pkg.outputs.name }}.sha256
