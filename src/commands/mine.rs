@@ -4,14 +4,13 @@ use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::Write as IoWrite;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zebra_chain::{
-    block::{self, Block, Header},
+    block::{self, Header},
     fmt::HexDebug,
-    parameters::{EquihashParams, Network, testnet},
-    serialization::{ZcashDeserializeInto, ZcashSerialize},
+    parameters::Network,
+    serialization::{CompactSizeMessage, ZcashSerialize},
     work::{
         difficulty::CompactDifficulty,
         equihash::{Solution, SolverCancelled},
@@ -50,6 +49,28 @@ struct TemplateSummary {
     transaction_bytes: usize,
 }
 
+struct RawTemplateBlock {
+    header: Header,
+    transactions: Vec<Vec<u8>>,
+}
+
+impl RawTemplateBlock {
+    fn serialize_with_header(&self, header: &Header) -> Result<Vec<u8>> {
+        let mut block_bytes = Vec::new();
+        header
+            .zcash_serialize(&mut block_bytes)
+            .context("failed to serialize solved header")?;
+        CompactSizeMessage::try_from(self.transactions.len())
+            .context("too many transactions in block template")?
+            .zcash_serialize(&mut block_bytes)
+            .context("failed to serialize transaction count")?;
+        for tx in &self.transactions {
+            block_bytes.extend_from_slice(tx);
+        }
+        Ok(block_bytes)
+    }
+}
+
 pub async fn run(rpc_endpoint: &str, zebrad_config: &Path) -> Result<()> {
     println!("Starting PoW miner against {rpc_endpoint}");
 
@@ -62,17 +83,13 @@ pub async fn run(rpc_endpoint: &str, zebrad_config: &Path) -> Result<()> {
     let chain = info["result"]["chain"].as_str().unwrap_or("unknown");
     let height = info["result"]["blocks"].as_u64().unwrap_or(0);
     println!("Connected: chain={chain}, height={height}");
-    let rpc_network = network_from_chain_name(chain)?;
-    let network = match load_equihash_params(zebrad_config)? {
-        Some(equihash_params) if is_test_chain_name(chain) => {
-            configured_testnet_network(equihash_params)?
-        }
-        _ => rpc_network,
-    };
-    println!(
-        "Mining with Equihash parameters: {:?}",
-        network.equihash_params()
-    );
+    let _network = network_from_chain_name(chain)?;
+    if !zebrad_config.exists() {
+        eprintln!(
+            "zebrad config {} not found; using RPC chain network",
+            zebrad_config.display()
+        );
+    }
 
     let mut log_file = OpenOptions::new()
         .create(true)
@@ -149,8 +166,9 @@ pub async fn run(rpc_endpoint: &str, zebrad_config: &Path) -> Result<()> {
             },
         );
 
-        // 2. Parse template into a Block
-        let block = match block_from_template(&template, &network) {
+        // 2. Parse template into a raw block. Template transactions can use
+        // transaction versions newer than Kresko needs to understand.
+        let block = match block_from_template(&template) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("Failed to parse block template: {e}");
@@ -159,7 +177,7 @@ pub async fn run(rpc_endpoint: &str, zebrad_config: &Path) -> Result<()> {
             }
         };
 
-        let header = *block.header;
+        let header = block.header;
 
         // 3. Set up cancellation via long-poll
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -178,7 +196,6 @@ pub async fn run(rpc_endpoint: &str, zebrad_config: &Path) -> Result<()> {
 
         // 4. Solve in a blocking thread
         let solve_start = Instant::now();
-        let solve_network = network.clone();
         let solve_result = tokio::task::spawn_blocking(move || {
             let cancel_fn = move || {
                 if *cancel_rx.borrow() {
@@ -187,7 +204,7 @@ pub async fn run(rpc_endpoint: &str, zebrad_config: &Path) -> Result<()> {
                     Ok(())
                 }
             };
-            Solution::solve(header, &solve_network, cancel_fn)
+            Solution::solve(header, cancel_fn)
         })
         .await
         .context("solver thread panicked")?;
@@ -204,17 +221,9 @@ pub async fn run(rpc_endpoint: &str, zebrad_config: &Path) -> Result<()> {
                     solve_time.as_secs_f64()
                 );
 
-                // Reconstruct block with solved header
-                let solved_block = Block {
-                    header: Arc::new(solved_header),
-                    transactions: block.transactions,
-                };
-
-                let block_hash = format!("{}", block::Hash::from(&*solved_block.header));
-
-                let mut block_bytes = Vec::new();
-                solved_block
-                    .zcash_serialize(&mut block_bytes)
+                let block_hash = format!("{}", block::Hash::from(&solved_header));
+                let block_bytes = block
+                    .serialize_with_header(&solved_header)
                     .context("failed to serialize solved block")?;
                 let block_hex = hex::encode(&block_bytes);
 
@@ -530,11 +539,12 @@ async fn rpc_call(
     Ok(payload)
 }
 
-/// Construct a zebra-chain `Block` from a `getblocktemplate` JSON response.
+/// Construct a raw block from a `getblocktemplate` JSON response.
 ///
-/// This reimplements the logic from `zebra_rpc::proposal_block_from_template` using
-/// only `zebra-chain` types, avoiding the heavy `zebra-rpc` dependency tree.
-fn block_from_template(template: &serde_json::Value, network: &Network) -> Result<Block> {
+/// Kresko only needs to solve the header. Transactions are kept as raw bytes so
+/// the miner can submit templates containing transaction versions that are
+/// newer than the local `zebra-chain` transaction parser supports.
+fn block_from_template(template: &serde_json::Value) -> Result<RawTemplateBlock> {
     let version = template["version"].as_u64().context("missing version")? as u32;
 
     let prev_hash_hex = template["previousblockhash"]
@@ -567,16 +577,11 @@ fn block_from_template(template: &serde_json::Value, network: &Network) -> Resul
     let time =
         chrono::DateTime::from_timestamp(cur_time, 0).context("invalid curtime timestamp")?;
 
-    // Parse transactions
     let coinbase_hex = template["coinbasetxn"]["data"]
         .as_str()
         .context("missing coinbasetxn.data")?;
     let coinbase_bytes = hex::decode(coinbase_hex).context("invalid coinbase hex")?;
-    let mut transactions: Vec<Arc<zebra_chain::transaction::Transaction>> = vec![
-        coinbase_bytes
-            .zcash_deserialize_into()
-            .context("failed to deserialize coinbase transaction")?,
-    ];
+    let mut transactions = vec![coinbase_bytes];
 
     if let Some(tx_templates) = template["transactions"].as_array() {
         for tx_template in tx_templates {
@@ -584,11 +589,7 @@ fn block_from_template(template: &serde_json::Value, network: &Network) -> Resul
                 .as_str()
                 .context("missing transaction data")?;
             let tx_bytes = hex::decode(tx_hex).context("invalid transaction hex")?;
-            transactions.push(
-                tx_bytes
-                    .zcash_deserialize_into()
-                    .context("failed to deserialize transaction")?,
-            );
+            transactions.push(tx_bytes);
         }
     }
 
@@ -600,11 +601,11 @@ fn block_from_template(template: &serde_json::Value, network: &Network) -> Resul
         time,
         difficulty_threshold,
         nonce: HexDebug([0; 32]),
-        solution: Solution::for_proposal(network),
+        solution: Solution::for_proposal(),
     };
 
-    Ok(Block {
-        header: Arc::new(header),
+    Ok(RawTemplateBlock {
+        header,
         transactions,
     })
 }
@@ -627,53 +628,4 @@ fn network_from_chain_name(chain: &str) -> Result<Network> {
             "unsupported chain reported by getblockchaininfo: '{other}'. Expected main/test network."
         ),
     }
-}
-
-fn is_test_chain_name(chain: &str) -> bool {
-    matches!(chain.to_ascii_lowercase().as_str(), "test" | "testnet")
-}
-
-fn configured_testnet_network(equihash_params: EquihashParams) -> Result<Network> {
-    testnet::Parameters::build()
-        .with_equihash_params(equihash_params)
-        .to_network()
-        .map_err(|err| anyhow::anyhow!("failed to build mining network parameters: {err}"))
-}
-
-fn load_equihash_params(config_path: &Path) -> Result<Option<EquihashParams>> {
-    if !config_path.exists() {
-        eprintln!(
-            "zebrad config {} not found; falling back to RPC chain defaults",
-            config_path.display()
-        );
-        return Ok(None);
-    }
-
-    let config = std::fs::read_to_string(config_path)
-        .with_context(|| format!("failed to read zebrad config {}", config_path.display()))?;
-    let parsed: toml::Value = toml::from_str(&config)
-        .with_context(|| format!("failed to parse zebrad config {}", config_path.display()))?;
-    let Some(value) = parsed
-        .get("network")
-        .and_then(|network| network.get("testnet_parameters"))
-        .and_then(|params| params.get("equihash_params"))
-        .and_then(toml::Value::as_str)
-    else {
-        return Ok(None);
-    };
-
-    let equihash_params = match value {
-        "common" => EquihashParams::Common,
-        "regtest" => EquihashParams::Regtest,
-        other => anyhow::bail!(
-            "unsupported network.testnet_parameters.equihash_params in {}: {other}",
-            config_path.display(),
-        ),
-    };
-    println!(
-        "Loaded Equihash parameters {:?} from {}",
-        equihash_params,
-        config_path.display()
-    );
-    Ok(Some(equihash_params))
 }

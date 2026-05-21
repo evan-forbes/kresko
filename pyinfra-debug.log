@@ -1,0 +1,9 @@
+  File "/home/evan/src/zcash/kresko.giga-refactor/.venv/lib/python3.14/site-packages/pyinfra_cli/cli.py", line 263, in cli
+    _main(*args, **kwargs)
+    ~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/evan/src/zcash/kresko.giga-refactor/.venv/lib/python3.14/site-packages/pyinfra_cli/cli.py", line 442, in _main
+    and not _do_confirm("Detected changes displayed above, skip this step with -y")
+            ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/evan/src/zcash/kresko.giga-refactor/.venv/lib/python3.14/site-packages/pyinfra_cli/cli.py", line 468, in _do_confirm
+    v = input()
+EOFError: EOF when reading a line

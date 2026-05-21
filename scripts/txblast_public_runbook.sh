@@ -35,10 +35,8 @@ set -euo pipefail
 # Assumptions:
 #
 # - Run from the experiment directory, or set EXPERIMENT_DIR below.
-# - The experiment was initialized with:
-#     kresko init -N public-testnet ...
-#   or:
-#     kresko init -N mainnet ...
+# - The experiment was provisioned and deployed via the Python orchestration
+#   layer (`harness`) for either `public-testnet` or `mainnet`.
 # - Nodes have already been created/deployed/synced when you reach prepare/run.
 # - For public testnet, first practice the full lifecycle with small funds.
 # - Do not enable mainnet runs until public-testnet recovery drills pass.
@@ -296,10 +294,6 @@ kresko txblast status \
 kresko txblast stop \
   -d "${EXPERIMENT_DIR}" \
   --dry-run
-#
-# Existing local-genesis txblast sessions can still be stopped with:
-#
-# kresko kill-session -d "${EXPERIMENT_DIR}" --session txblast
 
 ###############################################################################
 # 8. Withdraw funds back to an external wallet

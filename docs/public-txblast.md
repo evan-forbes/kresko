@@ -5,9 +5,6 @@ mainnet experiments. It is separate from local-genesis txblast: local-genesis
 can rely on premine-funded transparent keys, while public networks must treat
 transparent funds only as the initial deposit and final withdrawal boundary.
 
-For an operator-focused mainnet block-fill procedure, see
-[`docs/mainnet-txblast-runbook.md`](mainnet-txblast-runbook.md).
-
 ## Lifecycle
 
 1. Create a wallet:

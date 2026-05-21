@@ -1,7 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::future::join_all;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
 use crate::config::{Config, NetworkKind, resolve_value, select_instances, shellexpand};
@@ -16,8 +17,12 @@ pub struct QueryOptions {
 pub struct NodeStatus {
     pub name: String,
     pub ip: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<String>,
     pub height: Option<u64>,
     pub verification_progress: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_block_hash: Option<String>,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_reachable: Option<bool>,
@@ -25,6 +30,8 @@ pub struct NodeStatus {
     pub ssh_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tmux_session_present: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tmux_sessions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loopback_rpc_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,6 +63,28 @@ pub struct HeightBucket {
     pub nodes: usize,
 }
 
+#[derive(Debug)]
+struct StatusTargetSet {
+    targets: Vec<StatusTarget>,
+    network_kind: NetworkKind,
+    rpc_port: u16,
+    ssh_key_path: String,
+}
+
+#[derive(Debug)]
+struct StatusTarget {
+    name: String,
+    ip: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeSnapshot {
+    name: String,
+    public_ip: String,
+    #[serde(default)]
+    status: String,
+}
+
 pub async fn run(
     json: bool,
     summary: bool,
@@ -84,6 +113,7 @@ pub async fn run(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn query(directory: &str) -> Result<StatusReport> {
     query_with_options(directory, QueryOptions::default(), None).await
 }
@@ -93,14 +123,13 @@ pub async fn query_with_options(
     options: QueryOptions,
     ssh_key_path: Option<&str>,
 ) -> Result<StatusReport> {
-    let dir = std::path::Path::new(directory);
-    let config = Config::load(dir)?;
+    let dir = Path::new(directory);
+    let target_set = load_status_targets(dir)?;
+    let total = target_set.targets.len();
+    let rpc_port = target_set.rpc_port;
+    let network_kind = target_set.network_kind;
 
-    let active = select_instances(&config.miners, "all");
-    let total = active.len();
-    let rpc_port = config.rpc_port();
-
-    if active.is_empty() {
+    if target_set.targets.is_empty() {
         return Ok(StatusReport {
             nodes: vec![],
             total: 0,
@@ -116,23 +145,23 @@ pub async fn query_with_options(
         Some(shellexpand(&resolve_value(
             ssh_key_path,
             "KRESKO_SSH_KEY_PATH",
-            &config.ssh_key_path,
+            &target_set.ssh_key_path,
         )))
     } else {
         None
     };
 
-    let futs: Vec<_> = active
+    let futs: Vec<_> = target_set
+        .targets
         .iter()
-        .map(|inst| {
-            let name = inst.name.clone();
-            let ip = inst.public_ip.clone();
+        .map(|target| {
+            let name = target.name.clone();
+            let ip = target.ip.clone();
             let client = client.clone();
             let ssh_key = ssh_key.clone();
 
             async move {
-                let mut node =
-                    fetch_rpc_status(&client, &name, &ip, rpc_port, config.network_kind).await;
+                let mut node = fetch_rpc_status(&client, &name, &ip, rpc_port, network_kind).await;
                 if let Some(key) = ssh_key.as_deref() {
                     populate_deep_status(&mut node, key, rpc_port).await;
                 }
@@ -150,6 +179,62 @@ pub async fn query_with_options(
         total,
         reachable,
         unreachable,
+    })
+}
+
+fn load_status_targets(dir: &Path) -> Result<StatusTargetSet> {
+    let config_path = dir.join("config.json");
+    if config_path.is_file() {
+        let config = Config::load(dir)?;
+        let targets = select_instances(&config.miners, "all")
+            .into_iter()
+            .map(|inst| StatusTarget {
+                name: inst.name.clone(),
+                ip: inst.public_ip.clone(),
+            })
+            .collect();
+
+        return Ok(StatusTargetSet {
+            targets,
+            network_kind: config.network_kind,
+            rpc_port: config.rpc_port(),
+            ssh_key_path: config.ssh_key_path,
+        });
+    }
+
+    let nodes_dir = dir.join("nodes");
+    let mut targets = Vec::new();
+    if nodes_dir.is_dir() {
+        for entry in std::fs::read_dir(&nodes_dir)
+            .with_context(|| format!("failed to read {}", nodes_dir.display()))?
+        {
+            let entry = entry
+                .with_context(|| format!("failed to read entry in {}", nodes_dir.display()))?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let data = std::fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let node: NodeSnapshot = serde_json::from_str(&data)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
+            if node.status == "failed" || node.public_ip == "TBD" || node.public_ip.is_empty() {
+                continue;
+            }
+            targets.push(StatusTarget {
+                name: node.name,
+                ip: node.public_ip,
+            });
+        }
+    }
+
+    targets.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(StatusTargetSet {
+        targets,
+        network_kind: NetworkKind::LocalGenesis,
+        rpc_port: NetworkKind::LocalGenesis.rpc_port(),
+        ssh_key_path: "~/.ssh/id_ed25519".to_string(),
     })
 }
 
@@ -194,9 +279,11 @@ async fn fetch_rpc_status(
         Err(error) => NodeStatus {
             name: name.to_string(),
             ip: ip.to_string(),
+            chain: None,
             height,
             verification_progress: height
                 .and_then(|height| estimate_progress(height, network_kind)),
+            best_block_hash: None,
             status: match height.and_then(|height| estimate_progress(height, network_kind)) {
                 Some(progress) if progress >= 0.9999 => {
                     format!(
@@ -218,6 +305,7 @@ async fn fetch_rpc_status(
             ssh_reachable: None,
             ssh_status: None,
             tmux_session_present: None,
+            tmux_sessions: None,
             loopback_rpc_status: None,
             recent_log_tail: None,
         },
@@ -232,6 +320,10 @@ fn status_from_blockchain_info(
     network_kind: NetworkKind,
 ) -> NodeStatus {
     let height = json["result"]["blocks"].as_u64().or(fallback_height);
+    let chain = json["result"]["chain"].as_str().map(ToString::to_string);
+    let best_block_hash = json["result"]["bestblockhash"]
+        .as_str()
+        .map(ToString::to_string);
     let progress = json["result"]["verificationprogress"]
         .as_f64()
         .or_else(|| height.and_then(|height| estimate_progress(height, network_kind)));
@@ -245,12 +337,15 @@ fn status_from_blockchain_info(
     NodeStatus {
         name: name.to_string(),
         ip: ip.to_string(),
+        chain,
         height,
         verification_progress: progress,
+        best_block_hash,
         status,
         ssh_reachable: None,
         ssh_status: None,
         tmux_session_present: None,
+        tmux_sessions: None,
         loopback_rpc_status: None,
         recent_log_tail: None,
     }
@@ -276,12 +371,15 @@ fn status_from_height_fallback(
     NodeStatus {
         name: name.to_string(),
         ip: ip.to_string(),
+        chain: None,
         height,
         verification_progress: progress,
+        best_block_hash: None,
         status,
         ssh_reachable: None,
         ssh_status: None,
         tmux_session_present: None,
+        tmux_sessions: None,
         loopback_rpc_status: None,
         recent_log_tail: None,
     }
@@ -320,10 +418,20 @@ fn estimated_public_network_tip(network_kind: NetworkKind) -> Option<u64> {
 
 async fn populate_deep_status(node: &mut NodeStatus, ssh_key: &str, rpc_port: u16) {
     let command = format!(
-        r#"tmux_state="absent"
-if tmux has-session -t app >/dev/null 2>&1; then
-  tmux_state="present"
+        r#"tmux_state=""
+if command -v tmux >/dev/null 2>&1; then
+  if tmux has-session -t zebra >/dev/null 2>&1; then
+    tmux_state="${{tmux_state}}zebra,"
+  fi
+  if tmux has-session -t mine >/dev/null 2>&1; then
+    tmux_state="${{tmux_state}}mine,"
+  fi
+  if tmux has-session -t app >/dev/null 2>&1; then
+    tmux_state="${{tmux_state}}app,"
+  fi
 fi
+tmux_state="${{tmux_state%,}}"
+[ -n "$tmux_state" ] || tmux_state="absent"
 
 loopback_rpc="no-curl"
 if command -v curl >/dev/null 2>&1; then
@@ -335,7 +443,11 @@ if command -v curl >/dev/null 2>&1; then
 fi
 
 log_tail="missing"
-if [ -f /root/kresko-app.log ]; then
+if [ -f /root/kresko-mine.log ]; then
+  log_tail="$(tail -n 1 /root/kresko-mine.log | tr '\n' ' ' | cut -c1-160)"
+elif [ -f /root/logs/zebrad.log ]; then
+  log_tail="$(tail -n 1 /root/logs/zebrad.log | tr '\n' ' ' | cut -c1-160)"
+elif [ -f /root/kresko-app.log ]; then
   log_tail="$(tail -n 1 /root/kresko-app.log | tr '\n' ' ' | cut -c1-160)"
 elif [ -f /root/logs ]; then
   log_tail="$(tail -n 1 /root/logs | tr '\n' ' ' | cut -c1-160)"
@@ -344,8 +456,8 @@ fi
 printf 'tmux=%s\nloopback_rpc=%s\nlog_tail=%s\n' "$tmux_state" "$loopback_rpc" "$log_tail""#
     );
 
-    match ssh::ssh_exec_capture(&node.ip, ssh_key, &command).await {
-        Ok((_, output)) => {
+    match ssh::ssh_exec_timeout(&node.ip, ssh_key, &command, Duration::from_secs(15)).await {
+        Ok(output) => {
             node.ssh_reachable = Some(true);
             node.ssh_status = Some("reachable".to_string());
 
@@ -354,7 +466,11 @@ printf 'tmux=%s\nloopback_rpc=%s\nlog_tail=%s\n' "$tmux_state" "$loopback_rpc" "
                     continue;
                 };
                 match key {
-                    "tmux" => node.tmux_session_present = Some(value.trim() == "present"),
+                    "tmux" => {
+                        let sessions = value.trim();
+                        node.tmux_session_present = Some(sessions != "absent");
+                        node.tmux_sessions = Some(sessions.to_string());
+                    }
                     "loopback_rpc" => node.loopback_rpc_status = Some(value.trim().to_string()),
                     "log_tail" => node.recent_log_tail = Some(value.trim().to_string()),
                     _ => {}
@@ -375,19 +491,20 @@ fn print_report(report: &StatusReport, deep: bool) {
     }
 
     println!(
-        "{:<30} {:<18} {:<10} {:<24}",
-        "Name", "IP", "Height", "Status"
+        "{:<30} {:<18} {:<8} {:<10} {:<24}",
+        "Name", "IP", "Chain", "Height", "Status"
     );
-    println!("{}", "-".repeat(88));
+    println!("{}", "-".repeat(98));
 
     for node in &report.nodes {
         let height = node
             .height
             .map(|height| height.to_string())
             .unwrap_or_else(|| "N/A".to_string());
+        let chain = node.chain.as_deref().unwrap_or("-");
         println!(
-            "{:<30} {:<18} {:<10} {:<24}",
-            node.name, node.ip, height, node.status
+            "{:<30} {:<18} {:<8} {:<10} {:<24}",
+            node.name, node.ip, chain, height, node.status
         );
 
         if deep {
@@ -397,12 +514,15 @@ fn print_report(report: &StatusReport, deep: bool) {
                 _ => "not checked".to_string(),
             };
             let tmux_status = match node.tmux_session_present {
-                Some(true) => "present",
+                Some(true) => node.tmux_sessions.as_deref().unwrap_or("present"),
                 Some(false) => "absent",
                 None => "unknown",
             };
             let loopback_rpc = node.loopback_rpc_status.as_deref().unwrap_or("unknown");
-            println!("  ssh: {ssh_status}; tmux app: {tmux_status}; loopback rpc: {loopback_rpc}");
+            println!("  ssh: {ssh_status}; tmux: {tmux_status}; loopback rpc: {loopback_rpc}");
+            if let Some(hash) = node.best_block_hash.as_deref() {
+                println!("  best block: {hash}");
+            }
             if let Some(log_tail) = node.recent_log_tail.as_deref() {
                 println!("  last log: {log_tail}");
             }

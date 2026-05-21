@@ -22,8 +22,7 @@ use hex::FromHex;
 use zebra_chain::{
     block::{self, Header},
     fmt::HexDebug,
-    parameters::{Network, testnet},
-    serialization::ZcashSerialize,
+    parameters::Network,
     work::{
         difficulty::{CompactDifficulty, ExpandedDifficulty, U256},
         equihash::Solution,
@@ -354,13 +353,11 @@ pub fn benchmark_equihash_solver(inputs: PowBenchInputs) -> Result<PowBenchResul
         );
     }
 
-    let network = benchmark_network(inputs.equihash_params)?;
+    if inputs.equihash_params != EquihashParameterSet::Common {
+        anyhow::bail!("NU7 Zebra only supports common Equihash parameters for this benchmark");
+    }
+    let network = Network::new_default_testnet();
     let mut header = benchmark_header(&network)?;
-    let mut input = Vec::new();
-    header.zcash_serialize(&mut input)?;
-    // Take the part of the header before the nonce and solution, matching
-    // zebra_chain::work::equihash::Solution::solve.
-    let input = input[..Solution::INPUT_LENGTH].to_vec();
     let max_target = ExpandedDifficulty::from(U256::MAX);
 
     let started = Instant::now();
@@ -370,33 +367,21 @@ pub fn benchmark_equihash_solver(inputs: PowBenchInputs) -> Result<PowBenchResul
     let mut mining_candidates = 0usize;
 
     while started.elapsed().as_secs_f64() < inputs.min_seconds || mining_candidates == 0 {
-        let solutions = match inputs.equihash_params {
-            EquihashParameterSet::Common => equihash::tromp::solve_200_9(&input, || {
-                nonce_trials = nonce_trials.saturating_add(1);
-                let nonce = nonce_from_counter(next_nonce);
-                next_nonce = next_nonce.wrapping_add(1);
-                header.nonce = HexDebug(nonce);
-                Some(nonce)
-            }),
-            EquihashParameterSet::Regtest => equihash::tromp::solve_48_5(&input, || {
-                nonce_trials = nonce_trials.saturating_add(1);
-                let nonce = nonce_from_counter(next_nonce);
-                next_nonce = next_nonce.wrapping_add(1);
-                header.nonce = HexDebug(nonce);
-                Some(nonce)
-            }),
-        };
-        equihash_solutions = equihash_solutions.saturating_add(solutions.len());
-        for solution in solutions {
-            header.solution = Solution::from_bytes(&solution)
-                .map_err(|e| anyhow::anyhow!("solver returned invalid solution bytes: {e}"))?;
-            if header.solution.check(&header, &network).is_err() {
-                continue;
-            }
+        let nonce = nonce_from_counter(next_nonce);
+        next_nonce = next_nonce.wrapping_add(1);
+        header.nonce = HexDebug(nonce);
+        nonce_trials = nonce_trials.saturating_add(1);
 
-            let hash = header.hash();
-            black_box(hash <= max_target);
-            mining_candidates = mining_candidates.saturating_add(1);
+        let Ok(solved_headers) = Solution::solve(header, || Ok(())) else {
+            continue;
+        };
+        equihash_solutions = equihash_solutions.saturating_add(solved_headers.len());
+        for solved_header in solved_headers {
+            let hash = solved_header.hash();
+            if solved_header.solution.check(&solved_header).is_ok() {
+                black_box(hash <= max_target);
+                mining_candidates = mining_candidates.saturating_add(1);
+            }
         }
     }
 
@@ -424,14 +409,7 @@ pub fn benchmark_equihash_solver(inputs: PowBenchInputs) -> Result<PowBenchResul
     })
 }
 
-fn benchmark_network(equihash_params: EquihashParameterSet) -> Result<Network> {
-    testnet::Parameters::build()
-        .with_equihash_params(equihash_params.into())
-        .to_network()
-        .map_err(|err| anyhow::anyhow!("failed to build benchmark network: {err}"))
-}
-
-fn benchmark_header(network: &Network) -> Result<Header> {
+fn benchmark_header(_network: &Network) -> Result<Header> {
     Ok(Header {
         version: 4,
         previous_block_hash: block::Hash([0; 32]),
@@ -441,7 +419,7 @@ fn benchmark_header(network: &Network) -> Result<Header> {
         difficulty_threshold: CompactDifficulty::from_hex("207fffff")
             .map_err(|e| anyhow::anyhow!("invalid benchmark difficulty: {e}"))?,
         nonce: HexDebug([0; 32]),
-        solution: Solution::for_proposal(network),
+        solution: Solution::for_proposal(),
     })
 }
 

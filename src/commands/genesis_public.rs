@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use crate::commands::genesis::{append_zebra_trace_exports, copy_dir_recursive};
+use crate::commands::genesis::copy_dir_recursive;
 use crate::config::{Config, NetworkKind};
 use crate::zebra_config;
 
@@ -35,7 +35,7 @@ pub fn run(
         std::fs::read_to_string(&template_path)
             .with_context(|| format!("failed to read template {}", template_path.display()))?
     } else {
-        zebra_config::template_for(config.network_kind).to_string()
+        zebra_config::template_for(config.network_kind)?
     };
 
     let payload_dir = dir.join("payload");
@@ -128,7 +128,7 @@ pub fn run(
     })?;
     println!("Copied kresko binary from {}", kresko_binary_path.display());
 
-    let mut vars_content = format!(
+    let vars_content = format!(
         r#"#!/bin/bash
 export CHAIN_ID="{}"
 export KRESKO_NETWORK_KIND="{}"
@@ -155,7 +155,6 @@ export AWS_S3_ENDPOINT="{}"
         std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "kresko-data".into()),
         std::env::var("AWS_S3_ENDPOINT").unwrap_or_default(),
     );
-    append_zebra_trace_exports(&mut vars_content);
     std::fs::write(payload_dir.join("vars.sh"), vars_content)?;
 
     println!(

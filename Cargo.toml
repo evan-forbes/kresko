@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 aws-config = "1"
-equihash = { git = "https://github.com/evan-forbes/librustzcash.git", rev = "08a1d4b6f3185ca9ff9a799d815ab4985c3ae41e", version = "0.3" }
 aws-sdk-s3 = "1"
 aws-smithy-types = "1"
 base64 = "0.22"
@@ -25,8 +24,9 @@ secp256k1 = "0.29"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 chrono = { version = "0.4", default-features = false }
-zebra-chain = { path = "../zebra/zebra-chain", features = ["internal-miner"] }
-zebra-jsonl-trace = { path = "../zebra/zebra-jsonl-trace", version = "0.1.0" }
+zebra-chain = { path = "../nu7-testnet/zebra-chain", features = ["internal-miner"] }
+zebrad = { path = "../nu7-testnet/zebrad" }
+zebra-jsonl-trace = { path = "../nu7-testnet/zebra-jsonl-trace", version = "0.1.0" }
 zcash_primitives = { version = "0.26", features = ["transparent-inputs"] }
 zcash_protocol = "0.7"
 zcash_address = "0.10"

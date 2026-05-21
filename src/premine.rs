@@ -229,7 +229,7 @@ pub fn generate(sig: &CalibrationSignature) -> Result<PremineBundle> {
 
     let options = LocalTestnetGenesisOptions {
         network_name: "KreskoPremine".to_string(),
-        latest_network_upgrade: NetworkUpgrade::Nu6,
+        latest_network_upgrade: NetworkUpgrade::Nu7,
         disable_pow: true,
         target_spacing_secs: sig.block_time_secs,
         seeded_tip_time: None,
@@ -248,8 +248,8 @@ pub fn generate(sig: &CalibrationSignature) -> Result<PremineBundle> {
     let activation_height = network_params
         .activation_heights()
         .iter()
-        .find_map(|(height, upgrade)| (*upgrade == NetworkUpgrade::Nu6).then_some(height.0))
-        .context("missing activation height for NU6")?;
+        .find_map(|(height, upgrade)| (*upgrade == NetworkUpgrade::Nu7).then_some(height.0))
+        .context("missing activation height for NU7")?;
 
     let genesis_hex = generated
         .genesis_hex()
