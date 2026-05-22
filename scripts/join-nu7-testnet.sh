@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Join the NU7 testnet on a fresh x86_64 Ubuntu host.
+# Join the NU7 testnet on an x86_64 Ubuntu host.
 #
 # This single script:
 #   1. downloads (or copies) a kresko-generated join bundle (genesis seed blocks,
 #      zebrad config, and a manifest) from --bundle-url,
 #   2. downloads and checksum-verifies the prebuilt zebrad and (with --mine)
 #      kresko binaries from their GitHub releases — no compilation,
-#   3. seeds the local-genesis chain, then starts zebrad (and optionally a miner).
+#   3. replaces any previous NU7 join-script install state,
+#   4. seeds the local-genesis chain, then starts zebrad (and optionally a miner).
 #
 # The release coordinates (repo + tag) are read from the bundle manifest, so the
 # binaries always match the chain the bundle describes. Override them with the
@@ -42,7 +43,8 @@ usage() {
 Usage: join-nu7-testnet.sh --bundle-url URL_OR_PATH [options]
 
 Downloads the NU7 join bundle, fetches the prebuilt zebrad/kresko binaries from
-their releases, seeds the local genesis chain, and starts zebrad.
+their releases, replaces any previous NU7 join-script install state, seeds the
+local genesis chain, and starts zebrad.
 
 Options:
   --bundle-url URL_OR_PATH  Join bundle tarball (https URL or local path). Required.
@@ -287,6 +289,37 @@ install_kresko() {
     install -m 0755 "$bin" "$KRESKO_BIN"
 }
 
+rm_join_dir() {
+    local path="$1"
+    case "$path" in
+        ""|"/")
+            echo "refusing to remove unsafe path: ${path:-<empty>}" >&2
+            exit 1
+            ;;
+    esac
+    rm -rf "$path"
+}
+
+reset_existing_join_install() {
+    echo "resetting existing NU7 join install, if any"
+
+    if command -v tmux >/dev/null 2>&1; then
+        tmux kill-session -t nu7-zebrad 2>/dev/null || true
+        tmux kill-session -t nu7-mine 2>/dev/null || true
+    fi
+
+    pkill -INT -x zebrad 2>/dev/null || true
+    pkill -INT -x zebra 2>/dev/null || true
+    pkill -TERM -f '[k]resko mine' 2>/dev/null || true
+    sleep 2
+    pkill -TERM -x zebrad 2>/dev/null || true
+    pkill -TERM -x zebra 2>/dev/null || true
+
+    rm_join_dir "$INSTALL_ROOT"
+    rm_join_dir "$LOG_DIR"
+    rm -f "$CONFIG_PATH" "$BOOTSTRAP_CONFIG"
+}
+
 apt_retry() {
     local max_attempts=10
     local attempt=1
@@ -513,6 +546,8 @@ apt_retry install -y ca-certificates chrony curl jq libstdc++6 python3 tar tmux
 
 systemctl enable chrony || true
 systemctl start chrony || true
+
+reset_existing_join_install
 
 mkdir -p "$INSTALL_ROOT" "$BUNDLE_DIR" "$LOG_DIR" /root/.config
 cp -a "$EXTRACTED_BUNDLE"/. "$BUNDLE_DIR"/

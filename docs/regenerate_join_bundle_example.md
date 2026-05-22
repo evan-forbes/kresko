@@ -41,12 +41,12 @@ The join machine downloads released binaries. Make sure the release tags match
 the network binaries you deployed:
 
 - Zebra (zebrad): <https://github.com/valargroup/zebra/releases> — currently
-  `nu7-testnet-v0.1.0` (asset `zebra-<tag>-x86_64-unknown-linux-gnu.tar.gz`).
+  `nu7-testnet-v0.1.1` (asset `zebra-<tag>-x86_64-unknown-linux-gnu.tar.gz`).
 - Kresko (miner): <https://github.com/valargroup/kresko/releases> — currently
   `v0.1.0` (asset `kresko-<tag>-x86_64-linux-gnu`).
 
 ```bash
-gh release view nu7-testnet-v0.1.0 --repo valargroup/zebra  --json assets --jq '.assets[].name'
+gh release view nu7-testnet-v0.1.1 --repo valargroup/zebra  --json assets --jq '.assets[].name'
 gh release view v0.1.0             --repo valargroup/kresko --json assets --jq '.assets[].name'
 ```
 
@@ -60,7 +60,7 @@ CXXFLAGS='-include cstdint' cargo build --release --bin kresko
 
 ## 4. Generate And Package The Bundle
 
-The release coordinates default to `valargroup/zebra @ nu7-testnet-v0.1.0` and
+The release coordinates default to `valargroup/zebra @ nu7-testnet-v0.1.1` and
 `valargroup/kresko @ v0.1.0`; override them only if you cut new releases.
 
 ```bash
@@ -69,7 +69,7 @@ rm -rf "$OUT_DIR" "$BUNDLE_TGZ"
 target/release/kresko join-bundle \
   --run-dir "$RUN_DIR" \
   --zebra-repo valargroup/zebra \
-  --zebra-release-tag nu7-testnet-v0.1.0 \
+  --zebra-release-tag nu7-testnet-v0.1.1 \
   --kresko-repo valargroup/kresko \
   --kresko-release-tag v0.1.0 \
   --out "$OUT_DIR"
@@ -109,7 +109,8 @@ the run dir — the release build CI cannot produce it.
 
 `scripts/publish-join-bundle.sh` does steps 4 and 5 in one shot: it generates the
 bundle, compresses it to `nu7-join-bundle.tar.gz` (+ `.sha256`), validates it with
-`join-nu7-testnet.sh --dry-run`, and `gh release upload`s it.
+`join-nu7-testnet.sh --dry-run`, and `gh release upload`s the bundle assets plus
+the current `join-nu7-testnet.sh`.
 
 ```bash
 scripts/publish-join-bundle.sh --run-dir "$RUN_DIR" --tag v0.1.0
@@ -123,7 +124,8 @@ https://github.com/valargroup/kresko/releases/download/v0.1.0/nu7-join-bundle.ta
 
 Re-run with `--clobber` semantics (the script passes `--clobber`) whenever the
 run's genesis or peers change. Pass `--skip-upload` to only build the tarball, or
-forward extra `kresko join-bundle` flags after `--`.
+forward extra `kresko join-bundle` flags after `--`. Pass `--skip-script-upload`
+only when you intentionally want to leave the release's join script unchanged.
 
 ### Option B — host it yourself (e.g. S3/Spaces)
 
@@ -184,6 +186,12 @@ not save a spend key. Use `--miner-address` when rewards need to be spendable.
 tmux session nu7-zebrad         Running Zebra node
 tmux session nu7-mine           Running Kresko miner, only with --mine
 ```
+
+Rerunning `join-nu7-testnet.sh` replaces the join-script runtime: it stops the
+`nu7-zebrad`/`nu7-mine` sessions, removes `/opt/nu7-testnet`, removes
+`/var/log/nu7-testnet` (or `NU7_LOG_DIR`), and rewrites the runtime Zebra
+configs before seeding again. This makes a previously joined or half-failed host
+safe to rejoin without a separate manual cleanup step.
 
 ## 8. Verify The Joined Node
 

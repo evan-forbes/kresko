@@ -131,7 +131,7 @@ enum Commands {
         zebra_repo: String,
 
         /// Zebra GitHub release tag the join script downloads zebrad from
-        #[arg(long, default_value = "nu7-testnet-v0.1.0")]
+        #[arg(long, default_value = "nu7-testnet-v0.1.1")]
         zebra_release_tag: String,
 
         /// Kresko GitHub release repo (owner/name) the join script downloads kresko from when --mine is enabled

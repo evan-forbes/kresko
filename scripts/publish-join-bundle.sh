@@ -20,7 +20,9 @@ NAME="nu7-join-bundle"
 ARCHIVE=""
 OUT_DIR=""
 KRESKO_BIN="${KRESKO_BIN:-}"
+JOIN_SCRIPT=""
 SKIP_UPLOAD=0
+SKIP_SCRIPT_UPLOAD=0
 FORWARD=()
 
 usage() {
@@ -38,7 +40,9 @@ Options:
   --archive PATH       Output tarball path. Default: ./<name>.tar.gz
   --out DIR            Directory to generate the bundle into. Default: a temp dir.
   --kresko-bin PATH    kresko binary to use. Default: kresko on PATH, else target/release/kresko.
+  --join-script PATH   Join script to upload. Default: scripts/join-nu7-testnet.sh.
   --skip-upload        Build and validate the tarball but do not upload (e.g. to host elsewhere).
+  --skip-script-upload Upload only the bundle assets, not join-nu7-testnet.sh.
   -h, --help           Show this help.
 
 Anything after `--` is forwarded to `kresko join-bundle` (e.g. --zebra-release-tag).
@@ -54,7 +58,9 @@ while [ "$#" -gt 0 ]; do
         --archive)     ARCHIVE="${2:-}";     [ -n "$ARCHIVE" ]     || { echo "missing value for --archive" >&2; exit 2; }; shift 2 ;;
         --out)         OUT_DIR="${2:-}";     [ -n "$OUT_DIR" ]     || { echo "missing value for --out" >&2; exit 2; }; shift 2 ;;
         --kresko-bin)  KRESKO_BIN="${2:-}";  [ -n "$KRESKO_BIN" ]  || { echo "missing value for --kresko-bin" >&2; exit 2; }; shift 2 ;;
+        --join-script) JOIN_SCRIPT="${2:-}"; [ -n "$JOIN_SCRIPT" ] || { echo "missing value for --join-script" >&2; exit 2; }; shift 2 ;;
         --skip-upload) SKIP_UPLOAD=1; shift ;;
+        --skip-script-upload) SKIP_SCRIPT_UPLOAD=1; shift ;;
         --)            shift; FORWARD=("$@"); break ;;
         -h|--help)     usage; exit 0 ;;
         *)             echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -84,6 +90,9 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARCHIVE="${ARCHIVE:-$PWD/$NAME.tar.gz}"
+JOIN_SCRIPT="${JOIN_SCRIPT:-$SCRIPT_DIR/join-nu7-testnet.sh}"
+
+[ -f "$JOIN_SCRIPT" ] || { echo "join script not found: $JOIN_SCRIPT" >&2; exit 1; }
 
 if [ -z "$OUT_DIR" ]; then
     OUT_DIR="$(mktemp -d)"
@@ -110,7 +119,11 @@ if [ "$SKIP_UPLOAD" -eq 1 ]; then
 fi
 
 echo "uploading to $REPO release $TAG"
-gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber --repo "$REPO"
+assets=("$ARCHIVE" "$ARCHIVE.sha256")
+if [ "$SKIP_SCRIPT_UPLOAD" -eq 0 ]; then
+    assets+=("$JOIN_SCRIPT")
+fi
+gh release upload "$TAG" "${assets[@]}" --clobber --repo "$REPO"
 
 echo "done. join with:"
 echo "  --bundle-url https://github.com/$REPO/releases/download/$TAG/$(basename "$ARCHIVE")"
