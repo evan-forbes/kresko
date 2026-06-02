@@ -4,10 +4,15 @@ from pathlib import Path
 
 
 SCRIPT_PATH = Path("scripts/node_init.sh")
+PUBLIC_SCRIPT_PATH = Path("scripts/node_init_public.sh")
 
 
 def _script_text() -> str:
     return SCRIPT_PATH.read_text(encoding="utf-8")
+
+
+def _public_script_text() -> str:
+    return PUBLIC_SCRIPT_PATH.read_text(encoding="utf-8")
 
 
 def test_node_init_no_longer_munges_zebrad_toml_with_sed_or_awk():
@@ -78,3 +83,26 @@ def test_node_init_detects_early_zebrad_exit_and_dumps_log_tail():
     # The tail-and-exit path must run before `exec bash`.
     assert "Tail of $LOG_FILE" in text
     assert "exited within 10s with code" in text
+
+
+def test_public_node_init_runs_zebrad_under_systemd_with_raised_fd_limit():
+    text = _public_script_text()
+
+    assert 'mkdir -p /root/logs /root/traces' in text
+    # zebrad runs as a supervised systemd service (crash-restart +
+    # reboot-persistence), not a bare backgrounded process.
+    assert '/etc/systemd/system/zebrad.service' in text
+    assert 'Restart=on-failure' in text
+    # Raised open-file ceiling: rocksdb SST files + peer sockets otherwise
+    # exhaust the OS default of 1024 and panic the state service with EMFILE.
+    assert 'LimitNOFILE=1048576' in text
+    assert 'systemctl enable zebrad' in text
+    # The old export crashed this zebrad (unknown config field node_id); it
+    # must be gone now that the unit runs with a clean env.
+    assert 'export ZEBRA_NODE_ID="$parsed_hostname"' not in text
+    # Tracing env vars are carried into the unit instead, so download-traces
+    # keeps working.
+    assert '_kresko_unit_env+="Environment=' in text
+    assert 'mkdir -p "$(dirname "$_kresko_var_value")"' in text
+    assert 'mkdir -p "$(dirname "$_kresko_var_value")/traces"' not in text
+    assert "falling back to P2P block sync" in text

@@ -68,6 +68,12 @@ KRESKO_NETWORK_KIND="${KRESKO_NETWORK_KIND:-}"
 KRESKO_RPC_PORT="${KRESKO_RPC_PORT:-8232}"
 KRESKO_P2P_PORT="${KRESKO_P2P_PORT:-8233}"
 KRESKO_FRESH_STATE="${KRESKO_FRESH_STATE:-0}"
+# Optional state-snapshot bootstrap (default off). When set, the node hydrates
+# zebrad's state DB from this URL instead of syncing the whole chain over P2P.
+# Public-network only (this script already gates on mainnet/public-testnet).
+# The operator is responsible for pointing at a snapshot for the *right*
+# network — a mainnet snapshot on a testnet node will not verify.
+KRESKO_STATE_SNAPSHOT_URL="${KRESKO_STATE_SNAPSHOT_URL:-}"
 
 case "$KRESKO_NETWORK_KIND" in
     mainnet|public-testnet)
@@ -119,6 +125,26 @@ else
     echo "=== Preserving zebra state cache (KRESKO_FRESH_STATE=$KRESKO_FRESH_STATE) ==="
 fi
 mkdir -p /root/.cache/zebra
+
+if [ -n "$KRESKO_STATE_SNAPSHOT_URL" ]; then
+    if [ -d /root/.cache/zebra/state ] && [ -n "$(ls -A /root/.cache/zebra/state 2>/dev/null)" ]; then
+        echo "=== State cache already present; skipping snapshot ==="
+    else
+        echo "=== Hydrating zebra state from snapshot: ${KRESKO_STATE_SNAPSHOT_URL} ==="
+        if curl -fSL --retry 3 --retry-connrefused --retry-delay 5 \
+            --connect-timeout 10 --speed-time 120 --speed-limit 1024 \
+            -o /tmp/kresko-state-snapshot.tar.gz "$KRESKO_STATE_SNAPSHOT_URL" \
+            && tar -xzf /tmp/kresko-state-snapshot.tar.gz -C /root/.cache/zebra; then
+            rm -f /tmp/kresko-state-snapshot.tar.gz
+            echo "=== Snapshot extracted; zebrad will resume from the snapshot height ==="
+        else
+            status=$?
+            rm -f /tmp/kresko-state-snapshot.tar.gz
+            echo "=== Snapshot hydration failed with exit ${status}; falling back to P2P block sync ==="
+        fi
+    fi
+fi
+
 mkdir -p /root/.config
 cp "${node_payload_dir}/zebrad.toml" /root/.config/zebrad.toml
 
@@ -142,12 +168,18 @@ echo "=== Public node: ${parsed_hostname} (${KRESKO_NETWORK_KIND}) ==="
 echo "=== RPC port: ${KRESKO_RPC_PORT}; P2P port: ${KRESKO_P2P_PORT} ==="
 echo "=== Ensure provider firewall allows inbound P2P and blocks public RPC ==="
 
-echo "=== Starting zebrad ==="
+echo "=== Starting zebrad (systemd) ==="
+mkdir -p /root/logs /root/traces
+LOG_FILE="/root/logs/zebrad.log"
+
+# Re-apply the tracing env vars we held back during config parsing as
+# systemd Environment= lines (so `download-traces` keeps working), and
+# make sure any trace dirs/files exist. zebrad otherwise runs with a clean
+# env under systemd.
+_kresko_unit_env=""
 for _kresko_idx in "${!_SAVED_ZEBRA_TRACE_NAMES[@]}"; do
     _kresko_var_name="${_SAVED_ZEBRA_TRACE_NAMES[$_kresko_idx]}"
     _kresko_var_value="${_SAVED_ZEBRA_TRACE_VALUES[$_kresko_idx]}"
-    export "$_kresko_var_name=$_kresko_var_value"
-
     case "$_kresko_var_name" in
         ZEBRA_*TRACE*_DIR|ZEBRA_*TRACING*_DIR)
             if [ -n "$_kresko_var_value" ]; then
@@ -156,38 +188,62 @@ for _kresko_idx in "${!_SAVED_ZEBRA_TRACE_NAMES[@]}"; do
             ;;
         ZEBRA_*TRACE*_FILE|ZEBRA_*TRACING*_FILE)
             if [ -n "$_kresko_var_value" ]; then
-                mkdir -p "$(dirname "$_kresko_var_value")/traces"
+                mkdir -p "$(dirname "$_kresko_var_value")"
             fi
             ;;
     esac
+    _kresko_unit_env+="Environment=\"${_kresko_var_name}=${_kresko_var_value}\""$'\n'
 done
 
-mkdir -p /root/logs
-LOG_FILE="/root/logs/zebrad.log"
-set +e
-zebrad -c /root/.config/zebrad.toml start 2>&1 | tee -a "$LOG_FILE" &
-zebrad_pid=$!
+# Run zebrad as a supervised systemd service rather than a bare process:
+#  - Restart=on-failure survives crashes; the unit is enabled so it also
+#    survives reboots.
+#  - LimitNOFILE raises the open-file ceiling. zebra only lifts its own
+#    soft limit to a built-in target and splits it 50/50 between rocksdb
+#    SST files and peer sockets; at the OS default of 1024 a synced mainnet
+#    node exhausts descriptors and panics the state service with EMFILE.
+# The old `export ZEBRA_NODE_ID` is intentionally gone: this zebrad rejects
+# that field, and the clean systemd env avoids it entirely.
+cat > /etc/systemd/system/zebrad.service <<UNIT
+[Unit]
+Description=Zebra (zakura) ${KRESKO_NETWORK_KIND} node - ${parsed_hostname}
+After=network-online.target
+Wants=network-online.target
 
-# Surface a fast-fail: a public-network zebrad that dies in the first
-# ~10 seconds (e.g. address-already-in-use, malformed config) should
-# fail the deploy with the log tail rather than dropping into bash.
-for _ in $(seq 1 5); do
+[Service]
+Type=simple
+WorkingDirectory=/root
+ExecStart=/usr/local/bin/zebrad -c /root/.config/zebrad.toml start
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=1048576
+${_kresko_unit_env}StandardOutput=append:${LOG_FILE}
+StandardError=append:${LOG_FILE}
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable zebrad >/dev/null 2>&1 || true
+
+# Fast-fail: if zebrad can't stay up (bad config, missing binary, port
+# clash), surface the log tail and fail the deploy instead of leaving a
+# dead/looping unit behind.
+set +e
+systemctl restart zebrad
+for _ in $(seq 1 8); do
     sleep 2
-    if ! kill -0 "$zebrad_pid" 2>/dev/null; then
-        wait "$zebrad_pid" 2>/dev/null
-        zebrad_exit=$?
-        echo "=== zebrad exited within 10s with code $zebrad_exit ===" >&2
-        if [ -f "$LOG_FILE" ]; then
-            echo "=== Tail of $LOG_FILE ===" >&2
-            tail -n 200 "$LOG_FILE" >&2 || true
-        fi
-        exit "$zebrad_exit"
+    if [ "$(systemctl is-active zebrad)" = "failed" ] \
+        || [ "$(systemctl show -p NRestarts --value zebrad)" != "0" ]; then
+        echo "=== zebrad failed to stay up under systemd ===" >&2
+        systemctl status zebrad --no-pager -l >&2 2>/dev/null || true
+        echo "=== Tail of ${LOG_FILE} ===" >&2
+        tail -n 200 "${LOG_FILE}" >&2 || true
+        exit 1
     fi
 done
-
-wait "$zebrad_pid"
-zebrad_exit=$?
 set -e
 
-echo "=== zebrad exited with code $zebrad_exit ==="
-exec bash
+echo "=== zebrad is running under systemd (is-active: $(systemctl is-active zebrad)) ==="
+echo "=== follow logs: tail -f ${LOG_FILE}  (or: journalctl -u zebrad -f) ==="
