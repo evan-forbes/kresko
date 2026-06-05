@@ -1,17 +1,22 @@
-"""Provider-neutral instance reconciliation for experiment runs."""
+"""Provider-neutral instance reconciliation for a fleet.
+
+Idempotent: a node already live in the cloud and carrying the fleet tag plus
+the matching name is *adopted* (reused) instead of recreated; only missing
+nodes are created. This is what lets `Fleet.up()` run repeatedly against a
+long-running network without churning instances, and what lets a one-shot
+re-tag bring pre-existing nodes under fleet management.
+"""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from harness import assets
-from harness.providers import (
+from kresko import assets
+from kresko.providers import (
     CloudProvider,
     ProviderError,
-    experiment_tag,
-    role_tag,
-    run_tag,
+    fleet_tag,
     tag_value,
 )
 
@@ -33,15 +38,14 @@ class DesiredNode:
 
 
 def reconcile_instances(
-    spec: Any,
+    desired: list[DesiredNode],
     *,
-    experiment: str,
-    run_name: str,
+    fleet: str,
     providers: dict[str, CloudProvider],
+    ssh_key_selector: str = "",
     dry_run: bool = False,
     retry_failed: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
-    desired = _expand_desired(spec, experiment=experiment, run_name=run_name)
     _validate_unique_desired_names(desired)
 
     plan: dict[str, list[dict[str, Any]]] = {
@@ -52,19 +56,14 @@ def reconcile_instances(
     }
     creates: list[DesiredNode] = []
     target_by_name = {target.name: target for target in desired}
-    exp_tag = experiment_tag(experiment)
-    run_tag_value = run_tag(run_name)
+    fleet_tag_value = fleet_tag(fleet)
 
     for provider_name, provider_targets in _group_desired(desired).items():
         provider = providers.get(provider_name)
         if provider is None:
             raise ProviderError(f"provider {provider_name!r} is not configured")
 
-        existing = [
-            asset
-            for asset in provider.list_for_tag(exp_tag)
-            if run_tag_value in set(asset.get("tags") or [])
-        ]
+        existing = provider.list_for_tag(fleet_tag_value)
         existing_by_name: dict[str, dict[str, Any]] = {}
         seen: set[str] = set()
         for asset in existing:
@@ -102,16 +101,14 @@ def reconcile_instances(
 
     ssh_keys: dict[str, str | int] = {}
     if creates:
-        ssh_selector = (
-            (spec.ssh or {}).get("key_name")
-            or (spec.ssh or {}).get("ssh_key")
-            or ""
-        )
-        if not ssh_selector:
-            raise ProviderError("spec.ssh.key_name is required to create instances")
+        if not ssh_key_selector:
+            raise ProviderError(
+                "an SSH key name is required to create instances "
+                "(pass Fleet(ssh={'key_name': ...}))"
+            )
         for provider_name in sorted({target.provider for target in creates}):
             ssh_keys[provider_name] = providers[provider_name].lookup_ssh_key(
-                str(ssh_selector)
+                str(ssh_key_selector)
             )
 
     if dry_run:
@@ -175,37 +172,18 @@ def reconcile_instances(
                 continue
             asset = _target_asset(ready, target) if target else ready
             asset.pop("failure_reason", None)
+        else:
+            # Healthy adopted node: re-stamp the local mirror so its fleet/role
+            # fields and tags reflect the desired spec. This is what makes a
+            # one-shot re-tag of a pre-existing node converge under `up`.
+            target = target_by_name.get(asset.get("name", ""))
+            if target is not None:
+                asset = _target_asset(asset, target)
         assets.write_asset(asset)
         refreshed_reuse.append(asset)
     plan["reuse"] = refreshed_reuse
 
     return plan
-
-
-def _expand_desired(
-    spec: Any, *, experiment: str, run_name: str
-) -> list[DesiredNode]:
-    base_tags = [assets.REQUIRED_TAG, experiment_tag(experiment), run_tag(run_name)]
-    base_tags += list(getattr(spec, "tags", []) or [])
-    out: list[DesiredNode] = []
-    for group in spec.node_groups:
-        prefix = group.name_prefix or group.role
-        tags = sorted(set([*base_tags, *list(group.tags or []), role_tag(group.role)]))
-        for index in range(group.count):
-            out.append(
-                DesiredNode(
-                    provider=getattr(group, "provider", "digitalocean"),
-                    name=f"{prefix}-{index}",
-                    role=group.role,
-                    region=group.region,
-                    size=group.size,
-                    image=group.image,
-                    tags=tags,
-                    ssh_user=group.ssh_user or (spec.ssh or {}).get("user", "root"),
-                    provider_options=dict(getattr(group, "provider_options", {}) or {}),
-                )
-            )
-    return out
 
 
 def _group_desired(desired: list[DesiredNode]) -> dict[str, list[DesiredNode]]:
@@ -231,8 +209,7 @@ def _target_asset(asset: dict[str, Any], target: DesiredNode) -> dict[str, Any]:
     return {
         **asset,
         "role": target.role,
-        "experiment": tag_value(target.tags, "experiment-"),
-        "run": tag_value(target.tags, "run-"),
+        "fleet": tag_value(target.tags, "fleet-"),
         "ssh_user": target.ssh_user,
         "tags": target.tags,
     }

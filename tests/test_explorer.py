@@ -6,10 +6,8 @@ import tarfile
 
 import pytest
 
-from harness import Experiment, explorer, paths
-from harness.experiment import ENV_EXPERIMENT, ENV_RUN_DIR, ENV_RUN_NAME
-from harness.explorer import ExplorerDeployment, ExplorerSpec
-from harness.runs import start_run
+from kresko import Fleet, explorer, paths
+from kresko.explorer import ExplorerDeployment, ExplorerSpec
 
 
 @pytest.fixture
@@ -19,15 +17,8 @@ def home(monkeypatch, tmp_path):
     return tmp_path
 
 
-def make_experiment(monkeypatch, name="exp", run="exp") -> Experiment:
-    src = paths.experiment_dir(name)
-    src.mkdir(parents=True, exist_ok=True)
-    (src / "run.py").write_text("# placeholder\n", encoding="utf-8")
-    run_path = start_run(name, name=run)
-    monkeypatch.setenv(ENV_EXPERIMENT, name)
-    monkeypatch.setenv(ENV_RUN_NAME, run_path.name)
-    monkeypatch.setenv(ENV_RUN_DIR, str(run_path))
-    return Experiment.current(ssh={"user": "root", "key_path": ""})
+def make_experiment(monkeypatch, name="exp", run="exp") -> Fleet:
+    return Fleet(name, ssh={"user": "root", "key_path": ""})
 
 
 def make_source(tmp_path):
@@ -289,7 +280,7 @@ def _assets():
 def test_target_asset_by_name(home, monkeypatch):
     exp = make_experiment(monkeypatch)
     exp.add_explorer(node="miner-1")
-    monkeypatch.setattr(exp, "run_assets", lambda: _assets())
+    monkeypatch.setattr(exp, "fleet_assets", lambda: _assets())
     deployment = ExplorerDeployment(exp, exp._explorer, runner=FakeRunner())
     assert deployment._target_asset()["name"] == "miner-1"
 
@@ -297,7 +288,7 @@ def test_target_asset_by_name(home, monkeypatch):
 def test_target_asset_missing_raises(home, monkeypatch):
     exp = make_experiment(monkeypatch)
     exp.add_explorer(node="miner-9")
-    monkeypatch.setattr(exp, "run_assets", lambda: _assets())
+    monkeypatch.setattr(exp, "fleet_assets", lambda: _assets())
     deployment = ExplorerDeployment(exp, exp._explorer, runner=FakeRunner())
     with pytest.raises(RuntimeError, match="miner-9"):
         deployment._target_asset()
@@ -307,12 +298,12 @@ def test_target_asset_first_when_node_unset(home, monkeypatch):
     exp = make_experiment(monkeypatch)
     spec = ExplorerSpec.create(node="", env={})  # falls back to "miner-0" via create
     spec = explorer.ExplorerSpec(**{**spec.__dict__, "node": ""})  # force unset
-    monkeypatch.setattr(exp, "run_assets", lambda: _assets())
+    monkeypatch.setattr(exp, "fleet_assets", lambda: _assets())
     deployment = ExplorerDeployment(exp, spec, runner=FakeRunner())
     assert deployment._target_asset()["name"] == "miner-0"
 
 
-# --- Experiment integration --------------------------------------------------
+# --- Fleet integration --------------------------------------------------
 
 
 def test_deploy_explorer_noop_when_unconfigured(home, monkeypatch):
@@ -326,7 +317,7 @@ def test_full_deploy_uses_s3_and_curl(home, monkeypatch, tmp_path):
     exp = make_experiment(monkeypatch)
     source = make_source(tmp_path)
     exp.add_explorer(node="miner-0", source=source)
-    monkeypatch.setattr(exp, "run_assets", lambda: _assets())
+    monkeypatch.setattr(exp, "fleet_assets", lambda: _assets())
 
     runner = FakeRunner(http_status="200")
     s3_runner = fake_s3_runner()
@@ -352,17 +343,17 @@ def test_full_deploy_uses_s3_and_curl(home, monkeypatch, tmp_path):
     assert "ZCASHD_PORT=18232" in write_env["input_text"]
 
     # Metadata + result are persisted in the run dir.
-    meta = json.loads((exp.run_dir / "explorer.json").read_text())
+    meta = json.loads((exp.dir / "explorer.json").read_text())
     assert meta["status"] == "running"
     assert meta["url"] == "http://203.0.113.1:20001"
-    assert json.loads((exp.run_dir / "result.json").read_text())["ok"] is True
+    assert json.loads((exp.dir / "result.json").read_text())["ok"] is True
 
 
 def test_full_deploy_writes_faucet_env_from_remote_source_address(home, monkeypatch, tmp_path):
     exp = make_experiment(monkeypatch)
     source = make_source(tmp_path)
     exp.add_explorer(node="miner-0", source=source, faucet_enabled=True)
-    monkeypatch.setattr(exp, "run_assets", lambda: _assets())
+    monkeypatch.setattr(exp, "fleet_assets", lambda: _assets())
 
     runner = FakeRunner(
         http_status="200", stdout_tails={"explorer-faucet-source": "tmDiscovered"}
@@ -385,7 +376,7 @@ def test_deploy_fails_when_step_fails(home, monkeypatch, tmp_path):
     exp = make_experiment(monkeypatch)
     source = make_source(tmp_path)
     exp.add_explorer(node="miner-0", source=source)
-    monkeypatch.setattr(exp, "run_assets", lambda: _assets())
+    monkeypatch.setattr(exp, "fleet_assets", lambda: _assets())
 
     class FailingRunner(FakeRunner):
         def run(self, command, log_name, *, input_text=None):
@@ -401,8 +392,8 @@ def test_deploy_fails_when_step_fails(home, monkeypatch, tmp_path):
     result = deployment.deploy()
 
     assert result["ok"] is False
-    assert json.loads((exp.run_dir / "explorer.json").read_text())["status"] == "error"
-    res = json.loads((exp.run_dir / "result.json").read_text())
+    assert json.loads((exp.dir / "explorer.json").read_text())["status"] == "error"
+    res = json.loads((exp.dir / "result.json").read_text())
     assert res["ok"] is False
     assert any(f["command"] == "explorer-compose-up" for f in res["failures"])
 
@@ -411,7 +402,7 @@ def test_dry_run_skips_remote_work(home, monkeypatch, tmp_path):
     exp = make_experiment(monkeypatch)
     source = make_source(tmp_path)
     exp.add_explorer(node="miner-0", source=source)
-    monkeypatch.setattr(exp, "run_assets", lambda: _assets())
+    monkeypatch.setattr(exp, "fleet_assets", lambda: _assets())
 
     runner = FakeRunner()
     deployment = ExplorerDeployment(exp, exp._explorer, runner=runner)

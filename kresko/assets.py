@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from harness.paths import asset_path, assets_dir
+from kresko.paths import asset_path, assets_dir
 
 REQUIRED_TAG = "kresko"
 ASSET_SCHEMA_VERSION = 1
@@ -43,6 +43,7 @@ def normalize_asset(asset: dict[str, Any]) -> dict[str, Any]:
     out.setdefault("status", "unknown")
     out.setdefault("name", "")
     out.setdefault("role", "")
+    out.setdefault("fleet", "")
     out.setdefault("region", "")
     out.setdefault("size", "")
     out.setdefault("image", "")

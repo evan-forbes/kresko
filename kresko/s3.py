@@ -3,7 +3,7 @@
 We deliver payloads to nodes by uploading to S3 and handing the node a
 short-lived presigned URL to `curl` — never scp/rsync. This module is the
 operator-side helper: it shells out to the `aws` CLI (already required for the
-rest of the S3 workflow) so the harness doesn't take a boto3 dependency.
+rest of the S3 workflow) so the kresko doesn't take a boto3 dependency.
 
 Config is read from the environment, which `load_experiment_env` populates
 from the repo/experiment `.env` (and `scripts/vars.sh` documents the keys):

@@ -1,4 +1,4 @@
-"""Cloud provider adapters used by the Python experiment harness."""
+"""Cloud provider adapters used by the Python fleet harness."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Any, Protocol
 
 import requests
 
-from harness import assets
+from kresko import assets
 
 DO_API = "https://api.digitalocean.com/v2"
 VULTR_API = "https://api.vultr.com/v2"
@@ -20,10 +20,9 @@ VULTR = "vultr"
 KNOWN_PROVIDERS = (DIGITALOCEAN, VULTR)
 
 REQUIRED_TAG = assets.REQUIRED_TAG
-EXPERIMENT_TAG_PREFIX = "experiment-"
+FLEET_TAG_PREFIX = "fleet-"
 ROLE_TAG_PREFIX = "role-"
-RUN_TAG_PREFIX = "run-"
-KRESKO_TYPED_TAG_PREFIXES = (EXPERIMENT_TAG_PREFIX, ROLE_TAG_PREFIX, RUN_TAG_PREFIX)
+KRESKO_TYPED_TAG_PREFIXES = (FLEET_TAG_PREFIX, ROLE_TAG_PREFIX)
 
 
 class ProviderError(RuntimeError):
@@ -90,16 +89,12 @@ class Vultr:
     user_data: str | None = None
 
 
-def experiment_tag(experiment: str) -> str:
-    return f"{EXPERIMENT_TAG_PREFIX}{experiment}"
+def fleet_tag(fleet: str) -> str:
+    return f"{FLEET_TAG_PREFIX}{fleet}"
 
 
 def role_tag(role: str) -> str:
     return f"{ROLE_TAG_PREFIX}{role}"
-
-
-def run_tag(run_name: str) -> str:
-    return f"{RUN_TAG_PREFIX}{run_name}"
 
 
 def tag_value(tags: list[str], prefix: str) -> str:
@@ -113,8 +108,7 @@ def require_force_tag(tag: str) -> None:
     if tag == REQUIRED_TAG or not tag.startswith(KRESKO_TYPED_TAG_PREFIXES):
         raise ProviderError(
             f"refusing force-tag deletion for {tag!r}; use a specific tag like "
-            f"{EXPERIMENT_TAG_PREFIX}my-experiment, {ROLE_TAG_PREFIX}miner, or "
-            f"{RUN_TAG_PREFIX}r-20260507-141502"
+            f"{FLEET_TAG_PREFIX}my-fleet or {ROLE_TAG_PREFIX}miner"
         )
 
 
@@ -180,8 +174,7 @@ def droplet_to_asset(droplet: dict[str, Any]) -> dict[str, Any]:
         "provider_id": str(droplet.get("id", "")),
         "name": droplet.get("name", ""),
         "role": tag_value(tags, ROLE_TAG_PREFIX),
-        "experiment": tag_value(tags, EXPERIMENT_TAG_PREFIX),
-        "run": tag_value(tags, RUN_TAG_PREFIX),
+        "fleet": tag_value(tags, FLEET_TAG_PREFIX),
         "region": region_slug,
         "size": size_slug,
         "image": image_slug,
@@ -428,8 +421,7 @@ def vultr_to_asset(instance: dict[str, Any]) -> dict[str, Any]:
         "provider_id": str(instance.get("id", "")),
         "name": instance.get("label") or instance.get("name", ""),
         "role": tag_value(tags, ROLE_TAG_PREFIX),
-        "experiment": tag_value(tags, EXPERIMENT_TAG_PREFIX),
-        "run": tag_value(tags, RUN_TAG_PREFIX),
+        "fleet": tag_value(tags, FLEET_TAG_PREFIX),
         "region": instance.get("region", ""),
         "size": instance.get("plan", ""),
         "image": str(image),

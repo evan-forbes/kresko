@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from harness.inventory import pyinfra_groups
+from kresko.inventory import pyinfra_groups
 
 
 def _miner_asset() -> dict:
@@ -14,8 +14,7 @@ def _miner_asset() -> dict:
         "region": "nyc3",
         "size": "s-1vcpu-1gb",
         "status": "active",
-        "experiment": "smoke",
-        "run": "smoke",
+        "fleet": "smoke",
     }
 
 
@@ -32,8 +31,7 @@ def test_inventory_groups_include_role_and_provider_metadata():
     assert data["ssh_user"] == "ubuntu"
     assert data["kresko_name"] == "miner-0"
     assert data["kresko_provider_id"] == "42"
-    assert data["kresko_experiment"] == "smoke"
-    assert data["kresko_run"] == "smoke"
+    assert data["kresko_fleet"] == "smoke"
     assert data["ssh_key"] == "~/.ssh/test"
 
 

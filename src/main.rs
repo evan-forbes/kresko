@@ -19,24 +19,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize ~/.kresko/ and copy bundled reference experiments.
-    /// With <name>, scaffold a new experiment from a reference (default: pyinfra_do_smoke).
-    Init {
-        /// Optional experiment name to scaffold from a reference.
-        name: Option<String>,
-
-        /// Reference experiment to copy from when scaffolding.
-        #[arg(long, default_value = "pyinfra_do_smoke")]
-        from: String,
-
-        /// Overwrite the target experiment directory if it already exists.
-        #[arg(long)]
-        force: bool,
-
-        /// Override the source experiments directory (defaults to the build-time path).
-        #[arg(long)]
-        source: Option<String>,
-    },
+    /// Initialize the ~/.kresko/ home (fleets/, assets/, cache/, .env, config.toml).
+    /// Fleets are defined in plain Python scripts using the `kresko` package;
+    /// there are no bundled templates to scaffold.
+    Init,
 
     /// Generate deployment payload (configs, peers, binaries)
     Genesis {
@@ -131,7 +117,7 @@ enum Commands {
         zebra_repo: String,
 
         /// Zebra GitHub release tag the join script downloads zebrad from
-        #[arg(long, default_value = "nu7-testnet-v0.1.1")]
+        #[arg(long, default_value = "nu7-testnet-v0.1.2")]
         zebra_release_tag: String,
 
         /// Kresko GitHub release repo (owner/name) the join script downloads kresko from when --mine is enabled
@@ -790,7 +776,7 @@ impl Commands {
     /// FundRuntimeKeysLocal, TxblastStatusLocal) intentionally return None.
     fn directory(&self) -> Option<&str> {
         match self {
-            Commands::Init { .. }
+            Commands::Init
             | Commands::Config { .. }
             | Commands::Mine { .. }
             | Commands::JoinBundle { .. }
@@ -1137,13 +1123,8 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Init {
-            name,
-            from,
-            force,
-            source,
-        } => {
-            commands::init::run(name, from, force, source)?;
+        Commands::Init => {
+            commands::init::run()?;
         }
         Commands::Genesis {
             zebrad_binary,

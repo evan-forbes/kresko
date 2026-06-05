@@ -406,7 +406,7 @@ mod tests {
         super::run(
             run_dir.to_str().expect("temp path is utf8"),
             "valargroup/zebra",
-            "nu7-testnet-v0.1.1",
+            "nu7-testnet-v0.1.2",
             "valargroup/kresko",
             "v0.1.0",
             out_dir.to_str().expect("temp path is utf8"),
@@ -423,7 +423,7 @@ mod tests {
             vec!["1.1.1.1:18233", "2.2.2.2:18233"]
         );
         assert_eq!(manifest.zebra_release_repo, "valargroup/zebra");
-        assert_eq!(manifest.zebra_release_tag, "nu7-testnet-v0.1.1");
+        assert_eq!(manifest.zebra_release_tag, "nu7-testnet-v0.1.2");
         assert_eq!(manifest.kresko_release_repo, "valargroup/kresko");
         assert_eq!(manifest.kresko_release_tag, "v0.1.0");
         assert!(manifest.files.contains_key("local_genesis/genesis.hex"));

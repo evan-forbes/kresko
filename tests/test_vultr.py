@@ -4,7 +4,7 @@ import base64
 
 import pytest
 
-from harness.providers import (
+from kresko.providers import (
     VultrClient,
     VultrError,
     VultrProvider,
@@ -12,7 +12,7 @@ from harness.providers import (
     parse_vultr_image_selector,
     vultr_to_asset,
 )
-from harness.reconcile import DesiredNode
+from kresko.reconcile import DesiredNode
 
 
 class FakeResponse:
@@ -44,7 +44,7 @@ def desired_node(**overrides) -> DesiredNode:
         "region": "ord",
         "size": "vc2-1c-1gb",
         "image": "os:1743",
-        "tags": ["kresko", "experiment-smoke", "role-miner", "run-smoke"],
+        "tags": ["kresko", "fleet-smoke", "role-miner"],
         "ssh_user": "root",
         "provider_options": {},
     }
@@ -95,7 +95,7 @@ def test_vultr_to_asset_maps_tags_and_ips():
             "main_ip": "203.0.113.10",
             "internal_ip": "",
             "status": "active",
-            "tags": ["kresko", "experiment-smoke", "role-miner", "run-smoke"],
+            "tags": ["kresko", "fleet-smoke", "role-miner"],
         }
     )
 
@@ -103,8 +103,7 @@ def test_vultr_to_asset_maps_tags_and_ips():
     assert asset["provider_id"] == "abc"
     assert asset["name"] == "vultr-miner-0"
     assert asset["role"] == "miner"
-    assert asset["experiment"] == "smoke"
-    assert asset["run"] == "smoke"
+    assert asset["fleet"] == "smoke"
     assert asset["public_ip"] == "203.0.113.10"
     assert asset["private_ip"] == ""
 
@@ -208,7 +207,7 @@ def test_vultr_provider_requires_running_power_status_for_ready():
                 "internal_ip": "",
                 "status": "active",
                 "power_status": "running",
-                "tags": ["kresko", "experiment-smoke", "role-miner", "run-smoke"],
+                "tags": ["kresko", "fleet-smoke", "role-miner"],
             }
 
     provider = VultrProvider(FakeClient())

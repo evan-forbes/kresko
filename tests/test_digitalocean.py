@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import pytest
 
-from harness import assets, paths
-from harness.providers import (
+from kresko import assets, paths
+from kresko.providers import (
+    REQUIRED_TAG,
     DigitalOceanClient,
     DigitalOceanError,
     DigitalOceanProvider,
     ProviderError,
     create_droplet_request,
     droplet_to_asset,
+    fleet_tag,
+    role_tag,
     tag_value,
 )
-from harness.reconcile import reconcile_instances
-from harness.spec import ExperimentSpec, NodeGroup
+from kresko.reconcile import DesiredNode, reconcile_instances
 
 
 @pytest.fixture
@@ -21,6 +23,32 @@ def home(monkeypatch, tmp_path):
     monkeypatch.setenv(paths.KRESKO_HOME_ENV, str(tmp_path))
     paths.ensure_home()
     return tmp_path
+
+
+def miners(
+    count: int,
+    *,
+    fleet: str = "smoke",
+    role: str = "miner",
+    region: str = "nyc3",
+    size: str = "s-1vcpu-1gb",
+    image: str = "ubuntu-24-04-x64",
+) -> list[DesiredNode]:
+    tags = sorted({REQUIRED_TAG, fleet_tag(fleet), role_tag(role)})
+    return [
+        DesiredNode(
+            provider="digitalocean",
+            name=f"{role}-{i}",
+            role=role,
+            region=region,
+            size=size,
+            image=image,
+            tags=tags,
+            ssh_user="root",
+            provider_options={},
+        )
+        for i in range(count)
+    ]
 
 
 class FakeResponse:
@@ -50,7 +78,7 @@ def test_create_droplet_request_shape():
         region="nyc3",
         size="s-1vcpu-1gb",
         image="ubuntu-24-04-x64",
-        tags=["kresko", "experiment-smoke", "role-miner", "run-smoke"],
+        tags=["kresko", "fleet-smoke", "role-miner"],
         ssh_keys=[7],
     )
 
@@ -60,7 +88,7 @@ def test_create_droplet_request_shape():
     assert request["monitoring"] is True
 
 
-def test_droplet_to_asset_extracts_role_and_experiment_from_tags():
+def test_droplet_to_asset_extracts_role_and_fleet_from_tags():
     droplet = {
         "id": 99,
         "name": "miner-0",
@@ -74,7 +102,7 @@ def test_droplet_to_asset_extracts_role_and_experiment_from_tags():
                 {"type": "private", "ip_address": "10.0.0.1"},
             ]
         },
-        "tags": ["kresko", "experiment-smoke", "role-miner", "run-smoke-2"],
+        "tags": ["kresko", "fleet-nu7-testnet", "role-miner"],
     }
 
     asset = droplet_to_asset(droplet)
@@ -82,16 +110,15 @@ def test_droplet_to_asset_extracts_role_and_experiment_from_tags():
     assert asset["provider"] == "digitalocean"
     assert asset["provider_id"] == "99"
     assert asset["role"] == "miner"
-    assert asset["experiment"] == "smoke"
-    assert asset["run"] == "smoke-2"
+    assert asset["fleet"] == "nu7-testnet"
     assert asset["public_ip"] == "203.0.113.1"
     assert asset["private_ip"] == "10.0.0.1"
     assert asset["region"] == "nyc3"
 
 
 def test_tag_value_returns_first_match():
-    tags = ["kresko", "experiment-smoke", "role-miner", "extra"]
-    assert tag_value(tags, "experiment-") == "smoke"
+    tags = ["kresko", "fleet-smoke", "role-miner", "extra"]
+    assert tag_value(tags, "fleet-") == "smoke"
     assert tag_value(tags, "role-") == "miner"
     assert tag_value(tags, "missing-") == ""
 
@@ -140,94 +167,92 @@ class FakeClient:
         self.deleted.append(str(droplet_id))
 
 
+def _existing_droplet(provider_id, *, role="miner", fleet="smoke", ip="203.0.113.42"):
+    return {
+        "id": provider_id,
+        "name": "miner-0",
+        "status": "active",
+        "region": {"slug": "nyc3"},
+        "size": {"slug": "s-1vcpu-1gb"},
+        "image": {"slug": "ubuntu-24-04-x64"},
+        "tags": ["kresko", fleet_tag(fleet), role_tag(role)],
+        "networks": {"v4": [{"type": "public", "ip_address": ip}]},
+    }
+
+
 def test_reconcile_droplets_dry_run_returns_plan(home):
-    spec = ExperimentSpec(
-        name="smoke",
-        ssh={"key_name": "kresko-key"},
-        node_groups=[NodeGroup(role="miner", count=2, region="nyc3", size="s-1vcpu-1gb")],
-    )
     client = FakeClient()
 
     plan = reconcile_instances(
-        spec,
-        experiment="smoke",
-        run_name="smoke",
+        miners(2),
+        fleet="smoke",
         providers={"digitalocean": DigitalOceanProvider(client)},
+        ssh_key_selector="kresko-key",
         dry_run=True,
     )
 
     assert [a["name"] for a in plan["create"]] == ["miner-0", "miner-1"]
-    assert plan["create"][0]["tags"] == sorted(
-        {"kresko", "experiment-smoke", "run-smoke", "role-miner"}
-    )
+    assert plan["create"][0]["tags"] == sorted({"kresko", "fleet-smoke", "role-miner"})
     assert client.created == []
 
 
 def test_reconcile_droplets_creates_and_writes_assets(home):
-    spec = ExperimentSpec(
-        name="smoke",
-        ssh={"key_name": "kresko-key"},
-        node_groups=[NodeGroup(role="miner", count=1, region="nyc3", size="s-1vcpu-1gb")],
-    )
     client = FakeClient()
 
     plan = reconcile_instances(
-        spec,
-        experiment="smoke",
-        run_name="smoke",
+        miners(1),
+        fleet="smoke",
         providers={"digitalocean": DigitalOceanProvider(client)},
+        ssh_key_selector="kresko-key",
     )
 
     assert [a["name"] for a in plan["create"]] == ["miner-0"]
     assert len(client.created) == 1
     asset = assets.read_asset("digitalocean", "1")
     assert asset["name"] == "miner-0"
-    assert "experiment-smoke" in asset["tags"]
+    assert asset["fleet"] == "smoke"
+    assert "fleet-smoke" in asset["tags"]
     assert "role-miner" in asset["tags"]
-    assert "run-smoke" in asset["tags"]
 
 
-def test_reconcile_droplets_reuses_by_name(home):
-    spec = ExperimentSpec(
-        name="smoke",
-        ssh={"key_name": "kresko-key"},
-        node_groups=[NodeGroup(role="miner", count=1, region="nyc3", size="s-1vcpu-1gb")],
-    )
+def test_reconcile_droplets_adopts_existing_by_name(home):
     client = FakeClient()
-    client.droplets_by_tag["experiment-smoke"] = [
-        {
-            "id": 42,
-            "name": "miner-0",
-            "status": "active",
-            "region": {"slug": "nyc3"},
-            "size": {"slug": "s-1vcpu-1gb"},
-            "image": {"slug": "ubuntu-24-04-x64"},
-            "tags": ["kresko", "experiment-smoke", "role-miner", "run-smoke"],
-            "networks": {"v4": [{"type": "public", "ip_address": "203.0.113.42"}]},
-        }
-    ]
+    client.droplets_by_tag["fleet-smoke"] = [_existing_droplet(42)]
 
     plan = reconcile_instances(
-        spec,
-        experiment="smoke",
-        run_name="smoke",
+        miners(1),
+        fleet="smoke",
         providers={"digitalocean": DigitalOceanProvider(client)},
+        ssh_key_selector="kresko-key",
     )
 
     assert plan["create"] == []
     assert [a["name"] for a in plan["reuse"]] == ["miner-0"]
     assert client.created == []
-    assert assets.read_asset("digitalocean", "42")["public_ip"] == "203.0.113.42"
+    adopted = assets.read_asset("digitalocean", "42")
+    assert adopted["public_ip"] == "203.0.113.42"
+    assert adopted["fleet"] == "smoke"
+
+
+def test_reconcile_droplets_no_ssh_key_needed_when_all_adopted(home):
+    """Idempotent re-run against a fully live fleet needs no SSH key (nothing
+    is created), so adopting a running net never trips the key requirement."""
+    client = FakeClient()
+    client.droplets_by_tag["fleet-smoke"] = [_existing_droplet(42)]
+
+    plan = reconcile_instances(
+        miners(1),
+        fleet="smoke",
+        providers={"digitalocean": DigitalOceanProvider(client)},
+        ssh_key_selector="",
+    )
+
+    assert [a["name"] for a in plan["reuse"]] == ["miner-0"]
 
 
 def test_reconcile_droplets_dry_run_validates_ssh_key(home):
     """Dry-run/plan must surface a missing SSH key, not silently succeed and
     blow up only when the user runs `up`."""
-    spec = ExperimentSpec(
-        name="smoke",
-        ssh={"key_name": "missing-key"},
-        node_groups=[NodeGroup(role="miner", count=1, region="nyc3", size="s-1vcpu-1gb")],
-    )
 
     class MissingKeyClient(FakeClient):
         def lookup_ssh_key(self, selector):
@@ -235,41 +260,25 @@ def test_reconcile_droplets_dry_run_validates_ssh_key(home):
 
     with pytest.raises(DigitalOceanError):
         reconcile_instances(
-            spec,
-            experiment="smoke",
-            run_name="smoke",
+            miners(1),
+            fleet="smoke",
             providers={"digitalocean": DigitalOceanProvider(MissingKeyClient())},
+            ssh_key_selector="missing-key",
             dry_run=True,
         )
 
 
 def test_reconcile_droplets_refuses_role_mismatch_on_reuse(home):
-    spec = ExperimentSpec(
-        name="smoke",
-        ssh={"key_name": "kresko-key"},
-        node_groups=[NodeGroup(role="miner", count=1, region="nyc3", size="s-1vcpu-1gb")],
-    )
     client = FakeClient()
     # Existing droplet matches the desired name but has a different role
-    # (e.g. config drift between runs). Reuse must refuse.
-    client.droplets_by_tag["experiment-smoke"] = [
-        {
-            "id": 42,
-            "name": "miner-0",
-            "status": "active",
-            "region": {"slug": "nyc3"},
-            "size": {"slug": "s-1vcpu-1gb"},
-            "image": {"slug": "ubuntu-24-04-x64"},
-            "tags": ["kresko", "experiment-smoke", "role-rpc", "run-smoke"],
-            "networks": {"v4": [{"type": "public", "ip_address": "203.0.113.42"}]},
-        }
-    ]
+    # (e.g. config drift). Reuse must refuse.
+    client.droplets_by_tag["fleet-smoke"] = [_existing_droplet(42, role="rpc")]
 
     plan = reconcile_instances(
-        spec,
-        experiment="smoke",
-        run_name="smoke",
+        miners(1),
+        fleet="smoke",
         providers={"digitalocean": DigitalOceanProvider(client)},
+        ssh_key_selector="kresko-key",
     )
 
     assert plan["reuse"] == []
@@ -281,7 +290,7 @@ def test_destroy_assets_validates_required_tag(home):
         "provider": "digitalocean",
         "provider_id": "42",
         "name": "miner-0",
-        "tags": ["kresko", "experiment-smoke", "run-smoke"],
+        "tags": ["kresko", "fleet-smoke", "role-miner"],
     }
     assets.write_asset(asset)
 
@@ -289,18 +298,16 @@ def test_destroy_assets_validates_required_tag(home):
     client.droplets_by_id["42"] = {
         "id": 42,
         "name": "miner-0",
-        "tags": ["kresko", "experiment-smoke", "run-smoke"],
+        "tags": ["kresko", "fleet-smoke", "role-miner"],
     }
 
-    destroyed = DigitalOceanProvider(client).delete(
-        asset, required_tags=["experiment-smoke", "run-smoke"]
-    )
+    destroyed = DigitalOceanProvider(client).delete(asset, required_tags=["fleet-smoke"])
 
     assert destroyed == "42"
     assert client.deleted == ["42"]
 
 
-def test_destroy_assets_refuses_when_tag_missing(home):
+def test_destroy_assets_refuses_when_kresko_tag_missing(home):
     asset = {
         "provider": "digitalocean",
         "provider_id": "42",
@@ -311,31 +318,28 @@ def test_destroy_assets_refuses_when_tag_missing(home):
     client.droplets_by_id["42"] = {"id": 42, "name": "miner-0", "tags": ["kresko"]}
 
     with pytest.raises(ProviderError):
-        DigitalOceanProvider(client).delete(asset, required_tags=["experiment-smoke"])
+        DigitalOceanProvider(client).delete(asset, required_tags=["fleet-smoke"])
     assert client.deleted == []
 
 
-def test_destroy_assets_refuses_when_run_tag_missing(home):
-    """Even with the experiment tag, missing run tag must block deletion —
-    that's how `down` keeps a stale asset record from killing another run's
-    droplets."""
+def test_destroy_assets_refuses_on_fleet_mismatch(home):
+    """A stale asset record carrying the wrong fleet tag must not be able to
+    kill another fleet's droplets — `down` requires the matching fleet tag."""
     asset = {
         "provider": "digitalocean",
         "provider_id": "42",
         "name": "miner-0",
-        "tags": ["kresko", "experiment-smoke", "run-other"],
+        "tags": ["kresko", "fleet-other", "role-miner"],
     }
     client = FakeClient()
     client.droplets_by_id["42"] = {
         "id": 42,
         "name": "miner-0",
-        "tags": ["kresko", "experiment-smoke", "run-other"],
+        "tags": ["kresko", "fleet-other", "role-miner"],
     }
 
     with pytest.raises(ProviderError):
-        DigitalOceanProvider(client).delete(
-            asset, required_tags=["experiment-smoke", "run-mine"]
-        )
+        DigitalOceanProvider(client).delete(asset, required_tags=["fleet-mine"])
     assert client.deleted == []
 
 
@@ -352,12 +356,6 @@ def test_destroy_tagged_droplets_refuses_kresko_tag():
 
 
 def test_reconcile_droplets_marks_create_failures(home):
-    spec = ExperimentSpec(
-        name="smoke",
-        ssh={"key_name": "kresko-key"},
-        node_groups=[NodeGroup(role="miner", count=2, region="nyc3", size="s-1vcpu-1gb")],
-    )
-
     class CapacityClient(FakeClient):
         def create_droplet(self, request):
             if request["name"] == "miner-1":
@@ -366,10 +364,10 @@ def test_reconcile_droplets_marks_create_failures(home):
 
     client = CapacityClient()
     plan = reconcile_instances(
-        spec,
-        experiment="smoke",
-        run_name="smoke",
+        miners(2),
+        fleet="smoke",
         providers={"digitalocean": DigitalOceanProvider(client)},
+        ssh_key_selector="kresko-key",
     )
 
     assert [a["name"] for a in plan["create"]] == ["miner-0", "miner-1"]
@@ -386,12 +384,6 @@ def test_reconcile_droplets_marks_create_failures(home):
 
 
 def test_reconcile_droplets_marks_wait_timeouts_as_failed(home):
-    spec = ExperimentSpec(
-        name="smoke",
-        ssh={"key_name": "kresko-key"},
-        node_groups=[NodeGroup(role="miner", count=2, region="nyc3", size="s-1vcpu-1gb")],
-    )
-
     class TimeoutClient(FakeClient):
         def wait_for_ips(self, droplet_id, attempts=60, delay_secs=5.0):
             if str(droplet_id) == "1":
@@ -400,10 +392,10 @@ def test_reconcile_droplets_marks_wait_timeouts_as_failed(home):
 
     client = TimeoutClient()
     plan = reconcile_instances(
-        spec,
-        experiment="smoke",
-        run_name="smoke",
+        miners(2),
+        fleet="smoke",
         providers={"digitalocean": DigitalOceanProvider(client)},
+        ssh_key_selector="kresko-key",
     )
 
     assert len(plan["failed"]) == 1
@@ -421,24 +413,8 @@ def test_reconcile_droplets_marks_wait_timeouts_as_failed(home):
 
 
 def test_reconcile_droplets_preserves_failed_marker_without_retry(home):
-    spec = ExperimentSpec(
-        name="smoke",
-        ssh={"key_name": "kresko-key"},
-        node_groups=[NodeGroup(role="miner", count=1, region="nyc3", size="s-1vcpu-1gb")],
-    )
     client = FakeClient()
-    client.droplets_by_tag["experiment-smoke"] = [
-        {
-            "id": 9,
-            "name": "miner-0",
-            "status": "active",
-            "region": {"slug": "nyc3"},
-            "size": {"slug": "s-1vcpu-1gb"},
-            "image": {"slug": "ubuntu-24-04-x64"},
-            "tags": ["kresko", "experiment-smoke", "role-miner", "run-smoke"],
-            "networks": {"v4": [{"type": "public", "ip_address": "203.0.113.9"}]},
-        }
-    ]
+    client.droplets_by_tag["fleet-smoke"] = [_existing_droplet(9, ip="203.0.113.9")]
     # Pre-existing local asset says failed; reuse path should keep that status
     # so selectors keep skipping it.
     assets.write_asset(
@@ -446,17 +422,17 @@ def test_reconcile_droplets_preserves_failed_marker_without_retry(home):
             "provider": "digitalocean",
             "provider_id": "9",
             "name": "miner-0",
-            "tags": ["kresko", "experiment-smoke", "role-miner", "run-smoke"],
+            "tags": ["kresko", "fleet-smoke", "role-miner"],
             "status": "failed",
             "failure_reason": {"kind": "timeout", "region": "nyc3", "size": "s-1vcpu-1gb"},
         }
     )
 
     plan = reconcile_instances(
-        spec,
-        experiment="smoke",
-        run_name="smoke",
+        miners(1),
+        fleet="smoke",
         providers={"digitalocean": DigitalOceanProvider(client)},
+        ssh_key_selector="kresko-key",
     )
 
     assert plan["failed"] == []
@@ -465,40 +441,26 @@ def test_reconcile_droplets_preserves_failed_marker_without_retry(home):
 
 
 def test_reconcile_droplets_retry_failed_clears_marker_when_active(home):
-    spec = ExperimentSpec(
-        name="smoke",
-        ssh={"key_name": "kresko-key"},
-        node_groups=[NodeGroup(role="miner", count=1, region="nyc3", size="s-1vcpu-1gb")],
-    )
-    droplet = {
-        "id": 9,
-        "name": "miner-0",
-        "status": "active",
-        "region": {"slug": "nyc3"},
-        "size": {"slug": "s-1vcpu-1gb"},
-        "image": {"slug": "ubuntu-24-04-x64"},
-        "tags": ["kresko", "experiment-smoke", "role-miner", "run-smoke"],
-        "networks": {"v4": [{"type": "public", "ip_address": "203.0.113.9"}]},
-    }
+    droplet = _existing_droplet(9, ip="203.0.113.9")
     client = FakeClient()
-    client.droplets_by_tag["experiment-smoke"] = [droplet]
+    client.droplets_by_tag["fleet-smoke"] = [droplet]
     client.droplets_by_id["9"] = droplet
     assets.write_asset(
         {
             "provider": "digitalocean",
             "provider_id": "9",
             "name": "miner-0",
-            "tags": ["kresko", "experiment-smoke", "role-miner", "run-smoke"],
+            "tags": ["kresko", "fleet-smoke", "role-miner"],
             "status": "failed",
             "failure_reason": {"kind": "timeout"},
         }
     )
 
     plan = reconcile_instances(
-        spec,
-        experiment="smoke",
-        run_name="smoke",
+        miners(1),
+        fleet="smoke",
         providers={"digitalocean": DigitalOceanProvider(client)},
+        ssh_key_selector="kresko-key",
         retry_failed=True,
     )
 

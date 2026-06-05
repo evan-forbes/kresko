@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from harness.remote import APT_LOCK_WAIT, tmux_kill_command, tmux_start_command
+from kresko.remote import APT_LOCK_WAIT, state_snapshot_command, tmux_kill_command, tmux_start_command
 
 
 def test_tmux_command_rendering_quotes_session_and_logs():
@@ -16,7 +16,7 @@ def test_tmux_kill_command():
 
 
 def test_reset_command_kills_known_sessions_and_wipes_state():
-    from harness.remote import RESET_TMUX_SESSIONS, reset_command
+    from kresko.remote import RESET_TMUX_SESSIONS, reset_command
 
     cmd = reset_command()
     for session in RESET_TMUX_SESSIONS:
@@ -62,3 +62,14 @@ def test_apt_lock_wait_checks_known_lock_files_and_processes():
         "dpkg",
     ):
         assert needle in APT_LOCK_WAIT, f"missing apt-lock check for {needle}"
+
+
+def test_state_snapshot_command_falls_back_to_p2p_when_snapshot_fails():
+    cmd = state_snapshot_command("http://38.190.136.76:9997/")
+
+    assert "--retry-connrefused" in cmd
+    assert "--connect-timeout 10" in cmd
+    assert "--speed-time 120" in cmd
+    assert "&& tar -xzf" in cmd
+    assert "snapshot hydration failed with exit $status; falling back to P2P block sync" in cmd
+    assert "rm -f /tmp/kresko-state-snapshot.tar.gz" in cmd

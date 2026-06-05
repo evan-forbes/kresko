@@ -11,6 +11,49 @@ def shell_join(parts: list[str]) -> str:
 
 KRESKO_ENV_FILE = "/root/.kresko/env"
 
+# Default public state-snapshot mirror. Bringing a node up from a snapshot
+# hydrates zebrad's state DB instead of syncing the whole chain over P2P. This
+# is a public read mirror the node curls directly; it does NOT go through the
+# S3 payload/presign path (that contract is for artifacts we own).
+DEFAULT_STATE_SNAPSHOT_URL = "http://38.190.136.76:9997/"
+
+# Where zebrad keeps its state cache on a node (matches scripts/node_init*.sh).
+ZEBRA_STATE_CACHE_DIR = "/root/.cache/zebra"
+
+
+def state_snapshot_command(url: str, *, cache_dir: str = ZEBRA_STATE_CACHE_DIR) -> str:
+    """Render the node-side command that hydrates zebrad state from a snapshot.
+
+    Idempotent: if the state cache is already populated, the download is
+    skipped so re-deploys don't re-fetch. The node curls the public mirror
+    directly and extracts the tarball into ``cache_dir`` before zebrad starts,
+    so it resumes from the snapshot height instead of genesis.
+    """
+    if not url:
+        raise ValueError("state_snapshot requires a non-empty URL")
+    q_url = shlex.quote(url)
+    q_dir = shlex.quote(cache_dir)
+    archive = "/tmp/kresko-state-snapshot.tar.gz"
+    q_archive = shlex.quote(archive)
+    return (
+        f"if [ -d {q_dir}/state ] && [ -n \"$(ls -A {q_dir}/state 2>/dev/null)\" ]; then "
+        f"echo 'kresko: zebra state cache already present; skipping snapshot'; "
+        f"else "
+        f"echo 'kresko: hydrating zebra state from {url}'; "
+        f"mkdir -p {q_dir}; "
+        f"if curl -fSL --retry 3 --retry-connrefused --retry-delay 5 "
+        f"--connect-timeout 10 --speed-time 120 --speed-limit 1024 "
+        f"-o {q_archive} {q_url} && tar -xzf {q_archive} -C {q_dir}; then "
+        f"rm -f {q_archive}; "
+        f"echo 'kresko: snapshot extracted; zebrad will resume from the snapshot height'; "
+        f"else "
+        f"status=$?; "
+        f"rm -f {q_archive}; "
+        f"echo \"kresko: snapshot hydration failed with exit $status; falling back to P2P block sync\"; "
+        f"fi; "
+        f"fi"
+    )
+
 
 def tmux_start_command(session: str, command: str, log_path: str | None = None) -> str:
     if log_path:
@@ -114,7 +157,7 @@ def pyinfra_deploy_base(payload_paths: list[str], remote_root: str = "/root/kres
     )
     server.shell(
         name="Prepare Kresko directories",
-        commands=[f"mkdir -p {shlex.quote(remote_root)} /root/logs"],
+        commands=[f"mkdir -p {shlex.quote(remote_root)} /root/logs /root/traces"],
     )
     for payload_path in payload_paths:
         source = Path(payload_path)
@@ -170,4 +213,13 @@ def pyinfra_collect(paths: list[str], destination: str) -> None:
         name="Fetch artifact archive",
         src="/tmp/kresko-collect.tar.gz",
         dest=f"{destination}/{{{{ host.data.kresko_name }}}}/kresko-collect.tar.gz",
+    )
+
+
+def pyinfra_state_snapshot(url: str, cache_dir: str = ZEBRA_STATE_CACHE_DIR) -> None:
+    from pyinfra.operations import server
+
+    server.shell(
+        name="Hydrate zebra state from snapshot",
+        commands=[state_snapshot_command(url, cache_dir=cache_dir)],
     )

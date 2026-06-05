@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from harness.env import load_experiment_env
+from kresko.env import load_experiment_env
 
 
 def test_shell_env_wins_over_both_dotenv_files(monkeypatch, tmp_path):

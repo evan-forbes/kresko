@@ -4,7 +4,7 @@ import subprocess
 
 import pytest
 
-from harness import s3
+from kresko import s3
 
 
 class RecordingRunner:

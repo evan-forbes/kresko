@@ -1,17 +1,19 @@
 """Co-located Zcash block-explorer deployment.
 
-Declarative: an experiment opts in from `build_experiment()` with one line —
+Declarative: a fleet opts in with one line —
 
-    experiment.add_explorer(node="miner-0")
+    fleet.add_explorer(node="miner-0")
 
-— and the explorer then "pops up" during the experiment's launch flow when
-`exp.deploy_explorer()` runs. Operationally, the same machinery is exposed as
-`explorer-*` verbs (see `explorer_actions`) for redeploy / status / logs / stop.
+— and the explorer is then stood up via `fleet.deploy_explorer()`. The
+`fleet.explorer_status() / explorer_logs() / explorer_stop() / redeploy_explorer()`
+methods cover the rest of the lifecycle. (Demoted in the fleet refactor: this is
+"a payload deployed to one node"; full extraction onto the normal deploy/run
+path is a later step.)
 
 The explorer is the devdotbo/zcash-explorer Phoenix app, run via `docker
 compose` on an existing node, reaching that node's local Zebra RPC through
 `host.docker.internal`. The source tree is delivered to the node via an S3
-presigned URL the node `curl`s — never scp/rsync (see `harness.s3` and the
+presigned URL the node `curl`s — never scp/rsync (see `kresko.s3` and the
 operator's S3-only distribution rule). The small, secret `.env` is written
 over the SSH session's stdin so credentials never touch S3.
 
@@ -33,19 +35,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
-from harness import s3
-from harness.env import load_experiment_env
-from harness.runs import node_failure, write_result
+from kresko import s3
+from kresko.env import load_experiment_env
+from kresko.fleet import node_failure, write_result
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle.
-    from harness.experiment import Experiment
+    from kresko.fleet import Fleet
 
 __all__ = [
     "ExplorerSpec",
     "ExplorerDeployment",
     "CommandRunner",
     "build_source_archive",
-    "explorer_actions",
     "render_env",
 ]
 
@@ -468,7 +469,7 @@ def remote_stop_command(spec: ExplorerSpec) -> str:
 class CommandRunner:
     """Runs local subprocesses, teeing each into `<run_dir>/<log_name>.std*.log`.
 
-    Returns a step dict shaped like the rest of the harness
+    Returns a step dict shaped like the rest of the kresko
     (`{name, ok, returncode, stdout_path, stderr_path}`) so failures slot into
     `result.json` the same way. Injected in tests to avoid real ssh/aws calls.
     """
@@ -541,7 +542,7 @@ class ExplorerDeployment:
 
     def __init__(
         self,
-        exp: "Experiment",
+        exp: "Fleet",
         spec: ExplorerSpec,
         *,
         runner: CommandRunner | None = None,
@@ -549,7 +550,7 @@ class ExplorerDeployment:
     ) -> None:
         self.exp = exp
         self.spec = spec
-        self.runner = runner or CommandRunner(exp.run_dir)
+        self.runner = runner or CommandRunner(exp.dir)
         self.s3_runner = s3_runner
 
     # public lifecycle ------------------------------------------------------
@@ -563,7 +564,7 @@ class ExplorerDeployment:
             asset,
             [],
             url=meta["url"],
-            metadata_path=str(self.exp.run_dir / METADATA_FILENAME),
+            metadata_path=str(self.exp.dir / METADATA_FILENAME),
         )
 
     def deploy(self, *, dry_run: bool = False) -> dict[str, Any]:
@@ -611,7 +612,7 @@ class ExplorerDeployment:
             meta = self._write_metadata(asset, "planned")
             return self._result(stage, True, asset, [], dry_run=True, url=meta["url"])
 
-        load_experiment_env(self.exp.run_dir)
+        load_experiment_env(self.exp.dir)
         self._write_metadata(asset, "deploying")
         steps: list[dict[str, Any]] = []
         faucet_source_address: str | None = None
@@ -706,7 +707,7 @@ class ExplorerDeployment:
 
     def _s3_key(self) -> str:
         return (
-            f"{self.spec.s3_prefix}/{self.exp.name}/{self.exp.run_name}/"
+            f"{self.spec.s3_prefix}/{self.exp.name}/"
             f"zcash-explorer-{secrets.token_hex(4)}.tar.gz"
         )
 
@@ -755,7 +756,7 @@ class ExplorerDeployment:
         candidates = sorted(
             [
                 asset
-                for asset in self.exp.run_assets()
+                for asset in self.exp.fleet_assets()
                 if asset.get("role") == self.spec.role
                 and asset.get("status") != "failed"
                 and asset.get("public_ip")
@@ -769,11 +770,11 @@ class ExplorerDeployment:
             names = ", ".join(asset.get("name", "<unnamed>") for asset in candidates) or "<none>"
             raise RuntimeError(
                 f"explorer target node {self.spec.node!r} not found among active "
-                f"{self.spec.role} nodes in run {self.exp.run_name!r}: {names}"
+                f"{self.spec.role} nodes in fleet {self.exp.name!r}: {names}"
             )
         if not candidates:
             raise RuntimeError(
-                f"no active {self.spec.role} nodes with a public IP in run {self.exp.run_name!r}"
+                f"no active {self.spec.role} nodes with a public IP in fleet {self.exp.name!r}"
             )
         return candidates[0]
 
@@ -798,8 +799,7 @@ class ExplorerDeployment:
     def _write_metadata(self, asset: dict[str, Any], status: str) -> dict[str, Any]:
         public_ip = asset["public_ip"]
         metadata = {
-            "experiment": self.exp.name,
-            "run": self.exp.run_name,
+            "fleet": self.exp.name,
             "node": asset["name"],
             "public_ip": public_ip,
             "public_port": self.spec.public_port,
@@ -811,12 +811,12 @@ class ExplorerDeployment:
             "faucet_enabled": self.spec.faucet_enabled,
             "faucet_source_address": self.spec.faucet_source_address,
             "faucet_amount": self.spec.faucet_amount if self.spec.faucet_enabled else None,
-            "run_dir": str(self.exp.run_dir),
+            "run_dir": str(self.exp.dir),
             "source": str(self.spec.source),
             "status": status,
             "url": f"http://{public_ip}:{self.spec.public_port}",
         }
-        (self.exp.run_dir / METADATA_FILENAME).write_text(
+        (self.exp.dir / METADATA_FILENAME).write_text(
             json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         return metadata
@@ -838,7 +838,7 @@ class ExplorerDeployment:
             **extra,
         }
         failures = [] if ok else failures_from_steps(asset.get("name", "all"), stage, steps)
-        write_result(self.exp.run_dir, stage, ok, failures=failures, extra=payload)
+        write_result(self.exp.dir, stage, ok, failures=failures, extra=payload)
         return payload
 
     def _failure(
@@ -852,23 +852,3 @@ class ExplorerDeployment:
             steps,
             url=f"http://{asset.get('public_ip')}:{self.spec.public_port}",
         )
-
-
-def explorer_actions() -> dict[str, Callable[["Experiment", Any], dict[str, Any]]]:
-    """`extra_actions` map exposing the explorer lifecycle as `explorer-*` verbs.
-
-    These delegate to the `Experiment` methods, which no-op cleanly when the
-    experiment didn't `add_explorer(...)`.
-    """
-    return {
-        "explorer-plan": lambda exp, args: exp.plan_explorer(),
-        "explorer-deploy": lambda exp, args: exp.deploy_explorer(
-            dry_run=getattr(args, "dry_run", False)
-        ),
-        "explorer-redeploy": lambda exp, args: exp.redeploy_explorer(
-            dry_run=getattr(args, "dry_run", False)
-        ),
-        "explorer-status": lambda exp, args: exp.explorer_status(),
-        "explorer-logs": lambda exp, args: exp.explorer_logs(),
-        "explorer-stop": lambda exp, args: exp.explorer_stop(),
-    }

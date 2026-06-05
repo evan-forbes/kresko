@@ -12,6 +12,8 @@ use crate::config::{DaaConfig, NetworkKind};
 /// disbursement amount is zero. Zebra still needs an explicit config entry
 /// when NU6.1 is activated before NU7.
 pub const DEFAULT_NU6_1_LOCKBOX_ADDRESS: &str = "t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz";
+pub const PUBLIC_BLOCK_SYNC_PEER_TARGET: i64 = 100;
+pub const PUBLIC_BLOCK_SYNC_DOWNLOAD_CONCURRENCY_LIMIT: i64 = 100;
 
 /// A single one-time NU6.1 lockbox disbursement entry, matching zebra's
 /// `[[network.testnet_parameters.lockbox_disbursements]]` schema.
@@ -151,6 +153,7 @@ pub fn template_for(network_kind: NetworkKind) -> Result<String> {
             );
             set_path(&mut config, &["rpc", "listen_addr"], "0.0.0.0:18232".into());
             set_path(&mut config, &["rpc", "enable_cookie_auth"], false.into());
+            tune_public_block_sync(&mut config);
         }
         NetworkKind::Mainnet => {
             set_path(&mut config, &["network", "network"], "Mainnet".into());
@@ -166,10 +169,24 @@ pub fn template_for(network_kind: NetworkKind) -> Result<String> {
             );
             set_path(&mut config, &["rpc", "listen_addr"], "0.0.0.0:8232".into());
             set_path(&mut config, &["rpc", "enable_cookie_auth"], false.into());
+            tune_public_block_sync(&mut config);
         }
     }
 
     toml::to_string_pretty(&config).context("failed to serialize Zebra-generated config")
+}
+
+fn tune_public_block_sync(config: &mut toml::Value) {
+    set_path(
+        config,
+        &["network", "peerset_initial_target_size"],
+        PUBLIC_BLOCK_SYNC_PEER_TARGET.into(),
+    );
+    set_path(
+        config,
+        &["sync", "download_concurrency_limit"],
+        PUBLIC_BLOCK_SYNC_DOWNLOAD_CONCURRENCY_LIMIT.into(),
+    );
 }
 
 fn zebra_default_config_value() -> Result<toml::Value> {
@@ -741,6 +758,7 @@ fn extract_miner_address(template: &str) -> Option<String> {
 mod tests {
     use super::{
         DEFAULT_NU6_1_LOCKBOX_ADDRESS, LocalTestnetParameters, LockboxDisbursement,
+        PUBLIC_BLOCK_SYNC_DOWNLOAD_CONCURRENCY_LIMIT, PUBLIC_BLOCK_SYNC_PEER_TARGET,
         apply_local_testnet_parameters, bootstrap_config_for_isolated_rpc,
         default_nu6_1_lockbox_disbursements, ensure_miner_address_is_set, generate_node_config,
         read_genesis_hash, read_miner_address, set_miner_address, strip_genesis_block_path,
@@ -965,6 +983,29 @@ mod tests {
                 .and_then(toml::Value::as_str),
             Some("1.1.1.1:8233")
         );
+    }
+
+    #[test]
+    fn public_network_templates_use_fast_block_sync_settings() {
+        for network_kind in [NetworkKind::PublicTestnet, NetworkKind::Mainnet] {
+            let generated = parsed(&template_for(network_kind).expect("template generation"));
+            assert_eq!(
+                generated
+                    .get("network")
+                    .and_then(|network| network.get("peerset_initial_target_size"))
+                    .and_then(toml::Value::as_integer),
+                Some(PUBLIC_BLOCK_SYNC_PEER_TARGET),
+                "{network_kind} should target enough peers for fast public block sync",
+            );
+            assert_eq!(
+                generated
+                    .get("sync")
+                    .and_then(|sync| sync.get("download_concurrency_limit"))
+                    .and_then(toml::Value::as_integer),
+                Some(PUBLIC_BLOCK_SYNC_DOWNLOAD_CONCURRENCY_LIMIT),
+                "{network_kind} should allow matching concurrent block downloads",
+            );
+        }
     }
 
     #[test]

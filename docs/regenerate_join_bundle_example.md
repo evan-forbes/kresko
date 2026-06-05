@@ -41,12 +41,12 @@ The join machine downloads released binaries. Make sure the release tags match
 the network binaries you deployed:
 
 - Zebra (zebrad): <https://github.com/valargroup/zebra/releases> — currently
-  `nu7-testnet-v0.1.1` (asset `zebra-<tag>-x86_64-unknown-linux-gnu.tar.gz`).
+  `nu7-testnet-v0.1.2` (asset `zebra-<tag>-x86_64-unknown-linux-gnu.tar.gz`).
 - Kresko (miner): <https://github.com/valargroup/kresko/releases> — currently
   `v0.1.0` (asset `kresko-<tag>-x86_64-linux-gnu`).
 
 ```bash
-gh release view nu7-testnet-v0.1.1 --repo valargroup/zebra  --json assets --jq '.assets[].name'
+gh release view nu7-testnet-v0.1.2 --repo valargroup/zebra  --json assets --jq '.assets[].name'
 gh release view v0.1.0             --repo valargroup/kresko --json assets --jq '.assets[].name'
 ```
 
@@ -60,7 +60,7 @@ CXXFLAGS='-include cstdint' cargo build --release --bin kresko
 
 ## 4. Generate And Package The Bundle
 
-The release coordinates default to `valargroup/zebra @ nu7-testnet-v0.1.1` and
+The release coordinates default to `valargroup/zebra @ nu7-testnet-v0.1.2` and
 `valargroup/kresko @ v0.1.0`; override them only if you cut new releases.
 
 ```bash
@@ -69,7 +69,7 @@ rm -rf "$OUT_DIR" "$BUNDLE_TGZ"
 target/release/kresko join-bundle \
   --run-dir "$RUN_DIR" \
   --zebra-repo valargroup/zebra \
-  --zebra-release-tag nu7-testnet-v0.1.1 \
+  --zebra-release-tag nu7-testnet-v0.1.2 \
   --kresko-repo valargroup/kresko \
   --kresko-release-tag v0.1.0 \
   --out "$OUT_DIR"

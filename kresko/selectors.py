@@ -1,4 +1,4 @@
-"""Asset filtering: roles, names, glob patterns, run name, failed-from results."""
+"""Asset filtering: roles, names, glob patterns, fleet, failed-from results."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ def select(
     roles: str | Iterable[str] | None = None,
     names: str | Iterable[str] | None = None,
     patterns: str | Iterable[str] | None = None,
-    run_name: str | None = None,
+    fleet: str | None = None,
     failed_from: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     selected = active_assets(assets)
@@ -66,8 +66,8 @@ def select(
             for a in selected
             if any(fnmatch.fnmatch(a.get("name", ""), p) for p in pattern_list)
         ]
-    if run_name:
-        selected = [a for a in selected if a.get("run") == run_name]
+    if fleet:
+        selected = [a for a in selected if a.get("fleet") == fleet]
     if failed_from:
         failed = failed_node_names_from_result(failed_from)
         selected = [a for a in selected if a.get("name") in failed]

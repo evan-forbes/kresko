@@ -5,9 +5,9 @@ import json
 import pytest
 import requests
 
-from harness import assets, paths, status
-from harness.cli import main
-from harness.status import NodeStatus, StatusReport
+from kresko import assets, paths, status
+from kresko.cli import main
+from kresko.status import NodeStatus, StatusReport
 
 
 class FakeResponse:
@@ -165,7 +165,7 @@ def test_cli_status_filters_and_queries(home, monkeypatch, capsys):
         queried["rpc_port"] = rpc_port
         return StatusReport(nodes=[NodeStatus("miner-0", "203.0.113.1", height=99, status="synced")])
 
-    monkeypatch.setattr("harness.cli.status.query_status", fake_query)
+    monkeypatch.setattr("kresko.cli.status.query_status", fake_query)
 
     rc = main(["status", "--role", "miner", "--rpc-port", "18232", "--json"])
     out = json.loads(capsys.readouterr().out)
@@ -188,7 +188,7 @@ def test_cli_status_skips_destroyed_nodes(home, monkeypatch, capsys):
         seen["names"] = [a["name"] for a in items]
         return StatusReport(nodes=[])
 
-    monkeypatch.setattr("harness.cli.status.query_status", fake_query)
+    monkeypatch.setattr("kresko.cli.status.query_status", fake_query)
 
     main(["status"])
     assert seen["names"] == ["miner-0"]

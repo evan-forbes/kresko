@@ -10,9 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from harness import assets
-from harness.assets import REQUIRED_TAG
-from harness.providers import CloudProvider, ProviderError, get_provider, known_provider_names
+from kresko import assets
+from kresko.assets import REQUIRED_TAG
+from kresko.providers import CloudProvider, ProviderError, get_provider, known_provider_names
 
 
 @dataclass

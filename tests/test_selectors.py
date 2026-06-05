@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import json
 
-from harness.selectors import select
+from kresko.selectors import select
 
 
 def sample_assets():
     return [
-        {"name": "miner-0", "role": "miner", "public_ip": "203.0.113.1", "status": "active", "run": "smoke"},
-        {"name": "miner-1", "role": "miner", "public_ip": "203.0.113.2", "status": "active", "run": "smoke"},
-        {"name": "rpc-0", "role": "rpc", "public_ip": "203.0.113.3", "status": "active", "run": "smoke"},
-        {"name": "miner-2", "role": "miner", "public_ip": "", "status": "pending", "run": "smoke"},
-        {"name": "miner-3", "role": "miner", "public_ip": "203.0.113.4", "status": "destroyed", "run": "smoke"},
-        {"name": "miner-4", "role": "miner", "public_ip": "203.0.113.5", "status": "active", "run": "other"},
+        {"name": "miner-0", "role": "miner", "public_ip": "203.0.113.1", "status": "active", "fleet": "smoke"},
+        {"name": "miner-1", "role": "miner", "public_ip": "203.0.113.2", "status": "active", "fleet": "smoke"},
+        {"name": "rpc-0", "role": "rpc", "public_ip": "203.0.113.3", "status": "active", "fleet": "smoke"},
+        {"name": "miner-2", "role": "miner", "public_ip": "", "status": "pending", "fleet": "smoke"},
+        {"name": "miner-3", "role": "miner", "public_ip": "203.0.113.4", "status": "destroyed", "fleet": "smoke"},
+        {"name": "miner-4", "role": "miner", "public_ip": "203.0.113.5", "status": "active", "fleet": "other"},
     ]
 
 
@@ -28,8 +28,8 @@ def test_selects_roles_names_and_globs():
     ]
 
 
-def test_selects_by_run_name():
-    assert [a["name"] for a in select(sample_assets(), run_name="other")] == ["miner-4"]
+def test_selects_by_fleet():
+    assert [a["name"] for a in select(sample_assets(), fleet="other")] == ["miner-4"]
 
 
 def test_select_skips_failed_status_assets():
@@ -39,7 +39,7 @@ def test_select_skips_failed_status_assets():
             "role": "miner",
             "public_ip": "203.0.113.99",
             "status": "failed",
-            "run": "smoke",
+            "fleet": "smoke",
         }
     ]
     selected = select(assets, roles="miner")

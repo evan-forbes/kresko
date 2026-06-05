@@ -10,9 +10,15 @@ Layout::
     ├── .env
     ├── config.toml
     ├── cache/
-    ├── experiments/<experiment>/
-    ├── runs/<experiment>/<run-name>/
-    └── assets/<provider>-<provider-id>.json
+    ├── assets/<provider>-<provider-id>.json   # global mirror of all live nodes
+    └── fleets/<name>/                          # per-fleet working state
+        ├── nodes/<node>.json                   # per-node snapshot
+        ├── data/                               # collected files
+        └── *.log                               # operation logs
+
+A fleet is a named, tagged set of nodes plus its accumulated state. There is
+no separate "experiment template" / "run instantiation" split anymore: the
+fleet dir is created on first `Fleet.up()` and accumulates state in place.
 """
 
 from __future__ import annotations
@@ -34,33 +40,18 @@ def kresko_home() -> Path:
 
 def ensure_home() -> Path:
     home = kresko_home()
-    for sub in ("experiments", "runs", "assets", "cache"):
+    for sub in ("fleets", "assets", "cache"):
         (home / sub).mkdir(parents=True, exist_ok=True)
     return home
 
 
-def experiments_dir() -> Path:
-    return kresko_home() / "experiments"
+def fleets_dir() -> Path:
+    return kresko_home() / "fleets"
 
 
-def experiment_dir(experiment: str) -> Path:
-    validate_slug(experiment, kind="experiment")
-    return experiments_dir() / experiment
-
-
-def runs_dir() -> Path:
-    return kresko_home() / "runs"
-
-
-def experiment_runs_dir(experiment: str) -> Path:
-    validate_slug(experiment, kind="experiment")
-    return runs_dir() / experiment
-
-
-def run_dir(experiment: str, run_name: str) -> Path:
-    validate_slug(experiment, kind="experiment")
-    validate_slug(run_name, kind="run")
-    return experiment_runs_dir(experiment) / run_name
+def fleet_dir(name: str) -> Path:
+    validate_slug(name, kind="fleet")
+    return fleets_dir() / name
 
 
 def assets_dir() -> Path:
