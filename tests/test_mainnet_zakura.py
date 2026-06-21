@@ -133,29 +133,76 @@ def test_patch_zakura_fast_sync_defaults_is_idempotent(tmp_path):
     assert "download_concurrency_limit: 100," in sync.read_text(encoding="utf-8")
 
 
-def test_tune_payload_zebrad_configs_sets_fast_sync_values(tmp_path):
-    node_dir = tmp_path / "payload" / "asia-0"
-    node_dir.mkdir(parents=True)
-    config_path = node_dir / "zebrad.toml"
-    config_path.write_text(
-        """[network]
+def test_tune_payload_zebrad_configs_enables_zakura_only_bootstrap(home, tmp_path):
+    assets.write_asset(
+        {
+            "provider": "digitalocean",
+            "provider_id": "snapshot-1",
+            "name": "us-east-0",
+            "role": "node",
+            "fleet": "mainnet-zebra-snapshot",
+            "region": "nyc3",
+            "size": "so1_5-4vcpu-32gb",
+            "image": "ubuntu-24-04-x64",
+            "public_ip": "198.51.100.10",
+            "private_ip": "",
+            "status": "active",
+            "tags": [
+                "kresko",
+                "fleet-mainnet-zebra-snapshot",
+                "role-node",
+                "zebra",
+                "mainnet",
+                "snapshot",
+            ],
+        }
+    )
+    payload_dir = tmp_path / "payload"
+    for node_name, ip in [("asia-0", "203.0.113.1"), ("us-0", "203.0.113.2")]:
+        node_dir = payload_dir / node_name
+        node_dir.mkdir(parents=True)
+        (node_dir / "zebrad.toml").write_text(
+            f"""[network]
 network = "Mainnet"
+external_addr = "{ip}:8233"
 peerset_initial_target_size = 25
 
 [sync]
 download_concurrency_limit = 50
 checkpoint_verify_concurrency_limit = 1000
 """,
-        encoding="utf-8",
+            encoding="utf-8",
+        )
+
+    tuned = mainnet_zakura.tune_payload_zebrad_configs(
+        payload_dir,
+        fleet_assets=[
+            {"name": "asia-0", "public_ip": "203.0.113.1"},
+            {"name": "us-0", "public_ip": "203.0.113.2"},
+        ],
     )
 
-    tuned = mainnet_zakura.tune_payload_zebrad_configs(tmp_path / "payload")
-
-    assert tuned == [config_path]
-    text = config_path.read_text(encoding="utf-8")
-    assert "peerset_initial_target_size = 100" in text
-    assert "download_concurrency_limit = 100" in text
-    assert "checkpoint_verify_concurrency_limit = 1000" in text
+    assert tuned == [payload_dir / "asia-0" / "zebrad.toml", payload_dir / "us-0" / "zebrad.toml"]
+    asia_text = (payload_dir / "asia-0" / "zebrad.toml").read_text(encoding="utf-8")
+    us_text = (payload_dir / "us-0" / "zebrad.toml").read_text(encoding="utf-8")
+    for text in (asia_text, us_text):
+        assert "peerset_initial_target_size = 100" in text
+        assert "download_concurrency_limit = 100" in text
+        assert "checkpoint_verify_concurrency_limit = 1000" in text
+        assert "initial_mainnet_peers = [\n]" in text
+        assert "v2_p2p = true" in text
+        assert "legacy_p2p = false" in text
+        assert "zakura_node_secret_key = " in text
+        assert "[network.zakura]" in text
+        assert 'listen_addr = "0.0.0.0:8234"' in text
+        assert 'trace_dir = "/root/traces/zakura"' in text
+        assert "message_rate_per_second = 4000" in text
+        assert "[network.zakura.block_sync]" in text
+        assert "replace_legacy_syncer = true" in text
+    assert "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618@203.0.113.2:8234" in asia_text
+    assert "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@203.0.113.1:8234" in us_text
+    assert "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4@198.51.100.10:8234" in asia_text
+    assert "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4@198.51.100.10:8234" in us_text
 
 
 def test_build_zakura_uses_ubuntu_xtask_package(monkeypatch, home, tmp_path):

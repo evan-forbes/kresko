@@ -89,6 +89,8 @@ def test_public_node_init_runs_zebrad_under_systemd_with_raised_fd_limit():
     text = _public_script_text()
 
     assert 'mkdir -p /root/logs /root/traces' in text
+    assert 'payload_root="/root/kresko/payload"' in text
+    assert 'source "${payload_root}/vars.sh"' in text
     # zebrad runs as a supervised systemd service (crash-restart +
     # reboot-persistence), not a bare backgrounded process.
     assert '/etc/systemd/system/zebrad.service' in text
@@ -106,3 +108,14 @@ def test_public_node_init_runs_zebrad_under_systemd_with_raised_fd_limit():
     assert 'mkdir -p "$(dirname "$_kresko_var_value")"' in text
     assert 'mkdir -p "$(dirname "$_kresko_var_value")/traces"' not in text
     assert "falling back to P2P block sync" in text
+
+
+def test_public_node_init_requires_zakura_and_explicit_legacy_setting():
+    text = _public_script_text()
+
+    assert 'Zakura P2P enablement' in text
+    assert 'legacy Zebra P2P setting' in text
+    assert '(true|false)' in text
+    assert 'stable Zakura node identity' in text
+    assert 'Zakura P2P listen address' in text
+    assert 'Zakura bootstrap peers' in text

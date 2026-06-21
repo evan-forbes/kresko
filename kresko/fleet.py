@@ -24,8 +24,11 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shlex
 import subprocess
+import tarfile
+import tempfile
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -34,6 +37,7 @@ from typing import Any, Callable
 
 from kresko import assets as assets_store
 from kresko import paths
+from kresko import s3
 from kresko.env import load_experiment_env
 from kresko.inventory import write_pyinfra_inventory
 from kresko.providers import (
@@ -158,6 +162,7 @@ class Fleet:
         ssh: dict[str, Any] | None = None,
         providers: dict[str, CloudProvider] | None = None,
         pyinfra_runner: PyinfraRunner | None = None,
+        s3_runner: s3.Runner | None = None,
     ) -> None:
         paths.validate_slug(name, kind="fleet")
         paths.ensure_home()
@@ -177,6 +182,7 @@ class Fleet:
         self._nodes: list[_NodeSpec] = []
         self._providers = dict(providers or {})
         self._pyinfra_runner = pyinfra_runner or run_pyinfra
+        self._s3_runner = s3_runner
         # Optional co-located block explorer (see kresko.explorer). Populated by
         # add_explorer(); None means the explorer ops are clean no-ops.
         self._explorer: Any = None
@@ -387,36 +393,69 @@ class Fleet:
             nodes = self._select(role=role, name=name, pattern=pattern, failed_from=failed_from)
             payload_paths = self._absolute_payload_paths(payload, role=role)
             snapshot_url = _resolve_state_snapshot(state_snapshot)
-            body = (
-                "from kresko.remote import pyinfra_deploy_base\n"
-                f"pyinfra_deploy_base({payload_paths!r})\n"
-            )
-            if snapshot_url:
-                body += (
-                    "from kresko.remote import pyinfra_state_snapshot\n"
-                    f"pyinfra_state_snapshot({snapshot_url!r})\n"
-                )
-            inventory, deploy_file = self._write_pyinfra_deploy("deploy_payload.py", body, nodes)
             local_provenance = _read_local_binary_provenance(payload_paths)
+            payload_names = _payload_archive_names(payload_paths, require_exists=not dry_run)
             plan: dict[str, Any] = {
                 "nodes": [a["name"] for a in nodes],
                 "payload_paths": payload_paths,
+                "payload_names": payload_names,
+                "delivery": "s3",
                 "binary_provenance_local": local_provenance,
             }
             if snapshot_url:
                 plan["state_snapshot_url"] = snapshot_url
             if dry_run:
+                body = _deploy_s3_body(
+                    "DRY_RUN_PRESIGNED_URL",
+                    payload_names,
+                    archive_sha256="DRY_RUN_ARCHIVE_SHA256",
+                    snapshot_url=snapshot_url,
+                )
+                self._write_pyinfra_deploy("deploy_payload.py", body, nodes)
                 return self._success_result(stage, True, plan)
-            return self._run_pyinfra_stage(
-                stage,
-                inventory,
-                deploy_file,
-                plan,
-                post_process=_attach_remote_provenance,
-            )
+            with tempfile.TemporaryDirectory(prefix=f"kresko-{self.name}-payload-") as tmp:
+                archive = Path(tmp) / "payload.tar.gz"
+                payload_names = _build_payload_archive(payload_paths, archive)
+                archive_sha256 = _sha256_file(archive)
+                s3_key = _payload_s3_key(self.name)
+                presigned_url = self._upload_payload_archive(archive, s3_key)
+                plan.update(
+                    {
+                        "payload_names": payload_names,
+                        "payload_archive_sha256": archive_sha256,
+                        "payload_s3_key": s3_key,
+                        "payload_s3_expires": _payload_s3_expires(),
+                    }
+                )
+                body = _deploy_s3_body(
+                    presigned_url,
+                    payload_names,
+                    archive_sha256=archive_sha256,
+                    snapshot_url=snapshot_url,
+                )
+                inventory, deploy_file = self._write_pyinfra_deploy(
+                    "deploy_payload.py", body, nodes
+                )
+                return self._run_pyinfra_stage(
+                    stage,
+                    inventory,
+                    deploy_file,
+                    plan,
+                    post_process=_attach_remote_provenance,
+                )
         except Exception as exc:
             self._write_failure(stage, stage, exc)
             raise
+
+    def _upload_payload_archive(self, archive: Path, key: str) -> str:
+        if self._s3_runner is not None:
+            return s3.upload_and_presign(
+                archive,
+                key,
+                expires=_payload_s3_expires(),
+                runner=self._s3_runner,
+            )
+        return s3.upload_and_presign(archive, key, expires=_payload_s3_expires())
 
     def run(
         self,
@@ -971,6 +1010,74 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(64 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _payload_archive_names(
+    payload_paths: list[str], *, require_exists: bool = True
+) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw_path in payload_paths:
+        path = Path(raw_path)
+        if require_exists and not path.exists():
+            raise FileNotFoundError(path)
+        name = path.name
+        if not name:
+            raise ValueError(f"payload path has no archive name: {path}")
+        if name in seen:
+            raise ValueError(f"duplicate payload archive entry name: {name}")
+        seen.add(name)
+        names.append(name)
+    if not names:
+        raise ValueError("no payload paths selected for deploy")
+    return names
+
+
+def _build_payload_archive(payload_paths: list[str], archive: Path) -> list[str]:
+    names = _payload_archive_names(payload_paths)
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive, "w:gz") as tar:
+        for raw_path, name in zip(payload_paths, names, strict=True):
+            tar.add(Path(raw_path), arcname=name)
+    return names
+
+
+def _payload_s3_key(fleet_name: str) -> str:
+    prefix = os.environ.get("KRESKO_PAYLOAD_S3_PREFIX", "kresko").strip().strip("/")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filename = f"payload-{stamp}-{secrets.token_hex(4)}.tar.gz"
+    return f"{prefix}/{fleet_name}/{filename}" if prefix else f"{fleet_name}/{filename}"
+
+
+def _payload_s3_expires() -> int:
+    raw = os.environ.get("KRESKO_PAYLOAD_S3_EXPIRES", "21600")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("KRESKO_PAYLOAD_S3_EXPIRES must be an integer") from exc
+    if value <= 0:
+        raise ValueError("KRESKO_PAYLOAD_S3_EXPIRES must be positive")
+    return value
+
+
+def _deploy_s3_body(
+    presigned_url: str,
+    payload_names: list[str],
+    *,
+    archive_sha256: str,
+    snapshot_url: str | None,
+) -> str:
+    body = (
+        "from kresko.remote import pyinfra_deploy_s3\n"
+        f"pyinfra_deploy_s3({presigned_url!r}, {payload_names!r}, "
+        f"archive_sha256={archive_sha256!r})\n"
+    )
+    if snapshot_url:
+        body += (
+            "from kresko.remote import pyinfra_state_snapshot\n"
+            f"pyinfra_state_snapshot({snapshot_url!r})\n"
+        )
+    return body
 
 
 def _parse_payload_manifest(manifest_path: Path) -> dict[str, str]:

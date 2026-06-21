@@ -179,6 +179,98 @@ def pyinfra_deploy_base(payload_paths: list[str], remote_root: str = "/root/kres
     )
 
 
+def pyinfra_deploy_s3(
+    presigned_url: str,
+    payload_names: list[str],
+    *,
+    archive_sha256: str = "",
+    remote_root: str = "/root/kresko",
+) -> None:
+    """Fetch a presigned payload archive and install it under ``remote_root``.
+
+    The archive contains top-level entries named by ``payload_names``. We
+    extract into ``remote_root`` staging space first, validate the payload, then
+    swap entries into place. Nothing is ever extracted directly into ``/root``.
+    """
+
+    from pyinfra import host
+    from pyinfra.operations import apt, server
+
+    archive = "/tmp/kresko-payload.tar.gz"
+    extract_root = f"{remote_root}/payload.unpack"
+    quoted_url = shlex.quote(presigned_url)
+    quoted_archive = shlex.quote(archive)
+    quoted_extract_root = shlex.quote(extract_root)
+    quoted_remote_root = shlex.quote(remote_root)
+    names = [name for name in payload_names if name]
+    if not names:
+        raise ValueError("payload_names must not be empty")
+
+    validate = []
+    swaps = []
+    for name in names:
+        q_name = shlex.quote(name)
+        validate.append(f"test -e {quoted_extract_root}/{q_name}")
+        if name == "payload":
+            validate.append(f"test -f {quoted_extract_root}/{q_name}/vars.sh")
+        target = f"{quoted_remote_root}/{q_name}"
+        candidate = f"{quoted_extract_root}/{q_name}"
+        backup = f"{target}.old"
+        swaps.extend(
+            [
+                f"rm -rf {backup}",
+                f"if [ -e {target} ]; then mv {target} {backup}; fi",
+                f"mv {candidate} {target}",
+                f"chown -R root:root {target}",
+                f"rm -rf {backup}",
+            ]
+        )
+
+    verify_sha = []
+    if archive_sha256:
+        verify_sha.append(
+            f"printf '%s  %s\\n' {shlex.quote(archive_sha256)} {quoted_archive} | sha256sum -c -"
+        )
+
+    script = " && ".join(
+        [
+            "set -euo pipefail",
+            f"mkdir -p {quoted_remote_root} /root/logs /root/traces",
+            f"rm -rf {quoted_extract_root}",
+            f"mkdir -p {quoted_extract_root}",
+            (
+                "curl -fL --retry 3 --retry-connrefused --retry-delay 5 "
+                "--connect-timeout 10 --speed-time 120 --speed-limit 1024 "
+                f"-o {quoted_archive} {quoted_url}"
+            ),
+            *verify_sha,
+            f"tar -xzf {quoted_archive} -C {quoted_extract_root}",
+            *validate,
+            *swaps,
+            f"rm -rf {quoted_extract_root}",
+            f"rm -f {quoted_archive} /root/payload.tar.gz",
+        ]
+    )
+
+    server.shell(
+        name="Wait for apt/dpkg locks (cloud-init unattended-upgrades)",
+        commands=[APT_LOCK_WAIT],
+    )
+    apt.packages(
+        name="Install Kresko base packages",
+        packages=["tmux", "curl", "tar"],
+        update=True,
+    )
+    server.shell(
+        name="Fetch and install S3 payload archive",
+        commands=[f"bash -lc {shlex.quote(script)}"],
+    )
+    server.shell(
+        name="Set hostname from Kresko metadata",
+        commands=[f"hostnamectl set-hostname {shlex.quote(str(host.data.kresko_name))}"],
+    )
+
+
 def pyinfra_run_command(command: str) -> None:
     from pyinfra.operations import server
 

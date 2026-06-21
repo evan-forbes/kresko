@@ -70,11 +70,20 @@ def fake_provider(fake: FakeDigitalOcean) -> dict[str, DigitalOceanProvider]:
     return {"digitalocean": DigitalOceanProvider(fake)}
 
 
+def fake_s3_runner(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    if len(cmd) > 2 and cmd[2] == "cp":
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    if len(cmd) > 2 and cmd[2] == "presign":
+        return subprocess.CompletedProcess(cmd, 0, "https://example.test/payload.tar.gz\n", "")
+    return subprocess.CompletedProcess(cmd, 1, "", "unexpected aws command")
+
+
 def make_fleet(home, fake, name="ci-abc", **kwargs) -> Fleet:
     fleet = Fleet(
         name,
         ssh={"key_name": "kresko-key"},
         providers=fake_provider(fake),
+        s3_runner=fake_s3_runner,
         **kwargs,
     )
     return fleet
@@ -89,6 +98,13 @@ def add_miners(fleet: Fleet, count: int = 1, **kwargs) -> Fleet:
         **kwargs,
     )
     return fleet
+
+
+def make_payload(tmp_path, name: str = "payload"):
+    payload = tmp_path / name
+    payload.mkdir()
+    (payload / "vars.sh").write_text('export KRESKO_FRESH_STATE="0"\n', encoding="utf-8")
+    return payload
 
 
 # --- construction ------------------------------------------------------------
@@ -240,9 +256,13 @@ def test_deploy_dry_run_writes_pyinfra_files(home):
 
     assert result["ok"] is True
     assert result["nodes"] == ["miner-0"]
+    assert result["delivery"] == "s3"
     assert calls == []
     assert (fleet.dir / "inventory.py").exists()
     assert (fleet.dir / "deploy_payload.py").exists()
+    body = (fleet.dir / "deploy_payload.py").read_text()
+    assert "pyinfra_deploy_s3" in body
+    assert "pyinfra_deploy_base" not in body
 
 
 def test_deploy_skips_failed_nodes(home):
@@ -317,6 +337,7 @@ def test_deploy_records_local_binary_provenance(home, tmp_path):
         f"zebrad_source=/build/zebra\nkresko_source=/build/kresko\n",
         encoding="utf-8",
     )
+    (payload_root / "vars.sh").write_text('export KRESKO_FRESH_STATE="0"\n', encoding="utf-8")
 
     fleet._pyinfra_runner = lambda i, d, dr: subprocess.CompletedProcess([], 0, "", "")
     result = fleet.deploy(payload=str(payload_root), role="miner")
@@ -325,19 +346,24 @@ def test_deploy_records_local_binary_provenance(home, tmp_path):
     assert binaries["zebrad"]["manifest_sha256"] == z_sha
     assert binaries["zebrad"]["staged_sha256"] == z_sha
     assert binaries["zebrad"]["source"] == "/build/zebra"
+    assert result["delivery"] == "s3"
+    assert result["payload_names"] == ["payload"]
+    assert "payload_s3_key" in result
+    assert "payload_archive_sha256" in result
 
 
-def test_deploy_parses_remote_provenance_lines(home):
+def test_deploy_parses_remote_provenance_lines(home, tmp_path):
     fleet = make_fleet(home, FakeDigitalOcean())
     add_miners(fleet, count=1)
     fleet.up()
+    payload = make_payload(tmp_path)
 
     fake_stdout = (
         "[miner-0] PROVENANCE: zebrad CHANGED (was=aaaa, now=bbbb)\n"
         "[miner-0] PROVENANCE: kresko unchanged (sha256=cccc)\n"
     )
     fleet._pyinfra_runner = lambda i, d, dr: subprocess.CompletedProcess([], 0, fake_stdout, "")
-    result = fleet.deploy(role="miner")
+    result = fleet.deploy(payload=str(payload), role="miner")
 
     remote = result["binary_provenance_remote"]
     assert any(b["binary"] == "zebrad" for b in remote["changed"])

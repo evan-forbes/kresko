@@ -43,7 +43,7 @@ require_line() {
 
 echo "=== Installing public-node dependencies ==="
 apt_retry update -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-apt_retry install -y curl jq chrony tmux btop nethogs
+apt_retry install -y aria2 curl jq chrony tmux btop nethogs zstd
 
 echo "=== Configuring time sync ==="
 systemctl enable chrony
@@ -59,10 +59,18 @@ net.core.default_qdisc=fq_codel
 EOF
 sysctl --load "$KRESKO_SYSCTL_FILE"
 
-echo "=== Extracting payload ==="
-rm -rf /root/payload
-tar -xzf "/root/${ARCHIVE_NAME}" -C /root/
-source /root/payload/vars.sh
+echo "=== Locating payload ==="
+if [ -f /root/kresko/payload/vars.sh ]; then
+    payload_root="/root/kresko/payload"
+elif [ -f "/root/${ARCHIVE_NAME}" ]; then
+    rm -rf /root/payload
+    tar -xzf "/root/${ARCHIVE_NAME}" -C /root/
+    payload_root="/root/payload"
+else
+    echo "ERROR: no synced payload directory or /root/${ARCHIVE_NAME} archive found" >&2
+    exit 1
+fi
+source "${payload_root}/vars.sh"
 
 KRESKO_NETWORK_KIND="${KRESKO_NETWORK_KIND:-}"
 KRESKO_RPC_PORT="${KRESKO_RPC_PORT:-8232}"
@@ -74,6 +82,9 @@ KRESKO_FRESH_STATE="${KRESKO_FRESH_STATE:-0}"
 # The operator is responsible for pointing at a snapshot for the *right*
 # network — a mainnet snapshot on a testnet node will not verify.
 KRESKO_STATE_SNAPSHOT_URL="${KRESKO_STATE_SNAPSHOT_URL:-}"
+KRESKO_STATE_SNAPSHOT_URLS="${KRESKO_STATE_SNAPSHOT_URLS:-}"
+KRESKO_STATE_SNAPSHOT_SHA256="${KRESKO_STATE_SNAPSHOT_SHA256:-}"
+KRESKO_STATE_SNAPSHOT_ARCHIVE="${KRESKO_STATE_SNAPSHOT_ARCHIVE:-kresko-state-snapshot.tar.gz}"
 
 case "$KRESKO_NETWORK_KIND" in
     mainnet|public-testnet)
@@ -106,7 +117,7 @@ done
 cd "$HOME"
 hostname=$(hostname)
 parsed_hostname=$(echo "$hostname" | awk -F'-' '{print $1 "-" $2}')
-node_payload_dir="/root/payload/${parsed_hostname}"
+node_payload_dir="${payload_root}/${parsed_hostname}"
 
 if [ ! -d "$node_payload_dir" ]; then
     echo "ERROR: no payload directory for host '${parsed_hostname}' at ${node_payload_dir}" >&2
@@ -114,8 +125,8 @@ if [ ! -d "$node_payload_dir" ]; then
 fi
 
 echo "=== Installing binaries ==="
-install_binary_atomic /root/payload/build/zebrad /usr/local/bin/zebrad
-install_binary_atomic /root/payload/build/kresko /usr/local/bin/kresko
+install_binary_atomic "${payload_root}/build/zebrad" /usr/local/bin/zebrad
+install_binary_atomic "${payload_root}/build/kresko" /usr/local/bin/kresko
 
 echo "=== Setting up zebra config ==="
 if [ "$KRESKO_FRESH_STATE" = "1" ]; then
@@ -126,20 +137,38 @@ else
 fi
 mkdir -p /root/.cache/zebra
 
-if [ -n "$KRESKO_STATE_SNAPSHOT_URL" ]; then
+if [ -n "$KRESKO_STATE_SNAPSHOT_URLS" ] || [ -n "$KRESKO_STATE_SNAPSHOT_URL" ]; then
     if [ -d /root/.cache/zebra/state ] && [ -n "$(ls -A /root/.cache/zebra/state 2>/dev/null)" ]; then
         echo "=== State cache already present; skipping snapshot ==="
     else
-        echo "=== Hydrating zebra state from snapshot: ${KRESKO_STATE_SNAPSHOT_URL} ==="
-        if curl -fSL --retry 3 --retry-connrefused --retry-delay 5 \
-            --connect-timeout 10 --speed-time 120 --speed-limit 1024 \
-            -o /tmp/kresko-state-snapshot.tar.gz "$KRESKO_STATE_SNAPSHOT_URL" \
-            && tar -xzf /tmp/kresko-state-snapshot.tar.gz -C /root/.cache/zebra; then
-            rm -f /tmp/kresko-state-snapshot.tar.gz
+        snapshot_archive="/tmp/${KRESKO_STATE_SNAPSHOT_ARCHIVE}"
+        snapshot_urls="${KRESKO_STATE_SNAPSHOT_URLS:-$KRESKO_STATE_SNAPSHOT_URL}"
+        echo "=== Hydrating zebra state from snapshot: ${snapshot_urls} ==="
+        aria2_args=(-x16 -s16 --continue=true --allow-overwrite=true -d /tmp -o "$KRESKO_STATE_SNAPSHOT_ARCHIVE")
+        if [ -n "$KRESKO_STATE_SNAPSHOT_SHA256" ]; then
+            aria2_args+=("--checksum=sha-256=${KRESKO_STATE_SNAPSHOT_SHA256}")
+        fi
+        if aria2c "${aria2_args[@]}" ${snapshot_urls}; then
+            case "$snapshot_archive" in
+                *.tar.zst)
+                    zstd -dc "$snapshot_archive" | tar -x -C /root/.cache/zebra
+                    ;;
+                *.tar.gz|*.tgz)
+                    tar -xzf "$snapshot_archive" -C /root/.cache/zebra
+                    ;;
+                *.tar)
+                    tar -xf "$snapshot_archive" -C /root/.cache/zebra
+                    ;;
+                *)
+                    echo "ERROR: unsupported snapshot archive extension: ${snapshot_archive}" >&2
+                    exit 1
+                    ;;
+            esac
+            rm -f "$snapshot_archive"
             echo "=== Snapshot extracted; zebrad will resume from the snapshot height ==="
         else
             status=$?
-            rm -f /tmp/kresko-state-snapshot.tar.gz
+            rm -f "$snapshot_archive"
             echo "=== Snapshot hydration failed with exit ${status}; falling back to P2P block sync ==="
         fi
     fi
@@ -163,6 +192,11 @@ else
     require_line '^[[:space:]]*initial_testnet_peers[[:space:]]*=' /root/.config/zebrad.toml "testnet seed peers"
 fi
 require_line '^[[:space:]]*external_addr[[:space:]]*=' /root/.config/zebrad.toml "external address"
+require_line '^[[:space:]]*v2_p2p[[:space:]]*=[[:space:]]*true' /root/.config/zebrad.toml "Zakura P2P enablement"
+require_line '^[[:space:]]*legacy_p2p[[:space:]]*=[[:space:]]*(true|false)' /root/.config/zebrad.toml "legacy Zebra P2P setting"
+require_line '^[[:space:]]*zakura_node_secret_key[[:space:]]*=' /root/.config/zebrad.toml "stable Zakura node identity"
+require_line '^[[:space:]]*listen_addr[[:space:]]*=[[:space:]]*"0\.0\.0\.0:8234"' /root/.config/zebrad.toml "Zakura P2P listen address"
+require_line '^[[:space:]]*bootstrap_peers[[:space:]]*=' /root/.config/zebrad.toml "Zakura bootstrap peers"
 
 echo "=== Public node: ${parsed_hostname} (${KRESKO_NETWORK_KIND}) ==="
 echo "=== RPC port: ${KRESKO_RPC_PORT}; P2P port: ${KRESKO_P2P_PORT} ==="

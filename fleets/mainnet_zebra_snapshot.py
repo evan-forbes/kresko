@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Mainnet Zakura fleet orchestration.
-
-This script keeps the long-running mainnet Zakura workflow in one reusable
-place while the Fleet API owns provisioning, deploy, run, collect, and down.
-"""
+"""Seven-node mainnet Zebra fleet bootstrapped from a verified state snapshot."""
 
 from __future__ import annotations
 
@@ -16,48 +12,75 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from fleets import mainnet_zebra_snapshot
 from kresko import DigitalOcean, Fleet
-from kresko import assets as assets_store
+from kresko.env import load_experiment_env
 from kresko.fleet import TRACE_COLLECTION_PATHS
 
 
-DEFAULT_FLEET = "mainnet-zakura"
-DEFAULT_SIZE = "s-4vcpu-8gb"
+DEFAULT_FLEET = "mainnet-zebra-snapshot"
+DEFAULT_SIZE = "so1_5-4vcpu-32gb"
 DEFAULT_IMAGE = "ubuntu-24-04-x64"
-DEFAULT_REGIONS = {
-    "asia": "sgp1",
-    "us": "nyc3",
-    "europe": "fra1",
-}
-PR17_HEAD_SHA = "d5649f8111eb19350a1818303586463b308af5fc"
-DEFAULT_ZAKURA_ROOT = "/home/evan/src/valar/zakura"
+DEFAULT_ZEBRA_ROOT = "/home/evan/src/valar/zebra"
+DEFAULT_SNAPSHOT_ARCHIVE = "zebra-mainnet-20260612T230854Z-3375822.tar.zst"
+DEFAULT_SNAPSHOT_SHA256 = "834f8e41c129f90f6c6ce4fd964704cbeeaca2dde87ae9023854645e3a407440"
+DEFAULT_SNAPSHOT_URLS = [
+    "https://zebra-snapshots.nyc3.cdn.digitaloceanspaces.com/mainnet/"
+    "zebra-mainnet-20260612T230854Z-3375822.tar.zst",
+    "https://zebra-snapshots-ams3.ams3.digitaloceanspaces.com/mainnet/"
+    "zebra-mainnet-20260612T230854Z-3375822.tar.zst",
+    "https://zebra-snapshots-sgp1.sgp1.digitaloceanspaces.com/mainnet/"
+    "zebra-mainnet-20260612T230854Z-3375822.tar.zst",
+]
+DEFAULT_NODE_SPECS = [
+    ("us-east", "nyc3", "so1_5-4vcpu-32gb-intel"),
+    ("us-west", "sfo3", "so1_5-4vcpu-32gb-intel"),
+    ("canada", "tor1", "so1_5-4vcpu-32gb-intel"),
+    ("europe-west", "lon1", "so1_5-4vcpu-32gb"),
+    ("europe-central", "ams3", "so1_5-4vcpu-32gb-intel"),
+    ("asia-south", "blr1", "so1_5-4vcpu-32gb"),
+    ("asia-pacific", "syd1", "so1_5-4vcpu-32gb"),
+]
 DEFAULT_TRACE_FILTER = "info,zebrad=debug,zebra_network=debug,zebra_state=debug,zebra_rpc=debug"
-DEFAULT_TRACE_LOG_FILE = "/root/logs/zakura-tracing.log"
+DEFAULT_TRACE_LOG_FILE = "/root/logs/zebra-tracing.log"
 FAST_BLOCK_SYNC_PEER_TARGET = 100
 FAST_BLOCK_SYNC_DOWNLOAD_CONCURRENCY_LIMIT = 100
 ZAKURA_P2P_PORT = 8234
 ZAKURA_MESSAGE_RATE_PER_SECOND = 4000
+ZAKURA_ONLY_NODE_NAMES = {"asia-pacific-0", "europe-central-0"}
 ZAKURA_NODE_IDENTITIES = {
-    "asia-0": (
-        "0808080808080808080808080808080808080808080808080808080808080808",
-        "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca",
+    "us-east-0": (
+        "3761696e6e65742d7a656272612d736e617073686f743a75732d656173742d95",
+        "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4",
     ),
-    "us-0": (
-        "0909090909090909090909090909090909090909090909090909090909090909",
-        "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618",
+    "us-west-0": (
+        "24727a7f7f76853e8b767383723e847f7281847980854b86843e887684853ee4",
+        "bd3dc5d2a3d44c6bf90e364bf446231dbf9737e38a562ccf9e91ea631ea59b22",
     ),
-    "europe-0": (
-        "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
-        "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+    "canada-0": (
+        "d5838b909087964f9c878494834f95908392958a91965c8583908386834f52a5",
+        "14ab98fa0c4b07d40119e1dbc9f3c36d20c8f226ae5ba4216218a2034f148e57",
+    ),
+    "europe-west-0": (
+        "5c33fcc2a198a760ad9895a59460a6a194a3a69ba2a76d98a8a5a2a39860aa3d",
+        "681d21b18644cd82ec13256a97f92bec1fff815683ef6f65dc7c993f098a4fe5",
+    ),
+    "europe-central-0": (
+        "591d1b1702d8cc71bea9a6b6a571b7b2a5b4b7acb3b87ea9b9b6b3b4a971a70c",
+        "058b3f20dc9bef7bb447f94d7663d793cfbc036720f97e52d7f13661b21818e1",
+    ),
+    "asia-south-0": (
+        "25343bc3c3bac982cfbab7c7b682c8c3b6c5c8bdc4c98fb6c8beb682c8c4ca6c",
+        "291323d78eb7186c3fa225ef5e305e95363e0ef06d42dca91bd4ef0254aed1ae",
+    ),
+    "asia-pacific-0": (
+        "4508064742cbda93e0cbc8d8c793d9d4c7d6d9ced5daa0c7d9cfc793d6c7c96a",
+        "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084",
     ),
 }
-SNAPSHOT_FLEET_TAG = "fleet-mainnet-zebra-snapshot"
-SNAPSHOT_ZAKURA_NODE_IDENTITIES = mainnet_zebra_snapshot.ZAKURA_NODE_IDENTITIES
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Operate the mainnet Zakura fleet")
+    parser = argparse.ArgumentParser(description="Operate the snapshot-bootstrapped mainnet Zebra fleet")
     parser.add_argument(
         "action",
         choices=[
@@ -73,10 +96,11 @@ def main(argv: list[str] | None = None) -> int:
         ],
     )
     parser.add_argument("--dry-run", action="store_true", help="plan without running remote mutations")
-    parser.add_argument("--zebrad-binary", help="prebuilt Zakura zebrad binary for payload generation")
-    parser.add_argument("--skip-build", action="store_true", help="payload action: do not build Zakura")
+    parser.add_argument("--zebrad-binary", help="prebuilt Zebra zebrad binary for payload generation")
+    parser.add_argument("--skip-build", action="store_true", help="payload action: do not build Zebra")
     args = parser.parse_args(argv)
 
+    load_default_env()
     require_valar_do_token()
     fleet = make_fleet()
 
@@ -85,25 +109,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.action == "up":
         return print_result(fleet.up(dry_run=args.dry_run))
     if args.action == "build":
-        return print_result(build_zakura(fleet))
+        return print_result(build_zebra(fleet))
     if args.action == "payload":
         zebrad_binary = args.zebrad_binary
         provenance: dict[str, Any] = {}
         if not zebrad_binary and not args.skip_build:
-            provenance = build_zakura(fleet)
+            provenance = build_zebra(fleet)
             zebrad_binary = provenance["binary"]
         if not zebrad_binary:
             raise SystemExit("--zebrad-binary is required with --skip-build")
         return print_result(generate_payload(fleet, Path(zebrad_binary), provenance=provenance))
     if args.action == "deploy":
-        return print_result(
-            fleet.deploy(str(fleet.dir / "payload"), state_snapshot=True, dry_run=args.dry_run)
-        )
+        return print_result(fleet.deploy(str(fleet.dir / "payload"), dry_run=args.dry_run))
     if args.action == "start":
         return print_result(
             fleet.run(
                 "bash /root/kresko/payload/node_init.sh",
-                background="zakura",
+                background="zebra",
                 log_path="/root/logs/node_init.log",
                 dry_run=args.dry_run,
             )
@@ -122,63 +144,75 @@ def require_valar_do_token(env: dict[str, str] | None = None) -> None:
     valar = target.get("VALAR_DO_TOKEN")
     if not valar:
         raise SystemExit(
-            "VALAR_DO_TOKEN is not set. The mainnet-zakura fleet uses only the "
-            "valar DigitalOcean account and will not silently fall back to a "
-            "different DIGITALOCEAN_TOKEN. Export VALAR_DO_TOKEN and retry."
+            "VALAR_DO_TOKEN is not set. This mainnet fleet uses the valar "
+            "DigitalOcean account and will not fall back to DIGITALOCEAN_TOKEN."
         )
-    # VALAR_DO_TOKEN is authoritative for this fleet: pin provisioning to the
-    # valar DigitalOcean account, overriding any stale DIGITALOCEAN_TOKEN that
-    # may be lingering in the shell.
     target["DIGITALOCEAN_TOKEN"] = valar
 
 
 def make_fleet(env: dict[str, str] | None = None) -> Fleet:
     target = os.environ if env is None else env
+    if env is None:
+        load_default_env()
     require_valar_do_token(target)
 
-    fleet_name = target.get("KRESKO_FLEET", DEFAULT_FLEET)
     ssh = {
         "key_name": target.get("KRESKO_SSH_KEY_NAME", ""),
         "key_path": target.get("KRESKO_SSH_KEY_PATH", ""),
     }
-    fleet = Fleet(fleet_name, tags=["zakura", "mainnet"], ssh=ssh)
-    for prefix, region in regions(target).items():
+    fleet = Fleet(target.get("KRESKO_FLEET", DEFAULT_FLEET), tags=["zebra", "mainnet"], ssh=ssh)
+    for prefix, region, default_size in node_specs(target):
         fleet.add(
             "node",
             count=1,
             name_prefix=prefix,
             provider=DigitalOcean(
                 region=region,
-                size=target.get("KRESKO_DO_SIZE", DEFAULT_SIZE),
+                size=target.get("KRESKO_DO_SIZE", default_size),
                 image=target.get("KRESKO_DO_IMAGE", DEFAULT_IMAGE),
-                tags=["zakura", "mainnet"],
+                tags=["zebra", "mainnet", "snapshot"],
             ),
         )
     return fleet
 
 
-def regions(env: dict[str, str] | None = None) -> dict[str, str]:
-    target = os.environ if env is None else env
-    if target.get("KRESKO_ZAKURA_REGIONS"):
-        values = [v.strip() for v in target["KRESKO_ZAKURA_REGIONS"].split(",") if v.strip()]
-        if len(values) != 3:
-            raise ValueError("KRESKO_ZAKURA_REGIONS must contain exactly three comma-separated slugs")
-        return dict(zip(("asia", "us", "europe"), values, strict=True))
-    return {
-        "asia": target.get("KRESKO_ASIA_REGION", DEFAULT_REGIONS["asia"]),
-        "us": target.get("KRESKO_US_REGION", DEFAULT_REGIONS["us"]),
-        "europe": target.get("KRESKO_EUROPE_REGION", DEFAULT_REGIONS["europe"]),
-    }
+def load_default_env() -> None:
+    load_experiment_env(experiment_root=repo_root())
 
 
-def build_zakura(fleet: Fleet, env: dict[str, str] | None = None) -> dict[str, Any]:
+def node_specs(env: dict[str, str] | None = None) -> list[tuple[str, str, str]]:
     target = os.environ if env is None else env
-    root = Path(target.get("ZAKURA_ROOT", DEFAULT_ZAKURA_ROOT)).expanduser()
-    ref = target.get("ZAKURA_REF", PR17_HEAD_SHA)
+    raw = target.get("KRESKO_ZEBRA_SNAPSHOT_REGIONS", "")
+    if not raw:
+        return list(DEFAULT_NODE_SPECS)
+    specs: list[tuple[str, str, str]] = []
+    for item in [part.strip() for part in raw.split(",") if part.strip()]:
+        if ":" not in item:
+            raise ValueError(
+                "KRESKO_ZEBRA_SNAPSHOT_REGIONS entries must be prefix:region[:size]"
+            )
+        parts = [part.strip() for part in item.split(":")]
+        if len(parts) not in (2, 3):
+            raise ValueError(
+                "KRESKO_ZEBRA_SNAPSHOT_REGIONS entries must be prefix:region[:size]"
+            )
+        prefix, region = parts[:2]
+        size = parts[2] if len(parts) == 3 else target.get("KRESKO_DO_SIZE", DEFAULT_SIZE)
+        if not prefix or not region:
+            raise ValueError(
+                "KRESKO_ZEBRA_SNAPSHOT_REGIONS entries must be prefix:region[:size]"
+            )
+        specs.append((prefix, region, size))
+    if len(specs) != 7:
+        raise ValueError("KRESKO_ZEBRA_SNAPSHOT_REGIONS must contain exactly seven entries")
+    return specs
+
+
+def build_zebra(fleet: Fleet, env: dict[str, str] | None = None) -> dict[str, Any]:
+    target = os.environ if env is None else env
+    root = Path(target.get("ZEBRA_ROOT", DEFAULT_ZEBRA_ROOT)).expanduser()
     build_command = ["cargo", "xtask", "package", "ubuntu"]
 
-    run(["git", "-C", str(root), "checkout", ref])
-    patched_files = patch_zakura_fast_sync_defaults(root)
     run(build_command, cwd=root)
     commit = capture(["git", "-C", str(root), "rev-parse", "HEAD"])
     binary = root / "target" / "ubuntu" / "zebra"
@@ -187,17 +221,14 @@ def build_zakura(fleet: Fleet, env: dict[str, str] | None = None) -> dict[str, A
 
     provenance = {
         "repo": str(root),
-        "ref": ref,
         "commit": commit,
         "binary": str(binary),
         "binary_sha256": sha256_file(binary),
         "build_command": " ".join(build_command),
-        "fallback_ref": ref == PR17_HEAD_SHA,
         "fast_block_sync_peer_target": FAST_BLOCK_SYNC_PEER_TARGET,
         "fast_block_sync_download_concurrency_limit": FAST_BLOCK_SYNC_DOWNLOAD_CONCURRENCY_LIMIT,
-        "fast_block_sync_patched_files": [str(path) for path in patched_files],
     }
-    (fleet.dir / "zakura-build.json").write_text(
+    (fleet.dir / "zebra-build.json").write_text(
         json.dumps(provenance, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
@@ -229,6 +260,7 @@ def generate_payload(
         fleet.dir / "payload" / "node_init.sh",
     )
     tune_payload_zebrad_configs(fleet.dir / "payload", fleet_assets=fleet.fleet_assets())
+    append_snapshot_env(fleet.dir / "payload" / "vars.sh")
     append_tracing_env(fleet.dir / "payload" / "vars.sh")
     manifest = write_payload_manifest(fleet.dir / "payload" / "build", zebrad_binary, provenance)
     return {
@@ -239,33 +271,80 @@ def generate_payload(
         "payload": str(fleet.dir / "payload"),
         "manifest": str(manifest),
         "trace_paths": TRACE_COLLECTION_PATHS,
+        "snapshot_archive": snapshot_archive(),
+        "snapshot_sha256": snapshot_sha256(),
+        "snapshot_urls": snapshot_urls(),
         "fast_block_sync": fast_block_sync_payload(),
     }
 
 
-def patch_zakura_fast_sync_defaults(root: Path) -> list[Path]:
-    patches = [
-        (
-            root / "zebra-network" / "src" / "constants.rs",
-            "pub const DEFAULT_PEERSET_INITIAL_TARGET_SIZE: usize = 25;",
-            f"pub const DEFAULT_PEERSET_INITIAL_TARGET_SIZE: usize = {FAST_BLOCK_SYNC_PEER_TARGET};",
-        ),
-        (
-            root / "zebrad" / "src" / "components" / "sync.rs",
-            "download_concurrency_limit: 50,",
-            f"download_concurrency_limit: {FAST_BLOCK_SYNC_DOWNLOAD_CONCURRENCY_LIMIT},",
-        ),
-    ]
-    patched = []
-    for path, old, new in patches:
-        text = path.read_text(encoding="utf-8")
-        if new in text:
-            continue
-        if old not in text:
-            raise RuntimeError(f"cannot patch {path}: expected text not found")
-        path.write_text(text.replace(old, new, 1), encoding="utf-8")
-        patched.append(path)
-    return patched
+def write_public_config(fleet: Fleet) -> Path:
+    assets = sorted(fleet.fleet_assets(), key=lambda item: item.get("name", ""))
+    if not assets:
+        raise RuntimeError("no fleet assets found; run the up action before payload")
+
+    config = {
+        "miners": [asset_to_instance(asset) for asset in assets],
+        "chain_id": "mainnet-zebra-snapshot",
+        "experiment": fleet.name,
+        "ssh_pub_key_path": fleet.ssh.get("public_key_path", ""),
+        "ssh_key_name": fleet.ssh.get("key_name", ""),
+        "ssh_key_path": fleet.ssh.get("key_path", ""),
+        "provider": "digitalocean",
+        "network_kind": "mainnet",
+        "mining_mode": "generate",
+        "equihash_params": "common",
+        "local_genesis": None,
+    }
+    path = fleet.dir / "config.json"
+    path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def asset_to_instance(asset: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "node_type": "miner",
+        "public_ip": asset.get("public_ip", ""),
+        "private_ip": asset.get("private_ip", ""),
+        "provider": asset.get("provider", "digitalocean"),
+        "slug": asset.get("size", ""),
+        "region": asset.get("region", ""),
+        "name": asset.get("name", ""),
+        "tags": list(asset.get("tags", [])),
+        "tier": "full",
+    }
+
+
+def append_snapshot_env(vars_path: Path, env: dict[str, str] | None = None) -> None:
+    marker = "# Zebra mainnet state snapshot"
+    text = vars_path.read_text(encoding="utf-8")
+    if marker in text:
+        return
+    with vars_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "\n"
+            f"{marker}\n"
+            f"export KRESKO_STATE_SNAPSHOT_ARCHIVE=\"{snapshot_archive(env)}\"\n"
+            f"export KRESKO_STATE_SNAPSHOT_SHA256=\"{snapshot_sha256(env)}\"\n"
+            f"export KRESKO_STATE_SNAPSHOT_URLS=\"{snapshot_urls_shell(env)}\"\n"
+        )
+
+
+def append_tracing_env(vars_path: Path, env: dict[str, str] | None = None) -> None:
+    target = os.environ if env is None else env
+    marker = "# Zebra tracing"
+    text = vars_path.read_text(encoding="utf-8")
+    if marker in text:
+        return
+    trace_filter = target.get("ZEBRA_TRACING__FILTER", DEFAULT_TRACE_FILTER)
+    trace_log = target.get("ZEBRA_TRACING__LOG_FILE", DEFAULT_TRACE_LOG_FILE)
+    with vars_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "\n"
+            f"{marker}\n"
+            f"export ZEBRA_TRACING__FILTER=\"${{ZEBRA_TRACING__FILTER:-{trace_filter}}}\"\n"
+            f"export ZEBRA_TRACING__LOG_FILE=\"${{ZEBRA_TRACING__LOG_FILE:-{trace_log}}}\"\n"
+        )
 
 
 def tune_payload_zebrad_configs(
@@ -287,7 +366,6 @@ def tune_payload_zebrad_configs(
         for asset in assets
         if asset.get("name") in ZAKURA_NODE_IDENTITIES and asset.get("public_ip")
     }
-    snapshot_bootstrap_peers = snapshot_zakura_bootstrap_peers()
 
     tuned = []
     for path in sorted(payload_dir.glob("*/zebrad.toml")):
@@ -303,7 +381,6 @@ def tune_payload_zebrad_configs(
             for peer_name, peer in sorted(zakura_bootstrap.items())
             if peer_name != node_name
         ]
-        bootstrap_peers.extend(snapshot_bootstrap_peers)
         text = path.read_text(encoding="utf-8")
         next_text = set_toml_value(
             text,
@@ -311,9 +388,16 @@ def tune_payload_zebrad_configs(
             "peerset_initial_target_size",
             str(FAST_BLOCK_SYNC_PEER_TARGET),
         )
-        next_text = set_toml_array(next_text, "network", "initial_mainnet_peers", [])
+        zakura_only = node_name in ZAKURA_ONLY_NODE_NAMES
+        if zakura_only:
+            next_text = set_toml_array(next_text, "network", "initial_mainnet_peers", [])
         next_text = set_toml_value(next_text, "network", "v2_p2p", "true")
-        next_text = set_toml_value(next_text, "network", "legacy_p2p", "false")
+        next_text = set_toml_value(
+            next_text,
+            "network",
+            "legacy_p2p",
+            "false" if zakura_only else "true",
+        )
         next_text = set_toml_value(
             next_text,
             "network",
@@ -344,12 +428,13 @@ def tune_payload_zebrad_configs(
             "bootstrap_peers",
             bootstrap_peers,
         )
-        next_text = set_toml_value(
-            next_text,
-            "network.zakura.block_sync",
-            "replace_legacy_syncer",
-            "true",
-        )
+        if zakura_only:
+            next_text = set_toml_value(
+                next_text,
+                "network.zakura.block_sync",
+                "replace_legacy_syncer",
+                "true",
+            )
         next_text = set_toml_value(
             next_text,
             "sync",
@@ -360,25 +445,6 @@ def tune_payload_zebrad_configs(
             path.write_text(next_text, encoding="utf-8")
             tuned.append(path)
     return tuned
-
-
-def snapshot_zakura_bootstrap_peers(
-    fleet_assets: list[dict[str, Any]] | None = None,
-) -> list[str]:
-    assets = fleet_assets
-    if assets is None:
-        assets = assets_store.list_assets(tags=[SNAPSHOT_FLEET_TAG])
-    peers = []
-    for asset in sorted(assets, key=lambda item: item.get("name", "")):
-        node_name = asset.get("name")
-        public_ip = asset.get("public_ip")
-        if not node_name or not public_ip:
-            continue
-        identity = SNAPSHOT_ZAKURA_NODE_IDENTITIES.get(node_name)
-        if not identity:
-            continue
-        peers.append(f"{identity[1]}@{public_ip}:{ZAKURA_P2P_PORT}")
-    return peers
 
 
 def payload_dir_name(node_name: str) -> str:
@@ -460,67 +526,6 @@ def set_toml_block(text: str, section: str, key: str, block: list[str]) -> str:
     return "".join(lines)
 
 
-def fast_block_sync_payload() -> dict[str, int]:
-    return {
-        "peerset_initial_target_size": FAST_BLOCK_SYNC_PEER_TARGET,
-        "download_concurrency_limit": FAST_BLOCK_SYNC_DOWNLOAD_CONCURRENCY_LIMIT,
-    }
-
-
-def write_public_config(fleet: Fleet) -> Path:
-    assets = sorted(fleet.fleet_assets(), key=lambda item: item.get("name", ""))
-    if not assets:
-        raise RuntimeError("no fleet assets found; run the up action before payload")
-
-    config = {
-        "miners": [asset_to_instance(asset) for asset in assets],
-        "chain_id": "mainnet-zakura",
-        "experiment": fleet.name,
-        "ssh_pub_key_path": fleet.ssh.get("public_key_path", ""),
-        "ssh_key_name": fleet.ssh.get("key_name", ""),
-        "ssh_key_path": fleet.ssh.get("key_path", ""),
-        "provider": "digitalocean",
-        "network_kind": "mainnet",
-        "mining_mode": "generate",
-        "equihash_params": "common",
-        "local_genesis": None,
-    }
-    path = fleet.dir / "config.json"
-    path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return path
-
-
-def asset_to_instance(asset: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "node_type": "miner",
-        "public_ip": asset.get("public_ip", ""),
-        "private_ip": asset.get("private_ip", ""),
-        "provider": asset.get("provider", "digitalocean"),
-        "slug": asset.get("size", ""),
-        "region": asset.get("region", ""),
-        "name": asset.get("name", ""),
-        "tags": list(asset.get("tags", [])),
-        "tier": "full",
-    }
-
-
-def append_tracing_env(vars_path: Path, env: dict[str, str] | None = None) -> None:
-    target = os.environ if env is None else env
-    marker = "# Zakura tracing"
-    text = vars_path.read_text(encoding="utf-8")
-    if marker in text:
-        return
-    trace_filter = target.get("ZEBRA_TRACING__FILTER", DEFAULT_TRACE_FILTER)
-    trace_log = target.get("ZEBRA_TRACING__LOG_FILE", DEFAULT_TRACE_LOG_FILE)
-    with vars_path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            "\n"
-            f"{marker}\n"
-            f"export ZEBRA_TRACING__FILTER=\"${{ZEBRA_TRACING__FILTER:-{trace_filter}}}\"\n"
-            f"export ZEBRA_TRACING__LOG_FILE=\"${{ZEBRA_TRACING__LOG_FILE:-{trace_log}}}\"\n"
-        )
-
-
 def write_payload_manifest(
     build_dir: Path,
     zebrad_binary: Path,
@@ -529,7 +534,6 @@ def write_payload_manifest(
     manifest = build_dir / "manifest.txt"
     fields = {
         "zebrad_source": str((provenance or {}).get("repo", zebrad_binary.parent)),
-        "zebrad_ref": str((provenance or {}).get("ref", "")),
         "zebrad_commit": str((provenance or {}).get("commit", "")),
         "zebrad_sha256": sha256_file(build_dir / "zebrad"),
         "zebrad_build_command": str((provenance or {}).get("build_command", "")),
@@ -563,11 +567,42 @@ def plan_payload(fleet: Fleet) -> dict[str, Any]:
             }
             for node in desired
         ],
-        "zakura_root": os.environ.get("ZAKURA_ROOT", DEFAULT_ZAKURA_ROOT),
-        "zakura_ref": os.environ.get("ZAKURA_REF", PR17_HEAD_SHA),
+        "zebra_root": os.environ.get("ZEBRA_ROOT", DEFAULT_ZEBRA_ROOT),
         "trace_paths": TRACE_COLLECTION_PATHS,
+        "snapshot_archive": snapshot_archive(),
+        "snapshot_sha256": snapshot_sha256(),
+        "snapshot_urls": snapshot_urls(),
         "fast_block_sync": fast_block_sync_payload(),
     }
+
+
+def fast_block_sync_payload() -> dict[str, int]:
+    return {
+        "peerset_initial_target_size": FAST_BLOCK_SYNC_PEER_TARGET,
+        "download_concurrency_limit": FAST_BLOCK_SYNC_DOWNLOAD_CONCURRENCY_LIMIT,
+    }
+
+
+def snapshot_archive(env: dict[str, str] | None = None) -> str:
+    target = os.environ if env is None else env
+    return target.get("KRESKO_STATE_SNAPSHOT_ARCHIVE", DEFAULT_SNAPSHOT_ARCHIVE)
+
+
+def snapshot_sha256(env: dict[str, str] | None = None) -> str:
+    target = os.environ if env is None else env
+    return target.get("KRESKO_STATE_SNAPSHOT_SHA256", DEFAULT_SNAPSHOT_SHA256)
+
+
+def snapshot_urls(env: dict[str, str] | None = None) -> list[str]:
+    target = os.environ if env is None else env
+    raw = target.get("KRESKO_STATE_SNAPSHOT_URLS", "")
+    if raw:
+        return [url.strip() for url in raw.split() if url.strip()]
+    return list(DEFAULT_SNAPSHOT_URLS)
+
+
+def snapshot_urls_shell(env: dict[str, str] | None = None) -> str:
+    return " ".join(snapshot_urls(env))
 
 
 def find_kresko_binary() -> Path:

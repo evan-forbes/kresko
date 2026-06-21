@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -30,9 +32,68 @@ def host_tuple(asset: dict[str, Any], ssh: dict[str, Any]) -> tuple[str, dict[st
         "kresko_size": asset.get("size", ""),
         "kresko_fleet": asset.get("fleet", ""),
     }
-    if ssh.get("key_path"):
-        data["ssh_key"] = ssh["key_path"]
+    key_path = ssh.get("key_path")
+    if key_path and _should_pin_ssh_key(str(key_path)):
+        data["ssh_key"] = key_path
     return public_ip, data
+
+
+def _should_pin_ssh_key(key_path: str) -> bool:
+    """Return true when pyinfra should load `key_path` directly.
+
+    Paramiko prompts for encrypted private-key passphrases when `ssh_key` is
+    pinned in inventory. If the same public key is already loaded in
+    ssh-agent, omitting `ssh_key` lets pyinfra authenticate non-interactively
+    through the agent instead.
+    """
+    if _truthy_env("KRESKO_SSH_FORCE_KEY_PATH"):
+        return True
+    return not _agent_has_configured_public_key(key_path)
+
+
+def _agent_has_configured_public_key(key_path: str) -> bool:
+    public_key_path = Path(f"{key_path}.pub").expanduser()
+    if not public_key_path.exists():
+        return False
+    configured_blob = _public_key_blob(public_key_path)
+    if not configured_blob:
+        return False
+    return configured_blob in _agent_public_key_blobs()
+
+
+def _public_key_blob(path: Path) -> str:
+    try:
+        parts = path.read_text(encoding="utf-8").strip().split()
+    except OSError:
+        return ""
+    return parts[1] if len(parts) >= 2 else ""
+
+
+def _agent_public_key_blobs() -> set[str]:
+    if not os.environ.get("SSH_AUTH_SOCK"):
+        return set()
+    try:
+        result = subprocess.run(
+            ["ssh-add", "-L"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if result.returncode != 0:
+        return set()
+    blobs: set[str] = set()
+    for line in result.stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 2:
+            blobs.add(parts[1])
+    return blobs
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def pyinfra_groups(

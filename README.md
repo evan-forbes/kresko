@@ -311,12 +311,11 @@ uv run kresko-fleet status "ci-$GIT_SHA" --json > result.json
 ## Notes and caveats
 
 - Experimental project: interfaces and behavior may change.
-- Payload transport differs by path. `fleet.deploy()` ships payloads to nodes
-  over the pyinfra SSH transport (`files.sync`/`files.put`). The S3
-  presigned-URL path (operator uploads to S3, node `curl`s a short-lived URL —
-  never scp/rsync) is used for the **explorer source** and the **public-testnet
-  join bundle**, where pushing large/owned artifacts to many nodes warrants it.
-  (Routing `fleet.deploy()` itself through S3 is a possible follow-up.)
+- Payload transport is S3-first. `fleet.deploy()` tars the selected payloads,
+  uploads the archive once to `AWS_S3_BUCKET`, presigns it, and each node
+  `curl`s and extracts it under `/root/kresko` — never into `/root` and never
+  by repeated scp/rsync uploads. The explorer source uses the same presigned-URL
+  contract.
 - `~/.kresko/` is per-user-per-host. Run from two machines and `assets/`
   diverges until each runs `kresko-fleet sync`.
 - Provider credentials are loaded from `~/.kresko/.env` (and a project `.env`).

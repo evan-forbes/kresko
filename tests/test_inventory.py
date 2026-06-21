@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+
 from kresko.inventory import pyinfra_groups
 
 
@@ -41,3 +43,48 @@ def test_inventory_omits_ssh_key_when_path_blank():
     groups = pyinfra_groups([_miner_asset()], {"user": "ubuntu", "key_path": ""})
     _host, data = groups["miner"][0]
     assert "ssh_key" not in data
+
+
+def test_inventory_omits_ssh_key_when_configured_key_is_loaded_in_agent(
+    monkeypatch, tmp_path
+):
+    key_path = tmp_path / "id_ed25519"
+    public_blob = "AAAAC3NzaC1lZDI1NTE5AAAAIKreskoLoadedAgentKey"
+    key_path.write_text("encrypted-private-key-placeholder\n", encoding="utf-8")
+    key_path.with_suffix(key_path.suffix + ".pub").write_text(
+        f"ssh-ed25519 {public_blob} test@example\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            ["ssh-add", "-L"],
+            0,
+            stdout=f"ssh-ed25519 {public_blob} test@example\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    groups = pyinfra_groups([_miner_asset()], {"user": "ubuntu", "key_path": str(key_path)})
+    _host, data = groups["miner"][0]
+
+    assert "ssh_key" not in data
+
+
+def test_inventory_can_force_key_path_even_when_agent_has_key(monkeypatch, tmp_path):
+    key_path = tmp_path / "id_ed25519"
+    public_blob = "AAAAC3NzaC1lZDI1NTE5AAAAIKreskoLoadedAgentKey"
+    key_path.write_text("encrypted-private-key-placeholder\n", encoding="utf-8")
+    key_path.with_suffix(key_path.suffix + ".pub").write_text(
+        f"ssh-ed25519 {public_blob} test@example\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    monkeypatch.setenv("KRESKO_SSH_FORCE_KEY_PATH", "1")
+
+    groups = pyinfra_groups([_miner_asset()], {"user": "ubuntu", "key_path": str(key_path)})
+    _host, data = groups["miner"][0]
+
+    assert data["ssh_key"] == str(key_path)

@@ -1,6 +1,9 @@
 /target
 /build
 
+# Live-fleet trace bundles downloaded for state-refactor debugging.
+/debug
+
 # Local Zebra co-development override; see .cargo/config.toml.example
 /.cargo/config.toml
 
