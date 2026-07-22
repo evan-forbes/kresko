@@ -79,6 +79,8 @@ pub struct LocalTestnetParameters {
     pub slow_start_interval: u32,
     pub pre_blossom_halving_interval: u32,
     pub activation_height: u32,
+    /// Whether the generated chain activates NU7 (see the activation table below).
+    pub activates_nu7: bool,
     /// One-time NU6.1 lockbox disbursements emitted in
     /// `[[network.testnet_parameters.lockbox_disbursements]]`. Kresko's
     /// default local-genesis path uses a zero-zat synthetic P2SH entry so
@@ -190,7 +192,7 @@ fn tune_public_block_sync(config: &mut toml::Value) {
 }
 
 fn zebra_default_config_value() -> Result<toml::Value> {
-    toml::Value::try_from(zebrad::config::ZebradConfig::default())
+    toml::Value::try_from(zebrad::config::ZakuradConfig::default())
         .context("failed to serialize Zebra default config")
 }
 
@@ -512,7 +514,10 @@ pub fn apply_local_testnet_parameters(
     // NU6.1 is the one-time ZIP-271 lockbox disbursement event. Local genesis
     // activates it at the same height as NU7 with a zero-zat synthetic
     // disbursement so Zebra's NU6.1 config validation is explicit.
-    for upgrade in [
+    // NU7 is written only when the generated chain activates it: declaring an
+    // activation the chain was not built for makes every block at that height
+    // unminable on a node whose build lacks the NU7 consensus branch id.
+    let mut upgrades = vec![
         "Overwinter",
         "Sapling",
         "Blossom",
@@ -521,8 +526,11 @@ pub fn apply_local_testnet_parameters(
         "NU5",
         "NU6",
         "NU6.1",
-        "NU7",
-    ] {
+    ];
+    if params.activates_nu7 {
+        upgrades.push("NU7");
+    }
+    for upgrade in upgrades {
         activation_heights.insert(
             upgrade.to_string(),
             toml::Value::Integer(i64::from(params.activation_height)),
@@ -845,7 +853,7 @@ mod tests {
         // path unless an experiment explicitly asks for it.
         let default_config = parsed(
             &toml::to_string_pretty(
-                &toml::Value::try_from(zebrad::config::ZebradConfig::default())
+                &toml::Value::try_from(zebrad::config::ZakuradConfig::default())
                     .expect("zebra default should serialize"),
             )
             .expect("zebra default should re-serialize"),
@@ -1122,6 +1130,7 @@ initial_mainnet_peers = []
             Some("tmExampleAddress".to_string()),
         );
         let params = LocalTestnetParameters {
+            activates_nu7: true,
             network_name: "ReadTestNet".to_string(),
             network_magic: [1, 2, 3, 4],
             target_difficulty_limit: "0x0f".to_string(),
@@ -1151,7 +1160,7 @@ initial_mainnet_peers = []
         // Trust upstream Zebra to define what fields a config has — kresko
         // only ever overlays a few mining-friendly knobs.
         let default_serialized = toml::to_string_pretty(
-            &toml::Value::try_from(zebrad::config::ZebradConfig::default())
+            &toml::Value::try_from(zebrad::config::ZakuradConfig::default())
                 .expect("zebra default should serialize"),
         )
         .expect("zebra default should re-serialize");
@@ -1178,6 +1187,7 @@ initial_mainnet_peers = []
         // target limit, checkpoints, activation heights) must round-trip
         // through apply_local_testnet_parameters intact.
         let params = LocalTestnetParameters {
+            activates_nu7: true,
             network_name: "RequiredFieldsNet".to_string(),
             network_magic: [9, 8, 7, 6],
             target_difficulty_limit: "0x1f".to_string(),
@@ -1262,6 +1272,7 @@ initial_mainnet_peers = []
         lockbox: Vec<LockboxDisbursement>,
     ) -> LocalTestnetParameters {
         LocalTestnetParameters {
+            activates_nu7: true,
             network_name: "CrossValTestNet".to_string(),
             network_magic: [4, 3, 2, 1],
             target_difficulty_limit: "0x0f".to_string(),
@@ -1394,6 +1405,7 @@ initial_mainnet_peers = []
     #[test]
     fn injects_local_testnet_parameters() {
         let params = LocalTestnetParameters {
+            activates_nu7: true,
             network_name: "LocalGenesisNet".to_string(),
             network_magic: [1, 2, 3, 4],
             target_difficulty_limit: "0x0f".to_string(),

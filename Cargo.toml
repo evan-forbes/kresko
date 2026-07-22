@@ -24,12 +24,16 @@ secp256k1 = "0.29"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 chrono = { version = "0.4", default-features = false }
-# NU7 testnet Zebra crates, pinned to a tagged release so Cargo fetches them
-# directly (no sibling checkout needed). Cargo.lock pins the exact commit.
-# For local Zebra co-development, see .cargo/config.toml.example.
-zebra-chain = { git = "https://github.com/valargroup/zebra", tag = "nu7-testnet-v0.1.0", features = ["internal-miner"] }
-zebrad = { git = "https://github.com/valargroup/zebra", tag = "nu7-testnet-v0.1.0" }
-zebra-jsonl-trace = { git = "https://github.com/valargroup/zebra", tag = "nu7-testnet-v0.1.0", version = "0.1.0" }
+# Zakura crates, pinned to a tagged release so Cargo fetches them directly (no
+# sibling checkout needed). Cargo.lock pins the exact commit. For local Zakura
+# co-development, see .cargo/config.toml.example.
+#
+# Kept under the `zebra_*` extern names via `package =` so the existing
+# `zebra_chain::...` paths throughout this crate keep compiling; Zakura is the
+# continuation of these crates under a new name.
+zebra-chain = { package = "zakura-chain", git = "https://github.com/zakura-core/zakura", tag = "v1.0.3-rc0", features = ["internal-miner"] }
+zebrad = { package = "zakura", git = "https://github.com/zakura-core/zakura", tag = "v1.0.3-rc0" }
+zebra-jsonl-trace = { package = "zakura-jsonl-trace", git = "https://github.com/zakura-core/zakura", tag = "v1.0.3-rc0" }
 zcash_primitives = { version = "0.26", features = ["transparent-inputs"] }
 zcash_protocol = "0.7"
 zcash_address = "0.10"
