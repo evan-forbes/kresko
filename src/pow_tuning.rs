@@ -378,7 +378,7 @@ pub fn benchmark_equihash_solver(inputs: PowBenchInputs) -> Result<PowBenchResul
         equihash_solutions = equihash_solutions.saturating_add(solved_headers.len());
         for solved_header in solved_headers {
             let hash = solved_header.hash();
-            if solved_header.solution.check(&solved_header).is_ok() {
+            if solved_header.solution.check(&solved_header, &network).is_ok() {
                 black_box(hash <= max_target);
                 mining_candidates = mining_candidates.saturating_add(1);
             }

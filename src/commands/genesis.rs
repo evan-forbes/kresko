@@ -310,6 +310,25 @@ struct PreparedLocalGenesis {
     payload_local_genesis_files: Vec<(String, Vec<u8>)>,
 }
 
+/// Latest network upgrade to activate on the generated local chain.
+///
+/// Defaults to Nu6_3: a release-profile zakurad compiles the Nu7 consensus
+/// branch id out entirely (it is test-gated pending librustzcash), so a chain
+/// that activates Nu7 cannot be mined -- every block at the activation height
+/// is rejected as WrongTransactionConsensusBranchId. Override with
+/// KRESKO_LATEST_NETWORK_UPGRADE=nu7 against a build that carries it.
+fn local_genesis_upgrade() -> NetworkUpgrade {
+    match std::env::var("KRESKO_LATEST_NETWORK_UPGRADE").ok().as_deref() {
+        Some("nu5") | Some("Nu5") => NetworkUpgrade::Nu5,
+        Some("nu6") | Some("Nu6") => NetworkUpgrade::Nu6,
+        Some("nu6_1") | Some("Nu6_1") => NetworkUpgrade::Nu6_1,
+        Some("nu6_2") | Some("Nu6_2") => NetworkUpgrade::Nu6_2,
+        Some("nu6_3") | Some("Nu6_3") => NetworkUpgrade::Nu6_3,
+        Some("nu7") | Some("Nu7") => NetworkUpgrade::Nu7,
+        _ => NetworkUpgrade::Nu6_3,
+    }
+}
+
 fn prepare_generated_local_genesis(
     config: &Config,
     miner_names: &[String],
@@ -323,7 +342,7 @@ fn prepare_generated_local_genesis(
     // for the configured DAA averaging window.
     let options = LocalTestnetGenesisOptions {
         network_name: local_network_name(&config.chain_id),
-        latest_network_upgrade: NetworkUpgrade::Nu7,
+        latest_network_upgrade: local_genesis_upgrade(),
         disable_pow,
         target_spacing_secs,
         seeded_tip_time: None,
@@ -338,7 +357,7 @@ fn prepare_generated_local_genesis(
         .network
         .parameters()
         .context("generated local genesis did not produce testnet parameters")?;
-    let activation_height = activation_height(&network_params, NetworkUpgrade::Nu7)?;
+    let activation_height = activation_height(&network_params, local_genesis_upgrade())?;
     let activation_heights = activation_heights(activation_height);
 
     let genesis_hex = generated
@@ -401,6 +420,7 @@ fn prepare_generated_local_genesis(
 
     Ok(PreparedLocalGenesis {
         local_testnet: LocalTestnetParameters {
+            activates_nu7: local_genesis.activation_heights.nu7.is_some(),
             network_name: local_genesis.network_name.clone(),
             network_magic: local_genesis.network_magic,
             target_difficulty_limit: local_genesis.target_difficulty_limit.clone(),
@@ -436,6 +456,7 @@ fn prepare_generated_local_genesis(
 }
 
 fn activation_heights(activation_height: u32) -> LocalGenesisActivationHeights {
+    let upgrade = local_genesis_upgrade();
     LocalGenesisActivationHeights {
         overwinter: activation_height,
         sapling: activation_height,
@@ -445,7 +466,7 @@ fn activation_heights(activation_height: u32) -> LocalGenesisActivationHeights {
         nu5: activation_height,
         nu6: activation_height,
         nu6_1: activation_height,
-        nu7: activation_height,
+        nu7: (upgrade >= NetworkUpgrade::Nu7).then_some(activation_height),
     }
 }
 

@@ -51,10 +51,20 @@ impl consensus::Parameters for TxblastNetworkParams {
 
     fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
         match self {
-            Self::LocalGenesis => match nu {
-                NetworkUpgrade::Nu6_1 => None,
-                _ => Some(BlockHeight::from_u32(1)),
-            },
+            // Every upgrade this build knows about is active from height 1,
+            // matching the activation table written into the node config by
+            // zebra_config.rs. The two must agree exactly: the transaction
+            // builder picks its consensus branch id from the newest upgrade
+            // active here, so if that differs from the chain's newest upgrade,
+            // every transaction is rejected as "incorrect consensus branch
+            // id" -- after paying for Orchard proving.
+            //
+            // Excluding Nu6_1 here was harmless only because Nu7 is newer and
+            // masked it. On a node build without Nu7 (its consensus branch id
+            // is still test-gated in some trees) Nu6_1 becomes the newest
+            // upgrade, the exclusion takes effect, and every transaction
+            // fails.
+            Self::LocalGenesis => Some(BlockHeight::from_u32(1)),
             Self::PublicTestnet => consensus::Network::TestNetwork.activation_height(nu),
             Self::Mainnet => consensus::Network::MainNetwork.activation_height(nu),
         }
@@ -343,9 +353,36 @@ mod tests {
             TxblastNetworkParams::LocalGenesis.activation_height(NetworkUpgrade::Nu6),
             Some(BlockHeight::from_u32(1))
         );
+        // Previously asserted None. Nu6_1 is activated by the config writer,
+        // so excluding it here made the builder sign with an older branch id
+        // than the chain expected.
         assert_eq!(
             TxblastNetworkParams::LocalGenesis.activation_height(NetworkUpgrade::Nu6_1),
-            None
+            Some(BlockHeight::from_u32(1))
         );
+    }
+
+    #[test]
+    fn local_genesis_activates_every_upgrade_this_build_knows_about() {
+        // The invariant: the builder's newest active upgrade must equal the
+        // chain's, or every transaction is rejected as "incorrect consensus
+        // branch id". Enumerating from the newest backwards, none may be
+        // inactive -- a gap means some node build will pick the wrong id.
+        for nu in [
+            NetworkUpgrade::Overwinter,
+            NetworkUpgrade::Sapling,
+            NetworkUpgrade::Blossom,
+            NetworkUpgrade::Heartwood,
+            NetworkUpgrade::Canopy,
+            NetworkUpgrade::Nu5,
+            NetworkUpgrade::Nu6,
+            NetworkUpgrade::Nu6_1,
+        ] {
+            assert_eq!(
+                TxblastNetworkParams::LocalGenesis.activation_height(nu),
+                Some(BlockHeight::from_u32(1)),
+                "{nu:?} must be active on a local-genesis chain"
+            );
+        }
     }
 }

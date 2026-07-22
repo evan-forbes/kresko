@@ -79,6 +79,8 @@ pub struct LocalTestnetParameters {
     pub slow_start_interval: u32,
     pub pre_blossom_halving_interval: u32,
     pub activation_height: u32,
+    /// Whether the generated chain activates NU7 (see the activation table below).
+    pub activates_nu7: bool,
     /// One-time NU6.1 lockbox disbursements emitted in
     /// `[[network.testnet_parameters.lockbox_disbursements]]`. Kresko's
     /// default local-genesis path uses a zero-zat synthetic P2SH entry so
@@ -95,6 +97,29 @@ pub struct LocalTestnetParameters {
 pub struct TestnetTomlParameters {
     pub post_blossom_pow_target_spacing: Option<u32>,
     pub daa: DaaConfig,
+}
+
+/// Network upgrades a local-genesis chain activates, newest last.
+///
+/// The writer and the verifier must agree exactly, so both derive the list
+/// here. NU7 is included only when the generated chain activates it: a node
+/// build without the NU7 consensus branch id cannot mine a chain that
+/// declares an NU7 activation.
+fn local_genesis_upgrade_names(activates_nu7: bool) -> Vec<&'static str> {
+    let mut upgrades = vec![
+        "Overwinter",
+        "Sapling",
+        "Blossom",
+        "Heartwood",
+        "Canopy",
+        "NU5",
+        "NU6",
+        "NU6.1",
+    ];
+    if activates_nu7 {
+        upgrades.push("NU7");
+    }
+    upgrades
 }
 
 pub fn template_for(network_kind: NetworkKind) -> Result<String> {
@@ -190,7 +215,7 @@ fn tune_public_block_sync(config: &mut toml::Value) {
 }
 
 fn zebra_default_config_value() -> Result<toml::Value> {
-    toml::Value::try_from(zebrad::config::ZebradConfig::default())
+    toml::Value::try_from(zebrad::config::ZakuradConfig::default())
         .context("failed to serialize Zebra default config")
 }
 
@@ -512,17 +537,7 @@ pub fn apply_local_testnet_parameters(
     // NU6.1 is the one-time ZIP-271 lockbox disbursement event. Local genesis
     // activates it at the same height as NU7 with a zero-zat synthetic
     // disbursement so Zebra's NU6.1 config validation is explicit.
-    for upgrade in [
-        "Overwinter",
-        "Sapling",
-        "Blossom",
-        "Heartwood",
-        "Canopy",
-        "NU5",
-        "NU6",
-        "NU6.1",
-        "NU7",
-    ] {
+    for upgrade in local_genesis_upgrade_names(params.activates_nu7) {
         activation_heights.insert(
             upgrade.to_string(),
             toml::Value::Integer(i64::from(params.activation_height)),
@@ -600,17 +615,7 @@ pub fn verify_local_testnet_parameters(
         .get("activation_heights")
         .and_then(toml::Value::as_table)
         .context("missing network.testnet_parameters.activation_heights table")?;
-    for upgrade in [
-        "Overwinter",
-        "Sapling",
-        "Blossom",
-        "Heartwood",
-        "Canopy",
-        "NU5",
-        "NU6",
-        "NU6.1",
-        "NU7",
-    ] {
+    for upgrade in local_genesis_upgrade_names(params.activates_nu7) {
         let height = activation
             .get(upgrade)
             .and_then(toml::Value::as_integer)
@@ -845,7 +850,7 @@ mod tests {
         // path unless an experiment explicitly asks for it.
         let default_config = parsed(
             &toml::to_string_pretty(
-                &toml::Value::try_from(zebrad::config::ZebradConfig::default())
+                &toml::Value::try_from(zebrad::config::ZakuradConfig::default())
                     .expect("zebra default should serialize"),
             )
             .expect("zebra default should re-serialize"),
@@ -1122,6 +1127,7 @@ initial_mainnet_peers = []
             Some("tmExampleAddress".to_string()),
         );
         let params = LocalTestnetParameters {
+            activates_nu7: true,
             network_name: "ReadTestNet".to_string(),
             network_magic: [1, 2, 3, 4],
             target_difficulty_limit: "0x0f".to_string(),
@@ -1151,7 +1157,7 @@ initial_mainnet_peers = []
         // Trust upstream Zebra to define what fields a config has — kresko
         // only ever overlays a few mining-friendly knobs.
         let default_serialized = toml::to_string_pretty(
-            &toml::Value::try_from(zebrad::config::ZebradConfig::default())
+            &toml::Value::try_from(zebrad::config::ZakuradConfig::default())
                 .expect("zebra default should serialize"),
         )
         .expect("zebra default should re-serialize");
@@ -1178,6 +1184,7 @@ initial_mainnet_peers = []
         // target limit, checkpoints, activation heights) must round-trip
         // through apply_local_testnet_parameters intact.
         let params = LocalTestnetParameters {
+            activates_nu7: true,
             network_name: "RequiredFieldsNet".to_string(),
             network_magic: [9, 8, 7, 6],
             target_difficulty_limit: "0x1f".to_string(),
@@ -1262,6 +1269,7 @@ initial_mainnet_peers = []
         lockbox: Vec<LockboxDisbursement>,
     ) -> LocalTestnetParameters {
         LocalTestnetParameters {
+            activates_nu7: true,
             network_name: "CrossValTestNet".to_string(),
             network_magic: [4, 3, 2, 1],
             target_difficulty_limit: "0x0f".to_string(),
@@ -1378,6 +1386,45 @@ initial_mainnet_peers = []
     }
 
     #[test]
+    fn writer_and_verifier_agree_when_the_chain_omits_nu7() {
+        // The writer and verifier each used to carry their own hardcoded
+        // upgrade list. When NU7 became optional only the writer was updated,
+        // so a chain without NU7 rendered a config the verifier then rejected
+        // with "missing activation height for NU7". Both now derive the list
+        // from local_genesis_upgrade_names().
+        let mut params = local_testnet_params_with(
+            &"aa".repeat(32),
+            5,
+            vec![LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0).unwrap()],
+        );
+        params.activates_nu7 = false;
+        let template = template_for(NetworkKind::LocalGenesis).expect("template");
+        let rendered =
+            apply_local_testnet_parameters(&template, &params).expect("apply parameters");
+        assert!(
+            !rendered.contains("NU7"),
+            "a chain that does not activate NU7 must not declare it"
+        );
+        verify_local_testnet_parameters(&rendered, &params)
+            .expect("writer output must satisfy the verifier when NU7 is omitted");
+    }
+
+    #[test]
+    fn nu7_is_declared_when_the_chain_activates_it() {
+        let params = local_testnet_params_with(
+            &"aa".repeat(32),
+            5,
+            vec![LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0).unwrap()],
+        );
+        assert!(params.activates_nu7);
+        let template = template_for(NetworkKind::LocalGenesis).expect("template");
+        let rendered =
+            apply_local_testnet_parameters(&template, &params).expect("apply parameters");
+        assert!(rendered.contains("NU7"));
+        verify_local_testnet_parameters(&rendered, &params).expect("cross-validation");
+    }
+
+    #[test]
     fn verify_passes_when_chain_and_config_agree() {
         let params = local_testnet_params_with(
             &"aa".repeat(32),
@@ -1394,6 +1441,7 @@ initial_mainnet_peers = []
     #[test]
     fn injects_local_testnet_parameters() {
         let params = LocalTestnetParameters {
+            activates_nu7: true,
             network_name: "LocalGenesisNet".to_string(),
             network_magic: [1, 2, 3, 4],
             target_difficulty_limit: "0x0f".to_string(),

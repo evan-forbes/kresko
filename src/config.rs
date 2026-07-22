@@ -363,7 +363,10 @@ pub struct LocalGenesisActivationHeights {
     pub nu5: u32,
     pub nu6: u32,
     pub nu6_1: u32,
-    pub nu7: u32,
+    /// None when the generated chain does not activate Nu7, so the rendered
+    /// node config omits the key entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nu7: Option<u32>,
 }
 
 impl Config {
