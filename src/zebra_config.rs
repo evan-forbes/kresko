@@ -99,6 +99,29 @@ pub struct TestnetTomlParameters {
     pub daa: DaaConfig,
 }
 
+/// Network upgrades a local-genesis chain activates, newest last.
+///
+/// The writer and the verifier must agree exactly, so both derive the list
+/// here. NU7 is included only when the generated chain activates it: a node
+/// build without the NU7 consensus branch id cannot mine a chain that
+/// declares an NU7 activation.
+fn local_genesis_upgrade_names(activates_nu7: bool) -> Vec<&'static str> {
+    let mut upgrades = vec![
+        "Overwinter",
+        "Sapling",
+        "Blossom",
+        "Heartwood",
+        "Canopy",
+        "NU5",
+        "NU6",
+        "NU6.1",
+    ];
+    if activates_nu7 {
+        upgrades.push("NU7");
+    }
+    upgrades
+}
+
 pub fn template_for(network_kind: NetworkKind) -> Result<String> {
     let mut config = zebra_default_config_value()?;
 
@@ -514,23 +537,7 @@ pub fn apply_local_testnet_parameters(
     // NU6.1 is the one-time ZIP-271 lockbox disbursement event. Local genesis
     // activates it at the same height as NU7 with a zero-zat synthetic
     // disbursement so Zebra's NU6.1 config validation is explicit.
-    // NU7 is written only when the generated chain activates it: declaring an
-    // activation the chain was not built for makes every block at that height
-    // unminable on a node whose build lacks the NU7 consensus branch id.
-    let mut upgrades = vec![
-        "Overwinter",
-        "Sapling",
-        "Blossom",
-        "Heartwood",
-        "Canopy",
-        "NU5",
-        "NU6",
-        "NU6.1",
-    ];
-    if params.activates_nu7 {
-        upgrades.push("NU7");
-    }
-    for upgrade in upgrades {
+    for upgrade in local_genesis_upgrade_names(params.activates_nu7) {
         activation_heights.insert(
             upgrade.to_string(),
             toml::Value::Integer(i64::from(params.activation_height)),
@@ -608,17 +615,7 @@ pub fn verify_local_testnet_parameters(
         .get("activation_heights")
         .and_then(toml::Value::as_table)
         .context("missing network.testnet_parameters.activation_heights table")?;
-    for upgrade in [
-        "Overwinter",
-        "Sapling",
-        "Blossom",
-        "Heartwood",
-        "Canopy",
-        "NU5",
-        "NU6",
-        "NU6.1",
-        "NU7",
-    ] {
+    for upgrade in local_genesis_upgrade_names(params.activates_nu7) {
         let height = activation
             .get(upgrade)
             .and_then(toml::Value::as_integer)
@@ -1386,6 +1383,45 @@ initial_mainnet_peers = []
         let err = verify_local_testnet_parameters(&rendered, &params)
             .expect_err("verify must catch the activation drift");
         assert!(err.to_string().contains("activation height"), "{err}");
+    }
+
+    #[test]
+    fn writer_and_verifier_agree_when_the_chain_omits_nu7() {
+        // The writer and verifier each used to carry their own hardcoded
+        // upgrade list. When NU7 became optional only the writer was updated,
+        // so a chain without NU7 rendered a config the verifier then rejected
+        // with "missing activation height for NU7". Both now derive the list
+        // from local_genesis_upgrade_names().
+        let mut params = local_testnet_params_with(
+            &"aa".repeat(32),
+            5,
+            vec![LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0).unwrap()],
+        );
+        params.activates_nu7 = false;
+        let template = template_for(NetworkKind::LocalGenesis).expect("template");
+        let rendered =
+            apply_local_testnet_parameters(&template, &params).expect("apply parameters");
+        assert!(
+            !rendered.contains("NU7"),
+            "a chain that does not activate NU7 must not declare it"
+        );
+        verify_local_testnet_parameters(&rendered, &params)
+            .expect("writer output must satisfy the verifier when NU7 is omitted");
+    }
+
+    #[test]
+    fn nu7_is_declared_when_the_chain_activates_it() {
+        let params = local_testnet_params_with(
+            &"aa".repeat(32),
+            5,
+            vec![LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0).unwrap()],
+        );
+        assert!(params.activates_nu7);
+        let template = template_for(NetworkKind::LocalGenesis).expect("template");
+        let rendered =
+            apply_local_testnet_parameters(&template, &params).expect("apply parameters");
+        assert!(rendered.contains("NU7"));
+        verify_local_testnet_parameters(&rendered, &params).expect("cross-validation");
     }
 
     #[test]
