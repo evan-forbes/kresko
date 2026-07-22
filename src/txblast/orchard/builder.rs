@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use orchard::builder::BundleType as OrchardBundleType;
 use anyhow::{Context, Result};
 use orchard::keys::{FullViewingKey, Scope, SpendAuthorizingKey, SpendingKey};
 use orchard::note_encryption::OrchardDomain;
@@ -370,6 +371,12 @@ pub(crate) async fn build_and_send_shielding_tx(
     let build_config = BuildConfig::Standard {
         sapling_anchor: None,
         orchard_anchor: Some(anchor),
+        // This builder targets the Orchard pool. Ironwood shares Orchard's
+        // proof system but has its own commitment and nullifier state, so it
+        // needs its own anchor and note tracking -- see the follow-up note in
+        // the PR description.
+        ironwood_anchor: None,
+        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
     };
     let height = BlockHeight::from_u32(target_height);
     let mut builder = Builder::new(network_params, height, build_config);
@@ -377,15 +384,15 @@ pub(crate) async fn build_and_send_shielding_tx(
     let outpoint = transparent_outpoint(utxo_txid, utxo_output_index)?;
     let coin = transparent_txout(input_value, utxo_script)?;
     builder
-        .add_transparent_input(funded_key.public_key, outpoint, coin)
-        .map_err(|e| anyhow::anyhow!("add_transparent_input: {e}"))?;
+        .add_transparent_p2pkh_input(funded_key.public_key, outpoint, coin)
+        .map_err(|e| anyhow::anyhow!("add_transparent_p2pkh_input: {e}"))?;
 
     for output in outputs {
         builder
             .add_orchard_output::<zip317::FeeError>(
                 Some(keys.ovk.clone()),
                 keys.address,
-                output.value,
+                Zatoshis::from_u64(output.value).context("invalid orchard output amount")?,
                 memo_for_role(output.role),
             )
             .map_err(|e| anyhow::anyhow!("add_orchard_output: {e}"))?;
@@ -473,6 +480,12 @@ pub(crate) async fn build_and_send_orchard_to_transparent_tx(
     let build_config = BuildConfig::Standard {
         sapling_anchor: None,
         orchard_anchor: Some(anchor),
+        // This builder targets the Orchard pool. Ironwood shares Orchard's
+        // proof system but has its own commitment and nullifier state, so it
+        // needs its own anchor and note tracking -- see the follow-up note in
+        // the PR description.
+        ironwood_anchor: None,
+        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
     };
     let height = BlockHeight::from_u32(target_height);
     let mut builder = Builder::new(network_params, height, build_config);
@@ -543,6 +556,12 @@ pub(crate) async fn build_and_send_orchard_to_transparent_with_change_tx(
     let build_config = BuildConfig::Standard {
         sapling_anchor: None,
         orchard_anchor: Some(anchor),
+        // This builder targets the Orchard pool. Ironwood shares Orchard's
+        // proof system but has its own commitment and nullifier state, so it
+        // needs its own anchor and note tracking -- see the follow-up note in
+        // the PR description.
+        ironwood_anchor: None,
+        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
     };
     let height = BlockHeight::from_u32(target_height);
     let mut builder = Builder::new(network_params, height, build_config);
@@ -562,7 +581,7 @@ pub(crate) async fn build_and_send_orchard_to_transparent_with_change_tx(
                 .add_orchard_output::<zip317::FeeError>(
                     Some(keys.ovk.clone()),
                     keys.address,
-                    change_value,
+                    Zatoshis::from_u64(change_value).context("invalid orchard change amount")?,
                     memo_for_role(role),
                 )
                 .map_err(|e| anyhow::anyhow!("add_orchard_change_output: {e}"))?;
@@ -619,6 +638,12 @@ pub(crate) async fn build_and_send_orchard_fanout_tx(
     let build_config = BuildConfig::Standard {
         sapling_anchor: None,
         orchard_anchor: Some(anchor),
+        // This builder targets the Orchard pool. Ironwood shares Orchard's
+        // proof system but has its own commitment and nullifier state, so it
+        // needs its own anchor and note tracking -- see the follow-up note in
+        // the PR description.
+        ironwood_anchor: None,
+        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
     };
     let height = BlockHeight::from_u32(target_height);
     let mut builder = Builder::new(network_params, height, build_config);
@@ -632,7 +657,7 @@ pub(crate) async fn build_and_send_orchard_fanout_tx(
             .add_orchard_output::<zip317::FeeError>(
                 Some(keys.ovk.clone()),
                 *address,
-                output.value,
+                Zatoshis::from_u64(output.value).context("invalid orchard output amount")?,
                 memo_for_role(output.role),
             )
             .map_err(|e| anyhow::anyhow!("add_orchard_output: {e}"))?;
@@ -684,6 +709,12 @@ pub(crate) fn build_lane_advance_tx(
     let build_config = BuildConfig::Standard {
         sapling_anchor: None,
         orchard_anchor: Some(anchor),
+        // This builder targets the Orchard pool. Ironwood shares Orchard's
+        // proof system but has its own commitment and nullifier state, so it
+        // needs its own anchor and note tracking -- see the follow-up note in
+        // the PR description.
+        ironwood_anchor: None,
+        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
     };
     let height = BlockHeight::from_u32(target_height);
     let mut builder = Builder::new(network_params, height, build_config);
@@ -695,7 +726,7 @@ pub(crate) fn build_lane_advance_tx(
         .add_orchard_output::<zip317::FeeError>(
             Some(keys.ovk.clone()),
             keys.address,
-            note_value - fee,
+            Zatoshis::from_u64(note_value - fee).context("invalid orchard lane amount")?,
             memo_for_role(NoteRole::Lane),
         )
         .map_err(|e| anyhow::anyhow!("add_orchard_output: {e}"))?;
@@ -751,6 +782,12 @@ pub(crate) async fn build_and_send_lane_advance_tx(
     let build_config = BuildConfig::Standard {
         sapling_anchor: None,
         orchard_anchor: Some(anchor),
+        // This builder targets the Orchard pool. Ironwood shares Orchard's
+        // proof system but has its own commitment and nullifier state, so it
+        // needs its own anchor and note tracking -- see the follow-up note in
+        // the PR description.
+        ironwood_anchor: None,
+        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
     };
     let height = BlockHeight::from_u32(target_height);
     let mut builder = Builder::new(network_params, height, build_config);
@@ -762,7 +799,7 @@ pub(crate) async fn build_and_send_lane_advance_tx(
         .add_orchard_output::<zip317::FeeError>(
             Some(keys.ovk.clone()),
             keys.address,
-            note_value - fee,
+            Zatoshis::from_u64(note_value - fee).context("invalid orchard lane amount")?,
             memo_for_role(NoteRole::Lane),
         )
         .map_err(|e| anyhow::anyhow!("add_orchard_output: {e}"))?;
@@ -834,6 +871,12 @@ pub(crate) async fn build_and_send_reservoir_expand_tx(
     let build_config = BuildConfig::Standard {
         sapling_anchor: None,
         orchard_anchor: Some(anchor),
+        // This builder targets the Orchard pool. Ironwood shares Orchard's
+        // proof system but has its own commitment and nullifier state, so it
+        // needs its own anchor and note tracking -- see the follow-up note in
+        // the PR description.
+        ironwood_anchor: None,
+        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
     };
     let height = BlockHeight::from_u32(target_height);
     let mut builder = Builder::new(cfg.network_params, height, build_config);
@@ -847,7 +890,7 @@ pub(crate) async fn build_and_send_reservoir_expand_tx(
             .add_orchard_output::<zip317::FeeError>(
                 Some(keys.ovk.clone()),
                 keys.address,
-                output.value,
+                Zatoshis::from_u64(output.value).context("invalid orchard output amount")?,
                 memo_for_role(output.role),
             )
             .map_err(|e| anyhow::anyhow!("add_orchard_output: {e}"))?;

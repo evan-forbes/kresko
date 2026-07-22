@@ -329,6 +329,20 @@ fn local_genesis_upgrade() -> NetworkUpgrade {
     }
 }
 
+/// The chain's newest upgrade, named as the node config's activation table
+/// spells it.
+fn latest_upgrade_name() -> &'static str {
+    match local_genesis_upgrade() {
+        NetworkUpgrade::Nu5 => "NU5",
+        NetworkUpgrade::Nu6 => "NU6",
+        NetworkUpgrade::Nu6_1 => "NU6.1",
+        NetworkUpgrade::Nu6_2 => "NU6.2",
+        NetworkUpgrade::Nu6_3 => "NU6.3",
+        NetworkUpgrade::Nu7 => "NU7",
+        _ => "NU6.1",
+    }
+}
+
 fn prepare_generated_local_genesis(
     config: &Config,
     miner_names: &[String],
@@ -420,7 +434,7 @@ fn prepare_generated_local_genesis(
 
     Ok(PreparedLocalGenesis {
         local_testnet: LocalTestnetParameters {
-            activates_nu7: local_genesis.activation_heights.nu7.is_some(),
+            latest_upgrade: latest_upgrade_name().to_string(),
             network_name: local_genesis.network_name.clone(),
             network_magic: local_genesis.network_magic,
             target_difficulty_limit: local_genesis.target_difficulty_limit.clone(),
@@ -466,6 +480,8 @@ fn activation_heights(activation_height: u32) -> LocalGenesisActivationHeights {
         nu5: activation_height,
         nu6: activation_height,
         nu6_1: activation_height,
+        nu6_2: (upgrade >= NetworkUpgrade::Nu6_2).then_some(activation_height),
+        nu6_3: (upgrade >= NetworkUpgrade::Nu6_3).then_some(activation_height),
         nu7: (upgrade >= NetworkUpgrade::Nu7).then_some(activation_height),
     }
 }

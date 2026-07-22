@@ -3723,6 +3723,10 @@ mod tests {
             NoteValue::from_raw(value_zats),
             rho,
             rseed,
+            // V2 is the ZIP 212 Orchard plaintext. V3 is the Ironwood
+            // (ZIP 2005) format -- switching pools is a deliberate change,
+            // not a default.
+            orchard::note::NoteVersion::V2,
         ))
         .expect("valid test note");
 
