@@ -25,3 +25,6 @@ __pycache__/
 **/.kresko/runs/
 **/.kresko/
 .kresko/
+
+# Marker written by pr-node-bake.sh / mempool-load-run.sh at deploy time.
+.baked-ref
