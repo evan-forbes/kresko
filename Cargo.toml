@@ -47,3 +47,10 @@ ff = "0.13"
 jubjub = "0.10"
 bls12_381 = "0.8"
 rand_core_06 = { package = "rand_core", version = "0.6" }
+
+
+[patch.crates-io]
+# zcash_primitives with the Orchard proving-key cache (valargroup/librustzcash
+# @ kresko-provingkey-cache). Same 0.29.0 source, one memoized key -- ~2.3x
+# faster steady-state transaction building. Drop once the cache lands upstream.
+zcash_primitives = { git = "https://github.com/valargroup/librustzcash", branch = "kresko-provingkey-cache" }
