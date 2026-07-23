@@ -105,6 +105,43 @@ enum Commands {
         directory: String,
     },
 
+    /// Render local-fleet node configs from a generated genesis payload.
+    ///
+    /// Reads each miner's `payload/<name>` config and writes a localized
+    /// `nodes/<name>/zakura.toml` (plus a bootstrap variant and a copy of the
+    /// funded key) bound to that node's own 127.0.0.x loopback and directories,
+    /// so N nodes coexist on one host. Replaces the mempool-load harness's
+    /// former Python `prepare_node_dirs`.
+    LocalizeFleet {
+        /// How many nodes (from the front of the list) run zakurad's internal miner.
+        #[arg(long, default_value_t = 1)]
+        miner_nodes: usize,
+
+        /// Experiment/lab directory (must match the harness's resolved lab dir).
+        #[arg(short = 'd', long, default_value = ".")]
+        directory: String,
+    },
+
+    /// Seed a running node's chain state from a generated genesis payload.
+    ///
+    /// Submits the genesis block and every premine block to the node's RPC via
+    /// `submitblock`. The caller owns the node process lifecycle. Replaces the
+    /// mempool-load harness's former Python `seed_node`/`submit_block`.
+    SeedLocal {
+        /// Node RPC endpoint, e.g. `http://127.0.0.101:18232`.
+        #[arg(long)]
+        rpc_endpoint: String,
+
+        /// Path to the genesis block hex (`payload/local_genesis/genesis.hex`).
+        #[arg(long)]
+        genesis: String,
+
+        /// Path to the premine blocks hex, one block per line
+        /// (`payload/local_genesis/premine_blocks.hex`).
+        #[arg(long)]
+        premine: String,
+    },
+
     /// Generate a join bundle for outside NU7 testnet observers (binaries pulled
     /// from GitHub releases by the join script; see scripts/join-nu7-testnet.sh)
     JoinBundle {
@@ -785,9 +822,11 @@ impl Commands {
             | Commands::PowSimulateMatrix { .. }
             | Commands::TxblastLocal { .. }
             | Commands::FundRuntimeKeysLocal { .. }
+            | Commands::SeedLocal { .. }
             | Commands::TxblastStatusLocal { .. } => None,
             Commands::Genesis { directory, .. }
             | Commands::GenesisPublic { directory, .. }
+            | Commands::LocalizeFleet { directory, .. }
             | Commands::Status { directory, .. }
             | Commands::Txblast { directory, .. } => Some(directory),
         }
@@ -1172,6 +1211,19 @@ async fn main() -> Result<()> {
                 &scripts_dir,
                 &directory,
             )?;
+        }
+        Commands::LocalizeFleet {
+            miner_nodes,
+            directory,
+        } => {
+            commands::localize_fleet::run(&directory, miner_nodes)?;
+        }
+        Commands::SeedLocal {
+            rpc_endpoint,
+            genesis,
+            premine,
+        } => {
+            commands::seed_local::run(&rpc_endpoint, &genesis, &premine).await?;
         }
         Commands::JoinBundle {
             run_dir,
