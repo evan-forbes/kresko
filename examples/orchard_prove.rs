@@ -2,6 +2,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use orchard::{
+    bundle::{BundleVersion, Flags},
+    circuit::OrchardCircuitVersion,
     Anchor,
     builder::{Builder, BundleType, UnauthorizedBundle},
     circuit::ProvingKey,
@@ -26,7 +28,9 @@ fn main() -> Result<()> {
     let recipient = FullViewingKey::from(&sk).address_at(0u32, Scope::External);
 
     let pk_start = Instant::now();
-    let pk = ProvingKey::build();
+    // NU6.2 fixed the Orchard circuit, and NU6.3 added the disableCrossAddress
+    // constraint. Benchmark the circuit the current network actually proves.
+    let pk = ProvingKey::build(OrchardCircuitVersion::PostNu6_3);
     println!("proving_key_build_ms={}", elapsed_ms(pk_start.elapsed()));
 
     let mut timings = Vec::with_capacity(iterations);
@@ -60,10 +64,15 @@ fn prove_output_bundle(
     recipient: orchard::Address,
     pk: &ProvingKey,
 ) -> Result<u128> {
+    // orchard_v3 is the Orchard pool at NU6.3; ironwood_v3() would benchmark
+    // the Ironwood pool instead.
     let mut builder = Builder::new(
         BundleType::DEFAULT,
+        BundleVersion::orchard_v3(),
+        Flags::ENABLED,
         Option::<Anchor>::from(Anchor::from_bytes([0; 32])).context("invalid test anchor")?,
-    );
+    )
+    .context("failed to construct Orchard builder")?;
 
     for _ in 0..recipients {
         builder

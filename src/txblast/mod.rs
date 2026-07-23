@@ -41,6 +41,41 @@ impl TxblastNetworkParams {
     }
 }
 
+/// Newest upgrade a local-genesis chain activates.
+///
+/// Must stay in step with `kresko genesis` (see `local_genesis_upgrade` in
+/// `commands/genesis.rs`): the chain's activation table and the transaction
+/// builder's must describe the same chain.
+/// Ordinal position of an upgrade, oldest first.
+///
+/// `NetworkUpgrade` implements no ordering, so comparisons go through this.
+fn upgrade_rank(nu: NetworkUpgrade) -> u8 {
+    match nu {
+        NetworkUpgrade::Overwinter => 0,
+        NetworkUpgrade::Sapling => 1,
+        NetworkUpgrade::Blossom => 2,
+        NetworkUpgrade::Heartwood => 3,
+        NetworkUpgrade::Canopy => 4,
+        NetworkUpgrade::Nu5 => 5,
+        NetworkUpgrade::Nu6 => 6,
+        NetworkUpgrade::Nu6_1 => 7,
+        NetworkUpgrade::Nu6_2 => 8,
+        NetworkUpgrade::Nu6_3 => 9,
+        // Anything this build does not name is newer than everything it does.
+        _ => u8::MAX,
+    }
+}
+
+pub(crate) fn local_genesis_latest_upgrade() -> NetworkUpgrade {
+    match std::env::var("KRESKO_LATEST_NETWORK_UPGRADE").ok().as_deref() {
+        Some("nu5") | Some("Nu5") => NetworkUpgrade::Nu5,
+        Some("nu6") | Some("Nu6") => NetworkUpgrade::Nu6,
+        Some("nu6_1") | Some("Nu6_1") => NetworkUpgrade::Nu6_1,
+        Some("nu6_2") | Some("Nu6_2") => NetworkUpgrade::Nu6_2,
+        _ => NetworkUpgrade::Nu6_3,
+    }
+}
+
 impl consensus::Parameters for TxblastNetworkParams {
     fn network_type(&self) -> NetworkType {
         match self {
@@ -64,7 +99,21 @@ impl consensus::Parameters for TxblastNetworkParams {
             // is still test-gated in some trees) Nu6_1 becomes the newest
             // upgrade, the exclusion takes effect, and every transaction
             // fails.
-            Self::LocalGenesis => Some(BlockHeight::from_u32(1)),
+            // Capped at the chain's newest upgrade, not "everything this build
+            // knows about". The builder picks its consensus branch id from the
+            // newest upgrade active here, so activating more than the chain
+            // does signs at the wrong id and every transaction is rejected --
+            // which is what happened when the zcash stack gained Nu6_2/Nu6_3
+            // while local-genesis chains were still capped at NU6.1.
+            //
+            // Same environment variable as `kresko genesis`, so the chain and
+            // the builder cannot disagree.
+            Self::LocalGenesis
+                if upgrade_rank(nu) <= upgrade_rank(local_genesis_latest_upgrade()) =>
+            {
+                Some(BlockHeight::from_u32(1))
+            }
+            Self::LocalGenesis => None,
             Self::PublicTestnet => consensus::Network::TestNetwork.activation_height(nu),
             Self::Mainnet => consensus::Network::MainNetwork.activation_height(nu),
         }

@@ -363,8 +363,17 @@ pub struct LocalGenesisActivationHeights {
     pub nu5: u32,
     pub nu6: u32,
     pub nu6_1: u32,
-    /// None when the generated chain does not activate Nu7, so the rendered
-    /// node config omits the key entirely.
+    /// Upgrades above NU6.1 are optional: each is written only when the
+    /// generated chain actually activates it, so the rendered node config
+    /// never declares an activation the chain was not built for.
+    ///
+    /// NU6.3 matters beyond version bookkeeping -- the Ironwood shielded pool
+    /// is gated on it, so a chain that stops at NU6.1 cannot exercise Ironwood
+    /// at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nu6_2: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nu6_3: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nu7: Option<u32>,
 }

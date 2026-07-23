@@ -79,8 +79,10 @@ pub struct LocalTestnetParameters {
     pub slow_start_interval: u32,
     pub pre_blossom_halving_interval: u32,
     pub activation_height: u32,
-    /// Whether the generated chain activates NU7 (see the activation table below).
-    pub activates_nu7: bool,
+    /// Newest upgrade the generated chain activates, as it appears in the
+    /// config's activation table (e.g. "NU6.3"). Everything below it is
+    /// activated too; nothing above it is written.
+    pub latest_upgrade: String,
     /// One-time NU6.1 lockbox disbursements emitted in
     /// `[[network.testnet_parameters.lockbox_disbursements]]`. Kresko's
     /// default local-genesis path uses a zero-zat synthetic P2SH entry so
@@ -105,21 +107,31 @@ pub struct TestnetTomlParameters {
 /// here. NU7 is included only when the generated chain activates it: a node
 /// build without the NU7 consensus branch id cannot mine a chain that
 /// declares an NU7 activation.
-fn local_genesis_upgrade_names(activates_nu7: bool) -> Vec<&'static str> {
-    let mut upgrades = vec![
-        "Overwinter",
-        "Sapling",
-        "Blossom",
-        "Heartwood",
-        "Canopy",
-        "NU5",
-        "NU6",
-        "NU6.1",
-    ];
-    if activates_nu7 {
-        upgrades.push("NU7");
-    }
-    upgrades
+/// Local-genesis activation table, oldest first.
+///
+/// Everything up to and including the chain's newest upgrade is activated at
+/// the same height. The tail is optional because a node build without an
+/// upgrade's consensus branch id cannot mine a chain that declares it.
+const LOCAL_GENESIS_UPGRADES: &[&str] = &[
+    "Overwinter",
+    "Sapling",
+    "Blossom",
+    "Heartwood",
+    "Canopy",
+    "NU5",
+    "NU6",
+    "NU6.1",
+    "NU6.2",
+    "NU6.3",
+    "NU7",
+];
+
+fn local_genesis_upgrade_names(latest: &str) -> Vec<&'static str> {
+    let end = LOCAL_GENESIS_UPGRADES
+        .iter()
+        .position(|name| *name == latest)
+        .unwrap_or(LOCAL_GENESIS_UPGRADES.len() - 1);
+    LOCAL_GENESIS_UPGRADES[..=end].to_vec()
 }
 
 pub fn template_for(network_kind: NetworkKind) -> Result<String> {
@@ -537,7 +549,7 @@ pub fn apply_local_testnet_parameters(
     // NU6.1 is the one-time ZIP-271 lockbox disbursement event. Local genesis
     // activates it at the same height as NU7 with a zero-zat synthetic
     // disbursement so Zebra's NU6.1 config validation is explicit.
-    for upgrade in local_genesis_upgrade_names(params.activates_nu7) {
+    for upgrade in local_genesis_upgrade_names(&params.latest_upgrade) {
         activation_heights.insert(
             upgrade.to_string(),
             toml::Value::Integer(i64::from(params.activation_height)),
@@ -615,7 +627,7 @@ pub fn verify_local_testnet_parameters(
         .get("activation_heights")
         .and_then(toml::Value::as_table)
         .context("missing network.testnet_parameters.activation_heights table")?;
-    for upgrade in local_genesis_upgrade_names(params.activates_nu7) {
+    for upgrade in local_genesis_upgrade_names(&params.latest_upgrade) {
         let height = activation
             .get(upgrade)
             .and_then(toml::Value::as_integer)
@@ -762,6 +774,7 @@ fn extract_miner_address(template: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
+        local_genesis_upgrade_names,
         DEFAULT_NU6_1_LOCKBOX_ADDRESS, LocalTestnetParameters, LockboxDisbursement,
         PUBLIC_BLOCK_SYNC_DOWNLOAD_CONCURRENCY_LIMIT, PUBLIC_BLOCK_SYNC_PEER_TARGET,
         apply_local_testnet_parameters, bootstrap_config_for_isolated_rpc,
@@ -1127,7 +1140,7 @@ initial_mainnet_peers = []
             Some("tmExampleAddress".to_string()),
         );
         let params = LocalTestnetParameters {
-            activates_nu7: true,
+            latest_upgrade: "NU7".to_string(),
             network_name: "ReadTestNet".to_string(),
             network_magic: [1, 2, 3, 4],
             target_difficulty_limit: "0x0f".to_string(),
@@ -1184,7 +1197,7 @@ initial_mainnet_peers = []
         // target limit, checkpoints, activation heights) must round-trip
         // through apply_local_testnet_parameters intact.
         let params = LocalTestnetParameters {
-            activates_nu7: true,
+            latest_upgrade: "NU7".to_string(),
             network_name: "RequiredFieldsNet".to_string(),
             network_magic: [9, 8, 7, 6],
             target_difficulty_limit: "0x1f".to_string(),
@@ -1269,7 +1282,7 @@ initial_mainnet_peers = []
         lockbox: Vec<LockboxDisbursement>,
     ) -> LocalTestnetParameters {
         LocalTestnetParameters {
-            activates_nu7: true,
+            latest_upgrade: "NU7".to_string(),
             network_name: "CrossValTestNet".to_string(),
             network_magic: [4, 3, 2, 1],
             target_difficulty_limit: "0x0f".to_string(),
@@ -1386,6 +1399,45 @@ initial_mainnet_peers = []
     }
 
     #[test]
+    fn activation_table_stops_at_the_configured_upgrade() {
+        assert_eq!(
+            local_genesis_upgrade_names("NU6.1").last(),
+            Some(&"NU6.1"),
+            "nothing above the configured upgrade may be declared"
+        );
+        assert!(!local_genesis_upgrade_names("NU6.1").contains(&"NU6.2"));
+        assert!(!local_genesis_upgrade_names("NU6.1").contains(&"NU7"));
+    }
+
+    #[test]
+    fn nu6_3_activates_everything_below_it() {
+        // NU6.3 gates the Ironwood shielded pool, so a chain that stops short
+        // of it cannot exercise Ironwood at all.
+        let names = local_genesis_upgrade_names("NU6.3");
+        for expected in ["Overwinter", "NU5", "NU6", "NU6.1", "NU6.2", "NU6.3"] {
+            assert!(names.contains(&expected), "{expected} must be active");
+        }
+        assert!(!names.contains(&"NU7"));
+    }
+
+    #[test]
+    fn nu6_3_survives_the_writer_and_the_verifier() {
+        let mut params = local_testnet_params_with(
+            &"aa".repeat(32),
+            5,
+            vec![LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0).unwrap()],
+        );
+        params.latest_upgrade = "NU6.3".to_string();
+        let template = template_for(NetworkKind::LocalGenesis).expect("template");
+        let rendered =
+            apply_local_testnet_parameters(&template, &params).expect("apply parameters");
+        assert!(rendered.contains("NU6.3"));
+        assert!(!rendered.contains("NU7"));
+        verify_local_testnet_parameters(&rendered, &params)
+            .expect("an Ironwood-capable chain must pass cross-validation");
+    }
+
+    #[test]
     fn writer_and_verifier_agree_when_the_chain_omits_nu7() {
         // The writer and verifier each used to carry their own hardcoded
         // upgrade list. When NU7 became optional only the writer was updated,
@@ -1397,7 +1449,7 @@ initial_mainnet_peers = []
             5,
             vec![LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0).unwrap()],
         );
-        params.activates_nu7 = false;
+        params.latest_upgrade = "NU6.1".to_string();
         let template = template_for(NetworkKind::LocalGenesis).expect("template");
         let rendered =
             apply_local_testnet_parameters(&template, &params).expect("apply parameters");
@@ -1416,7 +1468,7 @@ initial_mainnet_peers = []
             5,
             vec![LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0).unwrap()],
         );
-        assert!(params.activates_nu7);
+        assert_eq!(params.latest_upgrade, "NU7");
         let template = template_for(NetworkKind::LocalGenesis).expect("template");
         let rendered =
             apply_local_testnet_parameters(&template, &params).expect("apply parameters");
@@ -1441,7 +1493,7 @@ initial_mainnet_peers = []
     #[test]
     fn injects_local_testnet_parameters() {
         let params = LocalTestnetParameters {
-            activates_nu7: true,
+            latest_upgrade: "NU7".to_string(),
             network_name: "LocalGenesisNet".to_string(),
             network_magic: [1, 2, 3, 4],
             target_difficulty_limit: "0x0f".to_string(),

@@ -34,15 +34,15 @@ chrono = { version = "0.4", default-features = false }
 zebra-chain = { package = "zakura-chain", git = "https://github.com/zakura-core/zakura", tag = "v1.0.3-rc0", features = ["internal-miner"] }
 zebrad = { package = "zakura", git = "https://github.com/zakura-core/zakura", tag = "v1.0.3-rc0" }
 zebra-jsonl-trace = { package = "zakura-jsonl-trace", git = "https://github.com/zakura-core/zakura", tag = "v1.0.3-rc0" }
-zcash_primitives = { version = "0.26", features = ["transparent-inputs"] }
-zcash_protocol = "0.7"
-zcash_address = "0.10"
-zcash_transparent = "0.6"
-orchard = "0.11"
-sapling-crypto = "0.5"
+zcash_primitives = { version = "0.29", features = ["transparent-inputs"] }
+zcash_protocol = "0.10"
+zcash_address = "0.13"
+zcash_transparent = "0.9"
+orchard = "0.15"
+sapling-crypto = "0.7"
 incrementalmerkletree = "0.8"
 shardtree = "0.6"
-zcash_note_encryption = "0.4"
+zcash_note_encryption = "0.4.1"
 ff = "0.13"
 jubjub = "0.10"
 bls12_381 = "0.8"
