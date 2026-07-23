@@ -28,6 +28,103 @@ pub(crate) const ORCHARD_SPEND_FEE: u64 = 10_000;
 const TXBLAST_MEMO_LANE: &[u8] = b"kresko:txblast:lane:v1";
 const TXBLAST_MEMO_RESERVOIR: &[u8] = b"kresko:txblast:reservoir:v1";
 
+use orchard::bundle::BundleVersion;
+
+/// Which shielded pool the txblast targets.
+///
+/// Orchard and Ironwood share a proof system and action shape but keep
+/// separate commitment and nullifier state, and NU6.3 closes the Orchard pool
+/// to new value while opening Ironwood. The pool is therefore derived from the
+/// chain's newest network upgrade (see `for_upgrade`) rather than configured,
+/// so the txblast cannot target a pool the chain rejects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShieldedPool {
+    Orchard,
+    Ironwood,
+}
+
+impl ShieldedPool {
+    /// The pool the chain accepts new value into at `height`. Orchard is closed
+    /// to new value after NU6.3; Ironwood opens at NU6.3. Works for any network
+    /// via its NU6.3 activation height.
+    pub(crate) fn at_height(
+        network_params: &TxblastNetworkParams,
+        height: BlockHeight,
+    ) -> Self {
+        use zcash_protocol::consensus::Parameters;
+        use zcash_protocol::consensus::NetworkUpgrade::Nu6_3;
+        match network_params.activation_height(Nu6_3) {
+            Some(nu6_3) if height >= nu6_3 => ShieldedPool::Ironwood,
+            _ => ShieldedPool::Orchard,
+        }
+    }
+
+    fn build_config(self, anchor: orchard::Anchor) -> BuildConfig {
+        match self {
+            ShieldedPool::Orchard => BuildConfig::Standard {
+                sapling_anchor: None,
+                orchard_anchor: Some(anchor),
+                ironwood_anchor: None,
+                orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
+            },
+            ShieldedPool::Ironwood => BuildConfig::Standard {
+                sapling_anchor: None,
+                orchard_anchor: None,
+                ironwood_anchor: Some(anchor),
+                orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
+            },
+        }
+    }
+
+    /// BundleVersion the node expects for this pool at NU6.3.
+    #[allow(dead_code)]
+    fn bundle_version(self) -> BundleVersion {
+        match self {
+            ShieldedPool::Orchard => BundleVersion::orchard_v3(),
+            ShieldedPool::Ironwood => BundleVersion::ironwood_v3(),
+        }
+    }
+
+    fn add_spend(
+        self,
+        builder: &mut Builder<TxblastNetworkParams, ()>,
+        fvk: FullViewingKey,
+        note: orchard::Note,
+        merkle_path: orchard::tree::MerklePath,
+    ) -> Result<()> {
+        match self {
+            ShieldedPool::Orchard => builder
+                .add_orchard_spend::<zip317::FeeError>(fvk, note, merkle_path)
+                .map_err(|e| anyhow::anyhow!("add_orchard_spend: {e}")),
+            ShieldedPool::Ironwood => builder
+                .add_ironwood_spend::<zip317::FeeError>(fvk, note, merkle_path)
+                .map_err(|e| anyhow::anyhow!("add_ironwood_spend: {e}")),
+        }
+    }
+
+    /// Add an output to the pool's own address. NU6.3 disables cross-address
+    /// transfers, so the Orchard side must go through the change-output path;
+    /// Ironwood uses a plain output.
+    fn add_output(
+        self,
+        builder: &mut Builder<TxblastNetworkParams, ()>,
+        fvk: FullViewingKey,
+        ovk: orchard::keys::OutgoingViewingKey,
+        recipient: orchard::Address,
+        value: Zatoshis,
+        memo: MemoBytes,
+    ) -> Result<()> {
+        match self {
+            ShieldedPool::Orchard => builder
+                .add_orchard_change_output::<zip317::FeeError>(fvk, Some(ovk), recipient, value, memo)
+                .map_err(|e| anyhow::anyhow!("add_orchard_change_output: {e}")),
+            ShieldedPool::Ironwood => builder
+                .add_ironwood_output::<zip317::FeeError>(Some(ovk), recipient, value, memo)
+                .map_err(|e| anyhow::anyhow!("add_ironwood_output: {e}")),
+        }
+    }
+}
+
 fn orchard_bundle_actions(spends: usize, outputs: usize) -> usize {
     std::cmp::max(2, std::cmp::max(spends, outputs))
 }
@@ -368,17 +465,9 @@ pub(crate) async fn build_and_send_shielding_tx(
         );
     }
 
-    let build_config = BuildConfig::Standard {
-        sapling_anchor: None,
-        orchard_anchor: Some(anchor),
-        // This builder targets the Orchard pool. Ironwood shares Orchard's
-        // proof system but has its own commitment and nullifier state, so it
-        // needs its own anchor and note tracking -- see the follow-up note in
-        // the PR description.
-        ironwood_anchor: None,
-        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
-    };
     let height = BlockHeight::from_u32(target_height);
+    let pool = ShieldedPool::at_height(&network_params, height);
+    let build_config = pool.build_config(anchor);
     let mut builder = Builder::new(network_params, height, build_config);
 
     let outpoint = transparent_outpoint(utxo_txid, utxo_output_index)?;
@@ -388,15 +477,7 @@ pub(crate) async fn build_and_send_shielding_tx(
         .map_err(|e| anyhow::anyhow!("add_transparent_p2pkh_input: {e}"))?;
 
     for output in outputs {
-        builder
-            .add_orchard_change_output::<zip317::FeeError>(
-                keys.fvk.clone(),
-                Some(keys.ovk.clone()),
-                keys.address,
-                Zatoshis::from_u64(output.value).context("invalid orchard output amount")?,
-                memo_for_role(output.role),
-            )
-            .map_err(|e| anyhow::anyhow!("add_orchard_change_output: {e}"))?;
+            pool.add_output(&mut builder, keys.fvk.clone(), keys.ovk.clone(), keys.address, Zatoshis::from_u64(output.value).context("invalid orchard output amount")?, memo_for_role(output.role))?;
     }
 
     let mut signing_set = TransparentSigningSet::new();
@@ -481,22 +562,12 @@ pub(crate) async fn build_and_send_orchard_to_transparent_tx(
         );
     }
 
-    let build_config = BuildConfig::Standard {
-        sapling_anchor: None,
-        orchard_anchor: Some(anchor),
-        // This builder targets the Orchard pool. Ironwood shares Orchard's
-        // proof system but has its own commitment and nullifier state, so it
-        // needs its own anchor and note tracking -- see the follow-up note in
-        // the PR description.
-        ironwood_anchor: None,
-        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
-    };
     let height = BlockHeight::from_u32(target_height);
+    let pool = ShieldedPool::at_height(&network_params, height);
+    let build_config = pool.build_config(anchor);
     let mut builder = Builder::new(network_params, height, build_config);
 
-    builder
-        .add_orchard_spend::<zip317::FeeError>(keys.fvk.clone(), tracked.note, merkle_path)
-        .map_err(|e| anyhow::anyhow!("add_orchard_spend: {e}"))?;
+    pool.add_spend(&mut builder, keys.fvk.clone(), tracked.note, merkle_path)?;
 
     for (address, value) in recipients {
         let value = Zatoshis::from_u64(*value).context("invalid transparent output amount")?;
@@ -557,22 +628,12 @@ pub(crate) async fn build_and_send_orchard_to_transparent_with_change_tx(
         );
     }
 
-    let build_config = BuildConfig::Standard {
-        sapling_anchor: None,
-        orchard_anchor: Some(anchor),
-        // This builder targets the Orchard pool. Ironwood shares Orchard's
-        // proof system but has its own commitment and nullifier state, so it
-        // needs its own anchor and note tracking -- see the follow-up note in
-        // the PR description.
-        ironwood_anchor: None,
-        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
-    };
     let height = BlockHeight::from_u32(target_height);
+    let pool = ShieldedPool::at_height(&network_params, height);
+    let build_config = pool.build_config(anchor);
     let mut builder = Builder::new(network_params, height, build_config);
 
-    builder
-        .add_orchard_spend::<zip317::FeeError>(keys.fvk.clone(), tracked.note, merkle_path)
-        .map_err(|e| anyhow::anyhow!("add_orchard_spend: {e}"))?;
+    pool.add_spend(&mut builder, keys.fvk.clone(), tracked.note, merkle_path)?;
 
     let value = Zatoshis::from_u64(recipient_value).context("invalid transparent output amount")?;
     builder
@@ -581,15 +642,7 @@ pub(crate) async fn build_and_send_orchard_to_transparent_with_change_tx(
 
     if let Some(role) = change_role {
         if change_value > 0 {
-            builder
-                .add_orchard_change_output::<zip317::FeeError>(
-                    keys.fvk.clone(),
-                    Some(keys.ovk.clone()),
-                    keys.address,
-                    Zatoshis::from_u64(change_value).context("invalid orchard change amount")?,
-                    memo_for_role(role),
-                )
-                .map_err(|e| anyhow::anyhow!("add_orchard_change_output: {e}"))?;
+                pool.add_output(&mut builder, keys.fvk.clone(), keys.ovk.clone(), keys.address, Zatoshis::from_u64(change_value).context("invalid orchard change amount")?, memo_for_role(role))?;
         }
     }
 
@@ -640,33 +693,15 @@ pub(crate) async fn build_and_send_orchard_fanout_tx(
         );
     }
 
-    let build_config = BuildConfig::Standard {
-        sapling_anchor: None,
-        orchard_anchor: Some(anchor),
-        // This builder targets the Orchard pool. Ironwood shares Orchard's
-        // proof system but has its own commitment and nullifier state, so it
-        // needs its own anchor and note tracking -- see the follow-up note in
-        // the PR description.
-        ironwood_anchor: None,
-        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
-    };
     let height = BlockHeight::from_u32(target_height);
+    let pool = ShieldedPool::at_height(&network_params, height);
+    let build_config = pool.build_config(anchor);
     let mut builder = Builder::new(network_params, height, build_config);
 
-    builder
-        .add_orchard_spend::<zip317::FeeError>(keys.fvk.clone(), tracked.note, merkle_path)
-        .map_err(|e| anyhow::anyhow!("add_orchard_spend: {e}"))?;
+    pool.add_spend(&mut builder, keys.fvk.clone(), tracked.note, merkle_path)?;
 
     for (address, output) in recipients {
-        builder
-            .add_orchard_change_output::<zip317::FeeError>(
-                keys.fvk.clone(),
-                Some(keys.ovk.clone()),
-                *address,
-                Zatoshis::from_u64(output.value).context("invalid orchard output amount")?,
-                memo_for_role(output.role),
-            )
-            .map_err(|e| anyhow::anyhow!("add_orchard_change_output: {e}"))?;
+            pool.add_output(&mut builder, keys.fvk.clone(), keys.ovk.clone(), *address, Zatoshis::from_u64(output.value).context("invalid orchard output amount")?, memo_for_role(output.role))?;
     }
 
     let signing_set = TransparentSigningSet::new();
@@ -712,31 +747,13 @@ pub(crate) fn build_lane_advance_tx(
         anyhow::bail!("note value {} is not enough to pay fee {}", note_value, fee);
     }
 
-    let build_config = BuildConfig::Standard {
-        sapling_anchor: None,
-        orchard_anchor: Some(anchor),
-        // This builder targets the Orchard pool. Ironwood shares Orchard's
-        // proof system but has its own commitment and nullifier state, so it
-        // needs its own anchor and note tracking -- see the follow-up note in
-        // the PR description.
-        ironwood_anchor: None,
-        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
-    };
     let height = BlockHeight::from_u32(target_height);
+    let pool = ShieldedPool::at_height(&network_params, height);
+    let build_config = pool.build_config(anchor);
     let mut builder = Builder::new(network_params, height, build_config);
 
-    builder
-        .add_orchard_spend::<zip317::FeeError>(keys.fvk.clone(), tracked.note, merkle_path)
-        .map_err(|e| anyhow::anyhow!("add_orchard_spend: {e}"))?;
-    builder
-        .add_orchard_change_output::<zip317::FeeError>(
-            keys.fvk.clone(),
-            Some(keys.ovk.clone()),
-            keys.address,
-            Zatoshis::from_u64(note_value - fee).context("invalid orchard lane amount")?,
-            memo_for_role(NoteRole::Lane),
-        )
-        .map_err(|e| anyhow::anyhow!("add_orchard_change_output: {e}"))?;
+    pool.add_spend(&mut builder, keys.fvk.clone(), tracked.note, merkle_path)?;
+        pool.add_output(&mut builder, keys.fvk.clone(), keys.ovk.clone(), keys.address, Zatoshis::from_u64(note_value - fee).context("invalid orchard lane amount")?, memo_for_role(NoteRole::Lane))?;
 
     let signing_set = TransparentSigningSet::new();
     let fee_rule = zip317::FeeRule::standard();
@@ -786,31 +803,13 @@ pub(crate) async fn build_and_send_lane_advance_tx(
         anyhow::bail!("note value {} is not enough to pay fee {}", note_value, fee);
     }
 
-    let build_config = BuildConfig::Standard {
-        sapling_anchor: None,
-        orchard_anchor: Some(anchor),
-        // This builder targets the Orchard pool. Ironwood shares Orchard's
-        // proof system but has its own commitment and nullifier state, so it
-        // needs its own anchor and note tracking -- see the follow-up note in
-        // the PR description.
-        ironwood_anchor: None,
-        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
-    };
     let height = BlockHeight::from_u32(target_height);
+    let pool = ShieldedPool::at_height(&network_params, height);
+    let build_config = pool.build_config(anchor);
     let mut builder = Builder::new(network_params, height, build_config);
 
-    builder
-        .add_orchard_spend::<zip317::FeeError>(keys.fvk.clone(), tracked.note, merkle_path)
-        .map_err(|e| anyhow::anyhow!("add_orchard_spend: {e}"))?;
-    builder
-        .add_orchard_change_output::<zip317::FeeError>(
-            keys.fvk.clone(),
-            Some(keys.ovk.clone()),
-            keys.address,
-            Zatoshis::from_u64(note_value - fee).context("invalid orchard lane amount")?,
-            memo_for_role(NoteRole::Lane),
-        )
-        .map_err(|e| anyhow::anyhow!("add_orchard_change_output: {e}"))?;
+    pool.add_spend(&mut builder, keys.fvk.clone(), tracked.note, merkle_path)?;
+        pool.add_output(&mut builder, keys.fvk.clone(), keys.ovk.clone(), keys.address, Zatoshis::from_u64(note_value - fee).context("invalid orchard lane amount")?, memo_for_role(NoteRole::Lane))?;
 
     let signing_set = TransparentSigningSet::new();
     let fee_rule = zip317::FeeRule::standard();
@@ -876,33 +875,15 @@ pub(crate) async fn build_and_send_reservoir_expand_tx(
 ) -> Result<SubmittedTx> {
     let planned_outputs = plan_reservoir_expand_outputs(tracked.value(), cfg)?;
 
-    let build_config = BuildConfig::Standard {
-        sapling_anchor: None,
-        orchard_anchor: Some(anchor),
-        // This builder targets the Orchard pool. Ironwood shares Orchard's
-        // proof system but has its own commitment and nullifier state, so it
-        // needs its own anchor and note tracking -- see the follow-up note in
-        // the PR description.
-        ironwood_anchor: None,
-        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
-    };
     let height = BlockHeight::from_u32(target_height);
+    let pool = ShieldedPool::at_height(&cfg.network_params, height);
+    let build_config = pool.build_config(anchor);
     let mut builder = Builder::new(cfg.network_params, height, build_config);
 
-    builder
-        .add_orchard_spend::<zip317::FeeError>(keys.fvk.clone(), tracked.note, merkle_path)
-        .map_err(|e| anyhow::anyhow!("add_orchard_spend: {e}"))?;
+    pool.add_spend(&mut builder, keys.fvk.clone(), tracked.note, merkle_path)?;
 
     for output in &planned_outputs {
-        builder
-            .add_orchard_change_output::<zip317::FeeError>(
-                keys.fvk.clone(),
-                Some(keys.ovk.clone()),
-                keys.address,
-                Zatoshis::from_u64(output.value).context("invalid orchard output amount")?,
-                memo_for_role(output.role),
-            )
-            .map_err(|e| anyhow::anyhow!("add_orchard_change_output: {e}"))?;
+            pool.add_output(&mut builder, keys.fvk.clone(), keys.ovk.clone(), keys.address, Zatoshis::from_u64(output.value).context("invalid orchard output amount")?, memo_for_role(output.role))?;
     }
 
     let signing_set = TransparentSigningSet::new();
