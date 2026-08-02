@@ -160,7 +160,7 @@ fleet.down()                        # tear down (omit for a long-running net)
 | `.run(cmd, *, background=None, role/...)` | `background="name"` ⇒ detached tmux |
 | `.collect(paths, *, role/..., dest=...)` | writes to `fleets/<name>/data/` |
 | `.status(*, role/..., rpc_port=...)` | RPC heights/health + `ok` flag |
-| `.reset(*, role/...)` | wipe node state without reprovisioning |
+| `.reset(*, role/...)` | wipe node state and per-run logs/traces without reprovisioning |
 | `.down(*, dry_run, force_tag)` | tear down by fleet tag |
 | `.archive(dest=...)` | tar the fleet dir |
 | `.plan()` | `up(dry_run=True)` |

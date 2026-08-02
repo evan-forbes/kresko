@@ -88,11 +88,12 @@ def reset_command(
     zebra_state_dir: str = "/root/.cache/zebra",
     zebra_config_dir: str = "/root/.config",
     log_dir: str = "/root/logs",
+    trace_dir: str = "/root/traces",
 ) -> str:
     """Render the shell command that resets a node to a clean pre-deploy state.
 
     Kills known tmux sessions, stops any stray zebrad/kresko processes, then
-    wipes state, configs, and logs. Idempotent: missing sessions/files are
+    wipes state, configs, logs, and traces. Idempotent: missing sessions/files are
     not errors.
     """
     parts = [
@@ -113,8 +114,10 @@ def reset_command(
         f"rm -f {shlex.quote(zebra_config_dir)}/zebrad.toml "
         f"{shlex.quote(zebra_config_dir)}/zebrad.bootstrap.toml "
         f"{shlex.quote(zebra_config_dir)}/funded_key.json",
-        # Wipe the unified log tree plus the kresko helper dir.
-        f"rm -rf {shlex.quote(log_dir)} /root/.kresko",
+        # Wipe per-run evidence plus the kresko helper dir. Callers must collect
+        # anything they need before reset; retaining JSONL files here causes the
+        # next run's trace oracle to evaluate stale process epochs.
+        f"rm -rf {shlex.quote(log_dir)} {shlex.quote(trace_dir)} /root/.kresko",
         # Legacy paths from earlier deploy layouts; harmless when missing.
         "rm -f /root/kresko-mine.log /root/kresko-mine-wait.sh "
         "/root/logs.bootstrap /root/payload.tar.gz",

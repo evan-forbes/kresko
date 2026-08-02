@@ -57,7 +57,7 @@ fleet.down()                                 # tear down (omit for a long-runnin
 | `.deploy(payload, *, role/name/pattern, state_snapshot=False, dry_run=)` | pyinfra/SSH payload ship |
 | `.run(cmd, *, background=None, role/..., log_path=, dry_run=)` | `background="name"` ⇒ detached tmux |
 | `.collect(paths, *, role/..., dest=)` / `.download_traces(...)` | write to `fleets/<name>/data/` |
-| `.status(*, role/..., rpc_port=)` / `.reset(...)` | RPC heights+`ok`; `reset` wipes node state in place |
+| `.status(*, role/..., rpc_port=)` / `.reset(...)` | RPC heights+`ok`; `reset` wipes node state and per-run evidence in place |
 | `.archive(dest=)` / `.down(*, dry_run, force_tag)` | bundle / tear down by fleet tag |
 | `.shell([...])` | run the Rust binary (or any cmd) locally, teeing logs into the fleet dir |
 | `.add_explorer(node=)` + `.deploy_explorer()` / `redeploy/_status/_logs/_stop/plan_` | co-located block explorer |

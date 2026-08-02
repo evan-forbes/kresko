@@ -566,7 +566,7 @@ class Fleet:
         tmux_sessions: tuple[str, ...] = RESET_TMUX_SESSIONS,
         dry_run: bool = False,
     ) -> dict[str, Any]:
-        """Wipe Zebra state, configs, logs, and kresko tmux sessions on selected nodes.
+        """Wipe Zebra state, configs, logs, traces, and tmux sessions on selected nodes.
 
         Starts the next deploy from a clean slate without re-provisioning. The
         cloud instances themselves are untouched — run `down` for that.
