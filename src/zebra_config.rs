@@ -187,6 +187,17 @@ fn tune_public_block_sync(config: &mut toml::Value) {
         &["sync", "download_concurrency_limit"],
         PUBLIC_BLOCK_SYNC_DOWNLOAD_CONCURRENCY_LIMIT.into(),
     );
+    // Public nodes must not force-enable the mempool from genesis. Zebra's
+    // embedded default config leaks `mempool.debug_enable_at_height = 0`, which
+    // keeps the mempool running the entire sync instead of activating only near
+    // the tip. Strip it so public nodes behave like normal nodes. LocalGenesis
+    // (mining) sets this deliberately and does not call this helper.
+    if let Some(mempool) = config
+        .get_mut("mempool")
+        .and_then(toml::Value::as_table_mut)
+    {
+        mempool.remove("debug_enable_at_height");
+    }
 }
 
 fn zebra_default_config_value() -> Result<toml::Value> {
@@ -876,6 +887,21 @@ mod tests {
                 .and_then(toml::Value::as_integer),
             Some(0),
         );
+    }
+
+    #[test]
+    fn generated_public_templates_do_not_force_enable_mempool() {
+        for network_kind in [NetworkKind::PublicTestnet, NetworkKind::Mainnet] {
+            let config = template_for(network_kind).expect("template generation");
+            let config = parsed(&config);
+
+            assert_eq!(
+                config
+                    .get("mempool")
+                    .and_then(|mempool| mempool.get("debug_enable_at_height")),
+                None,
+            );
+        }
     }
 
     #[test]
