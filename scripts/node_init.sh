@@ -371,7 +371,7 @@ if [ -f "$GENESIS_BLOCK_FILE" ] || [ -f "$PREMINE_BLOCKS_FILE" ]; then
             fi
 
             block_accepted=0
-            for retry in $(seq 1 10); do
+            for retry in $(seq 1 30); do
                 submit_response=$(curl -sS --max-time 10 \
                     -H "Content-Type: application/json" \
                     --data "{\"jsonrpc\":\"2.0\",\"id\":\"kresko\",\"method\":\"submitblock\",\"params\":[\"$block_hex\"]}" \
@@ -394,8 +394,8 @@ if [ -f "$GENESIS_BLOCK_FILE" ] || [ -f "$PREMINE_BLOCKS_FILE" ]; then
                     break
                 fi
 
-                if [ "$submit_result" = "rejected" ] && [ "$retry" -lt 10 ]; then
-                    echo "=== submitblock returned 'rejected' for seed block $((submitted+1)), retry $retry/10 ===" >&2
+                if [ "$submit_result" = "rejected" ] && [ "$retry" -lt 30 ]; then
+                    echo "=== submitblock returned 'rejected' for seed block $((submitted+1)), retry $retry/30 ===" >&2
                     sleep 2
                     continue
                 fi
@@ -411,6 +411,37 @@ if [ -f "$GENESIS_BLOCK_FILE" ] || [ -f "$PREMINE_BLOCKS_FILE" ]; then
             done
 
             submitted=$((submitted + 1))
+            committed=0
+            for attempt in $(seq 1 60); do
+                current_height_response=$(curl -sS --max-time 2 \
+                    -H "Content-Type: application/json" \
+                    --data '{"jsonrpc":"2.0","id":"kresko","method":"getblockchaininfo","params":[]}' \
+                    "$KRESKO_RPC_URL" 2>&1 || true)
+                if rpc_has_result_and_no_error "$current_height_response"; then
+                    current_height=$(printf '%s' "$current_height_response" | jq -r '.result.blocks // -1' 2>/dev/null || echo -1)
+                    if [ "$current_height" -ge "$submitted" ] 2>/dev/null; then
+                        committed=1
+                        break
+                    fi
+                fi
+                if ! kill -0 "$bootstrap_pid" 2>/dev/null; then
+                    break
+                fi
+                sleep 1
+            done
+            if [ "$committed" -ne 1 ]; then
+                echo "=== Timed out waiting for seed block $submitted to commit ===" >&2
+                if [ -f "$BOOTSTRAP_LOG" ]; then
+                    tail -n 120 "$BOOTSTRAP_LOG" || true
+                fi
+                if kill -0 "$bootstrap_pid" 2>/dev/null; then
+                    kill -INT "$bootstrap_pid" 2>/dev/null || true
+                    sleep 2
+                    kill -TERM "$bootstrap_pid" 2>/dev/null || true
+                fi
+                wait "$bootstrap_pid" 2>/dev/null || true
+                exit 1
+            fi
             if [ "$total_blocks" -gt 0 ]; then
                 if [ "$submitted" -eq 1 ] || [ $((submitted % 10)) -eq 0 ] || [ "$submitted" -eq "$total_blocks" ]; then
                     echo "=== Seed load progress: $submitted/$total_blocks blocks ==="

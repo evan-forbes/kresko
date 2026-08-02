@@ -85,6 +85,16 @@ def test_node_init_detects_early_zebrad_exit_and_dumps_log_tail():
     assert "exited within 10s with code" in text
 
 
+def test_node_init_serializes_seed_block_commits():
+    text = _script_text()
+
+    assert "for retry in $(seq 1 30)" in text
+    assert "retry $retry/30" in text
+    assert "for attempt in $(seq 1 60)" in text
+    assert 'if [ "$current_height" -ge "$submitted" ]' in text
+    assert "Timed out waiting for seed block $submitted to commit" in text
+
+
 def test_public_node_init_runs_zebrad_under_systemd_with_raised_fd_limit():
     text = _public_script_text()
 
