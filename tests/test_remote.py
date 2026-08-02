@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from kresko.remote import APT_LOCK_WAIT, state_snapshot_command, tmux_kill_command, tmux_start_command
+from kresko.remote import (
+    APT_LOCK_WAIT,
+    collection_archive_path,
+    state_snapshot_command,
+    tmux_kill_command,
+    tmux_start_command,
+)
 
 
 def test_tmux_command_rendering_quotes_session_and_logs():
@@ -73,3 +79,12 @@ def test_state_snapshot_command_falls_back_to_p2p_when_snapshot_fails():
     assert "&& tar -xzf" in cmd
     assert "snapshot hydration failed with exit $status; falling back to P2P block sync" in cmd
     assert "rm -f /tmp/kresko-state-snapshot.tar.gz" in cmd
+
+
+def test_collection_archive_path_is_unique_per_node(tmp_path):
+    producer = collection_archive_path(str(tmp_path), "producer-0")
+    candidate = collection_archive_path(str(tmp_path), "candidate-0")
+
+    assert producer == str(tmp_path / "producer-0" / "kresko-collect.tar.gz")
+    assert candidate == str(tmp_path / "candidate-0" / "kresko-collect.tar.gz")
+    assert producer != candidate

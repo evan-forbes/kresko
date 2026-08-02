@@ -293,6 +293,7 @@ def pyinfra_kill_tmux(session: str) -> None:
 
 
 def pyinfra_collect(paths: list[str], destination: str) -> None:
+    from pyinfra import host
     from pyinfra.operations import files, server
 
     server.shell(name="Prepare collection tarball", commands=["rm -f /tmp/kresko-collect.tar.gz"])
@@ -304,8 +305,13 @@ def pyinfra_collect(paths: list[str], destination: str) -> None:
     files.get(
         name="Fetch artifact archive",
         src="/tmp/kresko-collect.tar.gz",
-        dest=f"{destination}/{{{{ host.data.kresko_name }}}}/kresko-collect.tar.gz",
+        dest=collection_archive_path(destination, str(host.data.kresko_name)),
+        create_local_dir=True,
     )
+
+
+def collection_archive_path(destination: str, node_name: str) -> str:
+    return str(Path(destination) / node_name / "kresko-collect.tar.gz")
 
 
 def pyinfra_state_snapshot(url: str, cache_dir: str = ZEBRA_STATE_CACHE_DIR) -> None:
