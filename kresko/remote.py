@@ -19,6 +19,7 @@ DEFAULT_STATE_SNAPSHOT_URL = "http://38.190.136.76:9997/"
 
 # Where zebrad keeps its state cache on a node (matches scripts/node_init*.sh).
 ZEBRA_STATE_CACHE_DIR = "/root/.cache/zebra"
+ZAKURA_NETWORK_CACHE_DIR = "/root/.cache/zakura"
 
 
 def state_snapshot_command(url: str, *, cache_dir: str = ZEBRA_STATE_CACHE_DIR) -> str:
@@ -86,6 +87,7 @@ def reset_command(
     *,
     tmux_sessions: tuple[str, ...] = RESET_TMUX_SESSIONS,
     zebra_state_dir: str = "/root/.cache/zebra",
+    zakura_network_cache_dir: str = ZAKURA_NETWORK_CACHE_DIR,
     zebra_config_dir: str = "/root/.config",
     log_dir: str = "/root/logs",
     trace_dir: str = "/root/traces",
@@ -108,8 +110,11 @@ def reset_command(
         # Stop any leftover daemons that might keep the state dir busy.
         "pkill -x zebrad 2>/dev/null || true",
         "pkill -f '[k]resko mine' 2>/dev/null || true",
-        # Wipe Zebra state.
+        # Wipe Zebra state and Zakura's separate network peer cache. Leaving
+        # cached peers behind lets an isolated bootstrap reconnect during seed
+        # replay even when its rendered initial peer lists are empty.
         f"rm -rf {shlex.quote(zebra_state_dir)}",
+        f"rm -rf {shlex.quote(zakura_network_cache_dir)}",
         # Wipe deployed configs (matches what node_init.sh writes).
         f"rm -f {shlex.quote(zebra_config_dir)}/zebrad.toml "
         f"{shlex.quote(zebra_config_dir)}/zebrad.bootstrap.toml "

@@ -417,6 +417,7 @@ def test_reset_wipes_state_and_sessions(home):
     assert result["stage"] == "reset"
     body = captured["body"]
     assert "rm -rf /root/.cache/zebra" in body
+    assert "rm -rf /root/.cache/zakura" in body
     assert "tmux kill-session -t zebra" in body
     assert "tmux kill-session -t mine" in body
 
