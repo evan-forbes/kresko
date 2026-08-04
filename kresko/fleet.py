@@ -606,6 +606,40 @@ class Fleet:
         out["ok"] = report.total > 0 and report.unreachable == 0
         return out
 
+    def heights(
+        self,
+        *,
+        role: str | list[str] | None = None,
+        name: str | list[str] | None = None,
+        pattern: str | list[str] | None = None,
+        out: str | Path | None = None,
+        start_height: int = 0,
+        end_height: int | None = None,
+        rpc_port: int | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Walk each node's best chain into `data/heights.jsonl`.
+
+        This is the canonical-chain input the fork and block-time analyses read,
+        and it is separate from `download_traces()`: the traces come off the
+        nodes' disks, this comes off their RPC, so it must be collected while the
+        fleet is still up.
+        """
+        from kresko import heights as heights_mod
+        from kresko import status as status_mod
+
+        nodes = self._select(role=role, name=name, pattern=pattern, failed_from=None)
+        port = rpc_port or int(os.environ.get("KRESKO_RPC_PORT", status_mod.DEFAULT_RPC_PORT))
+        out_path = Path(out) if out else (self.dir / "data" / "heights.jsonl")
+        return heights_mod.collect(
+            nodes,
+            out_path,
+            start_height=start_height,
+            end_height=end_height,
+            rpc_port=port,
+            timeout=timeout or status_mod.DEFAULT_TIMEOUT,
+        )
+
     def archive(self, dest: str | Path | None = None) -> dict[str, Any]:
         """Tar the fleet dir into a reproducible bundle.
 

@@ -81,6 +81,42 @@ def main(argv: list[str] | None = None) -> int:
     p_status.add_argument("--summary", action="store_true", help="print aggregate height stats only")
     p_status.add_argument("--json", action="store_true", help="emit JSON instead of a table")
 
+    p_heights = sub.add_parser(
+        "heights",
+        help="Walk each node's best chain over RPC into heights.jsonl",
+    )
+    p_heights.add_argument("fleet", nargs="?", help="fleet name (filters by fleet tag)")
+    p_heights.add_argument("--tag", action="append", default=[], help="filter by tag (repeat for AND)")
+    p_heights.add_argument("--provider", help="filter by provider name")
+    p_heights.add_argument("--role", action="append", default=None, help="filter by role (repeat)")
+    p_heights.add_argument("--name", action="append", default=None, help="filter by node name (repeat)")
+    p_heights.add_argument(
+        "--pattern", action="append", default=None, help="fnmatch pattern over node names (repeat)"
+    )
+    p_heights.add_argument(
+        "--out",
+        help="output path (default: ~/.kresko/fleets/<fleet>/data/heights.jsonl)",
+    )
+    p_heights.add_argument("--start-height", type=int, default=0, help="first height to walk")
+    p_heights.add_argument(
+        "--end-height",
+        type=int,
+        default=None,
+        help="last height to walk (default: each node's own tip, which is what shows disagreement)",
+    )
+    p_heights.add_argument(
+        "--rpc-port",
+        type=int,
+        default=int(os.environ.get("KRESKO_RPC_PORT", status.DEFAULT_RPC_PORT)),
+        help=(
+            "RPC port to query (default: $KRESKO_RPC_PORT or "
+            f"{status.DEFAULT_RPC_PORT}; local-genesis nodes use 18232)"
+        ),
+    )
+    p_heights.add_argument(
+        "--timeout", type=float, default=status.DEFAULT_TIMEOUT, help="per-call RPC timeout in seconds"
+    )
+
     p_assets = sub.add_parser("assets", help="Inspect the asset store")
     p_assets_sub = p_assets.add_subparsers(dest="assets_command", required=True)
     p_assets_list = p_assets_sub.add_parser("list", help="List assets, optionally filtered")
@@ -124,6 +160,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_sync(args)
     if args.command == "status":
         return cmd_status(args)
+    if args.command == "heights":
+        return cmd_heights(args)
     if args.command == "assets":
         return cmd_assets(args)
     if args.command == "down":
@@ -198,6 +236,40 @@ def cmd_status(args: argparse.Namespace) -> int:
     else:
         print(status.render_report(report))
     return 0
+
+
+def cmd_heights(args: argparse.Namespace) -> int:
+    from kresko import heights as heights_mod
+
+    paths.ensure_home()
+    tags = list(args.tag)
+    if args.fleet:
+        tags.append(fleet_tag(args.fleet))
+    items = assets.list_assets(tags=tags, provider=args.provider)
+    items = selectors.select(
+        items,
+        roles=args.role,
+        names=args.name,
+        patterns=args.pattern,
+    )
+
+    out = args.out
+    if out is None:
+        if not args.fleet:
+            print("--out is required when no fleet name is given", file=sys.stderr)
+            return 2
+        out = paths.fleets_dir() / args.fleet / "data" / "heights.jsonl"
+
+    summary = heights_mod.collect(
+        items,
+        out,
+        start_height=args.start_height,
+        end_height=args.end_height,
+        rpc_port=args.rpc_port,
+        timeout=args.timeout,
+    )
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0 if summary["ok"] else 1
 
 
 def cmd_assets(args: argparse.Namespace) -> int:

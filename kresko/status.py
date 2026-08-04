@@ -187,9 +187,13 @@ def render_summary(summary: dict[str, Any]) -> str:
 
 
 def _rpc_call(
-    session: requests.Session, url: str, method: str, timeout: float
+    session: requests.Session,
+    url: str,
+    method: str,
+    timeout: float,
+    params: list[Any] | None = None,
 ) -> Any:
-    body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": []}
+    body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}
     resp = session.post(url, json=body, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
