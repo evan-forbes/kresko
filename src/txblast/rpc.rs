@@ -86,6 +86,13 @@ impl ZebraRpcClient {
         self.call("getblockchaininfo", serde_json::json!([])).await
     }
 
+    /// Issue an arbitrary JSON-RPC call and return the raw `result` value.
+    /// Used by `seed-local` for `submitblock`, whose non-error results
+    /// (`null`, `"duplicate*"`, `"rejected"`) must be inspected directly.
+    pub async fn call_raw(&self, method: &str, params: Value) -> Result<Value> {
+        self.call(method, params).await
+    }
+
     pub async fn send_raw_transaction(&self, hex_tx: &str) -> Result<String> {
         let mut queue_full_retries = 0usize;
 

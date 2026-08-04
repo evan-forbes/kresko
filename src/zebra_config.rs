@@ -79,6 +79,10 @@ pub struct LocalTestnetParameters {
     pub slow_start_interval: u32,
     pub pre_blossom_halving_interval: u32,
     pub activation_height: u32,
+    /// Newest upgrade the generated chain activates, as it appears in the
+    /// config's activation table (e.g. "NU6.3"). Everything below it is
+    /// activated too; nothing above it is written.
+    pub latest_upgrade: String,
     /// One-time NU6.1 lockbox disbursements emitted in
     /// `[[network.testnet_parameters.lockbox_disbursements]]`. Kresko's
     /// default local-genesis path uses a zero-zat synthetic P2SH entry so
@@ -95,6 +99,39 @@ pub struct LocalTestnetParameters {
 pub struct TestnetTomlParameters {
     pub post_blossom_pow_target_spacing: Option<u32>,
     pub daa: DaaConfig,
+}
+
+/// Network upgrades a local-genesis chain activates, newest last.
+///
+/// The writer and the verifier must agree exactly, so both derive the list
+/// here. NU7 is included only when the generated chain activates it: a node
+/// build without the NU7 consensus branch id cannot mine a chain that
+/// declares an NU7 activation.
+/// Local-genesis activation table, oldest first.
+///
+/// Everything up to and including the chain's newest upgrade is activated at
+/// the same height. The tail is optional because a node build without an
+/// upgrade's consensus branch id cannot mine a chain that declares it.
+const LOCAL_GENESIS_UPGRADES: &[&str] = &[
+    "Overwinter",
+    "Sapling",
+    "Blossom",
+    "Heartwood",
+    "Canopy",
+    "NU5",
+    "NU6",
+    "NU6.1",
+    "NU6.2",
+    "NU6.3",
+    "NU7",
+];
+
+fn local_genesis_upgrade_names(latest: &str) -> Vec<&'static str> {
+    let end = LOCAL_GENESIS_UPGRADES
+        .iter()
+        .position(|name| *name == latest)
+        .unwrap_or(LOCAL_GENESIS_UPGRADES.len() - 1);
+    LOCAL_GENESIS_UPGRADES[..=end].to_vec()
 }
 
 pub fn template_for(network_kind: NetworkKind) -> Result<String> {
@@ -201,7 +238,7 @@ fn tune_public_block_sync(config: &mut toml::Value) {
 }
 
 fn zebra_default_config_value() -> Result<toml::Value> {
-    toml::Value::try_from(zebrad::config::ZebradConfig::default())
+    toml::Value::try_from(zebrad::config::ZakuradConfig::default())
         .context("failed to serialize Zebra default config")
 }
 
@@ -523,17 +560,7 @@ pub fn apply_local_testnet_parameters(
     // NU6.1 is the one-time ZIP-271 lockbox disbursement event. Local genesis
     // activates it at the same height as NU7 with a zero-zat synthetic
     // disbursement so Zebra's NU6.1 config validation is explicit.
-    for upgrade in [
-        "Overwinter",
-        "Sapling",
-        "Blossom",
-        "Heartwood",
-        "Canopy",
-        "NU5",
-        "NU6",
-        "NU6.1",
-        "NU7",
-    ] {
+    for upgrade in local_genesis_upgrade_names(&params.latest_upgrade) {
         activation_heights.insert(
             upgrade.to_string(),
             toml::Value::Integer(i64::from(params.activation_height)),
@@ -611,17 +638,7 @@ pub fn verify_local_testnet_parameters(
         .get("activation_heights")
         .and_then(toml::Value::as_table)
         .context("missing network.testnet_parameters.activation_heights table")?;
-    for upgrade in [
-        "Overwinter",
-        "Sapling",
-        "Blossom",
-        "Heartwood",
-        "Canopy",
-        "NU5",
-        "NU6",
-        "NU6.1",
-        "NU7",
-    ] {
+    for upgrade in local_genesis_upgrade_names(&params.latest_upgrade) {
         let height = activation
             .get(upgrade)
             .and_then(toml::Value::as_integer)
@@ -765,6 +782,306 @@ fn extract_miner_address(template: &str) -> Option<String> {
     None
 }
 
+// ---------------------------------------------------------------------------- #
+// Local-fleet config rewriting (formerly the harness's prepare_node_dirs)
+//
+// The mempool-load harness runs N zakurad nodes on one host, each on a distinct
+// 127.0.0.x loopback, so Kresko's one-node-per-host template (0.0.0.0 binds,
+// shared /root state dir) has to be re-pointed per node. This used to live as
+// ~350 lines of line-oriented TOML rewriting in mempool-load-lab.py.
+//
+// It is kept LINE-ORIENTED here on purpose rather than round-tripping through
+// `toml::Value`: Kresko renders each config one key per line with
+// `toml::to_string_pretty`, and preserving that layout keeps the rendered
+// per-node config byte-identical to the former Python output — the strongest
+// possible regression check for a refactor that must not change node behavior.
+// ---------------------------------------------------------------------------- #
+
+// Kresko's fixed per-host ports (see template_for). The harness varies the bind
+// address rather than these, so localized configs need no port rewriting.
+const LOCAL_FLEET_P2P_PORT: u16 = 18233;
+const LOCAL_FLEET_RPC_PORT: u16 = 18232;
+// Prometheus scrape endpoint. The mempool backpressure counters the harness
+// grades on are only exposed here, not over JSON-RPC.
+const LOCAL_FLEET_METRICS_PORT: u16 = 19999;
+// The Zakura p2p stack's own listener: present in the config even when the
+// default stack leaves it unused, and it still binds a wildcard port every node
+// would otherwise contend for.
+const LOCAL_FLEET_ZAKURA_P2P_PORT: u16 = 18234;
+
+// Public seed-peer arrays emptied on an isolated local chain. Cleared by bare
+// key name (not dotted path) to match every section they may appear in, exactly
+// as the harness did. The loopback `initial_testnet_peers` list is preserved.
+const LOCAL_FLEET_PUBLIC_PEER_KEYS: [&str; 2] = ["initial_mainnet_peers", "bootstrap_peers"];
+
+/// One node's placement in a local fleet, addressing the harness's on-disk
+/// layout so the rendered config is byte-identical to the old Python output.
+#[derive(Debug, Clone)]
+pub struct LocalFleetNode {
+    /// Loopback address this node binds (e.g. `127.0.0.101`).
+    pub ip: String,
+    /// Absolute per-node directory (`<lab>/nodes/<name>`), whose subdirs hold
+    /// this node's own state DB, peer cache, identity, and cookie.
+    pub node_dir: std::path::PathBuf,
+    /// Whether this node runs zakurad's internal miner (only the designated
+    /// miners produce blocks; the rest are pure relay/mempool peers).
+    pub is_miner: bool,
+    /// The other nodes' `ip:p2p` addresses this node dials.
+    pub peers: Vec<String>,
+}
+
+/// Rewrite one generated node config for local-fleet use.
+///
+/// Mirrors the harness's per-file rewrite: re-point every remote-deployment
+/// absolute path and 0.0.0.0 bind at this node's own loopback and directories,
+/// insert the metrics endpoint and internal-miner flag, empty the public
+/// seed-peer lists, and (for the running config) set the loopback peer list.
+///
+/// `bootstrap` selects the P2P-disabled variant used for seeding: it keeps
+/// Kresko's own `network.listen_addr` and omits the loopback peer list, matching
+/// how the harness treats `zebrad.bootstrap.toml`.
+pub fn localize_local_fleet_config(
+    config: &str,
+    node: &LocalFleetNode,
+    checkpoints_path: &str,
+    bootstrap: bool,
+) -> Result<String> {
+    let dir = |sub: &str| quote(&node.node_dir.join(sub).display().to_string());
+
+    // Re-point every remote-deployment absolute path and shared bind at this
+    // node's own directory, so N nodes never share a state DB, peer cache,
+    // identity, cookie, or listener. These keys must already exist; a missing
+    // one means Kresko's template drifted and is surfaced loudly.
+    let mut updates: Vec<(String, String)> = vec![
+        ("network.cache_dir".into(), dir("peer-cache")),
+        ("network.identity_dir".into(), dir("identity")),
+        ("state.cache_dir".into(), dir("state")),
+        ("rpc.cookie_dir".into(), dir("cookie")),
+        (
+            "rpc.listen_addr".into(),
+            quote(&format!("{}:{LOCAL_FLEET_RPC_PORT}", node.ip)),
+        ),
+        (
+            "network.testnet_parameters.checkpoints".into(),
+            quote(checkpoints_path),
+        ),
+        (
+            "network.zakura.listen_addr".into(),
+            quote(&format!("{}:{LOCAL_FLEET_ZAKURA_P2P_PORT}", node.ip)),
+        ),
+    ];
+    // The bootstrap config runs P2P-disabled on an isolated RPC, so it keeps
+    // Kresko's own network.listen_addr handling.
+    if !bootstrap {
+        updates.push((
+            "network.listen_addr".into(),
+            quote(&format!("{}:{LOCAL_FLEET_P2P_PORT}", node.ip)),
+        ));
+    }
+    let mut text = set_toml_values(config, &updates, false)?;
+
+    // Inserted rather than replaced: Kresko writes neither key.
+    text = set_toml_values(
+        &text,
+        &[
+            (
+                "metrics.endpoint_addr".into(),
+                quote(&format!("{}:{LOCAL_FLEET_METRICS_PORT}", node.ip)),
+            ),
+            (
+                "mining.internal_miner".into(),
+                (if node.is_miner { "true" } else { "false" }).to_string(),
+            ),
+        ],
+        true,
+    )?;
+
+    let cleared: Vec<(&str, Vec<String>)> = LOCAL_FLEET_PUBLIC_PEER_KEYS
+        .iter()
+        .map(|key| (*key, Vec::new()))
+        .collect();
+    text = set_toml_arrays(&text, &cleared, false)?;
+
+    // Kresko bakes the peer list at genesis time from config.json's addresses.
+    // Regenerating it here from the live addressing keeps the run correct even
+    // if genesis ran with a different node count or address base; a stale list
+    // silently yields a 0-peer network that measures nothing.
+    if !bootstrap {
+        text = set_toml_arrays(
+            &text,
+            &[("initial_testnet_peers", node.peers.clone())],
+            true,
+        )?;
+    }
+
+    Ok(text)
+}
+
+fn quote(value: &str) -> String {
+    format!("\"{value}\"")
+}
+
+/// Split into lines like Python's `str.splitlines()` for `\n`-delimited text:
+/// a single trailing newline does not yield an empty final element. The rewrite
+/// helpers rejoin with `"\n"` and re-add one trailing `\n`, so this keeps the
+/// line count exact and the output byte-identical to the former Python output.
+fn splitlines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    body.split('\n').collect()
+}
+
+/// Set `section.key = value` entries in a rendered config, addressed by full
+/// dotted path. Line-oriented so untouched lines keep their exact bytes.
+///
+/// Addressing is by dotted `section.key` rather than bare key because the same
+/// key recurs across sections (`cache_dir` is both the peer cache and the state
+/// DB; `listen_addr` appears in `[network]`, `[rpc]`, and `[network.zakura]`).
+/// Missing keys are an error unless `insert_missing`, so Kresko template drift
+/// fails loudly instead of leaving a node on a default binding.
+pub fn set_toml_values(
+    text: &str,
+    updates: &[(String, String)],
+    insert_missing: bool,
+) -> Result<String> {
+    let mut remaining: std::collections::HashMap<String, String> =
+        updates.iter().cloned().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut section = String::new();
+    // Where each section's body ends in `out`, so a missing key can be inserted.
+    let mut section_end: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+
+    for line in splitlines(text) {
+        let stripped = line.trim();
+        if stripped.starts_with('[') && stripped.ends_with(']') {
+            section = stripped.trim_matches(|c| c == '[' || c == ']').to_string();
+        } else if stripped.contains('=') && !stripped.starts_with('#') {
+            let key = stripped
+                .split_once('=')
+                .map(|(k, _)| k.trim())
+                .unwrap_or("");
+            let path = if section.is_empty() {
+                key.to_string()
+            } else {
+                format!("{section}.{key}")
+            };
+            if let Some(value) = remaining.remove(&path) {
+                out.push(format!("{key} = {value}"));
+                section_end.insert(section.clone(), out.len());
+                continue;
+            }
+        }
+        if !section.is_empty() {
+            section_end.insert(section.clone(), out.len() + 1);
+        }
+        out.push(line.to_string());
+    }
+
+    if !remaining.is_empty() && !insert_missing {
+        let mut missing: Vec<&String> = remaining.keys().collect();
+        missing.sort();
+        anyhow::bail!(
+            "keys not found in generated config (Kresko template drift?): {}",
+            missing
+                .iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    // Insert leftovers at the end of their section, or append the section.
+    // Sorted in reverse so multiple appended sections land in a stable order,
+    // matching the harness's `sorted(..., reverse=True)`.
+    let mut leftovers: Vec<(String, String)> = remaining.into_iter().collect();
+    leftovers.sort_by(|a, b| b.0.cmp(&a.0));
+    for (path, value) in leftovers {
+        let (target_section, key) = match path.rsplit_once('.') {
+            Some((s, k)) => (s.to_string(), k.to_string()),
+            None => (String::new(), path.clone()),
+        };
+        if let Some(&idx) = section_end.get(&target_section) {
+            out.insert(idx, format!("{key} = {value}"));
+        } else {
+            out.push(String::new());
+            out.push(format!("[{target_section}]"));
+            out.push(format!("{key} = {value}"));
+        }
+    }
+
+    Ok(out.join("\n") + "\n")
+}
+
+/// Replace whole `key = [...]` arrays, single- or multi-line, addressed by bare
+/// key. Handles both forms Kresko emits, and errors for a missing key when
+/// `require` — a silently absent peer list yields a 0-peer network.
+pub fn set_toml_arrays(
+    text: &str,
+    arrays: &[(&str, Vec<String>)],
+    require: bool,
+) -> Result<String> {
+    let lookup: std::collections::HashMap<&str, &Vec<String>> =
+        arrays.iter().map(|(k, v)| (*k, v)).collect();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    let mut consuming = false;
+
+    for line in splitlines(text) {
+        let stripped = line.trim();
+        if consuming {
+            // Drop the old entries up to the closing bracket.
+            if stripped.starts_with(']') {
+                consuming = false;
+            }
+            continue;
+        }
+        let key = if stripped.contains('=') {
+            stripped
+                .split_once('=')
+                .map(|(k, _)| k.trim())
+                .unwrap_or("")
+        } else {
+            ""
+        };
+        // Match against the array keys (bare key, any section) and record the
+        // slice's own `&str` so `seen` shares its lifetime, not the line's.
+        let matched = arrays.iter().find(|(k, _)| *k == key).map(|(k, _)| *k);
+        if let Some(matched) = matched {
+            let items = lookup[matched];
+            seen.insert(matched);
+            if items.is_empty() {
+                out.push(format!("{key} = []"));
+            } else {
+                out.push(format!("{key} = ["));
+                for item in items {
+                    out.push(format!("    \"{item}\","));
+                }
+                out.push("]".to_string());
+            }
+            // A single-line `key = [...]` is fully consumed by this line.
+            consuming = !stripped.trim_end().ends_with(']');
+            continue;
+        }
+        out.push(line.to_string());
+    }
+
+    if require {
+        let missing: Vec<&str> = arrays
+            .iter()
+            .map(|(k, _)| *k)
+            .filter(|k| !seen.contains(k))
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!("array key(s) not found in generated config: {missing:?}");
+        }
+    }
+
+    Ok(out.join("\n") + "\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -772,8 +1089,9 @@ mod tests {
         PUBLIC_BLOCK_SYNC_DOWNLOAD_CONCURRENCY_LIMIT, PUBLIC_BLOCK_SYNC_PEER_TARGET,
         apply_local_testnet_parameters, bootstrap_config_for_isolated_rpc,
         default_nu6_1_lockbox_disbursements, ensure_miner_address_is_set, generate_node_config,
-        read_genesis_hash, read_miner_address, set_miner_address, strip_genesis_block_path,
-        template_for, testnet_toml_parameters, verify_local_testnet_parameters,
+        local_genesis_upgrade_names, read_genesis_hash, read_miner_address, set_miner_address,
+        strip_genesis_block_path, template_for, testnet_toml_parameters,
+        verify_local_testnet_parameters,
     };
     use crate::config::{DaaConfig, Instance, NetworkKind, NodeType, Provider};
 
@@ -856,7 +1174,7 @@ mod tests {
         // path unless an experiment explicitly asks for it.
         let default_config = parsed(
             &toml::to_string_pretty(
-                &toml::Value::try_from(zebrad::config::ZebradConfig::default())
+                &toml::Value::try_from(zebrad::config::ZakuradConfig::default())
                     .expect("zebra default should serialize"),
             )
             .expect("zebra default should re-serialize"),
@@ -1148,6 +1466,7 @@ initial_mainnet_peers = []
             Some("tmExampleAddress".to_string()),
         );
         let params = LocalTestnetParameters {
+            latest_upgrade: "NU7".to_string(),
             network_name: "ReadTestNet".to_string(),
             network_magic: [1, 2, 3, 4],
             target_difficulty_limit: "0x0f".to_string(),
@@ -1177,7 +1496,7 @@ initial_mainnet_peers = []
         // Trust upstream Zebra to define what fields a config has — kresko
         // only ever overlays a few mining-friendly knobs.
         let default_serialized = toml::to_string_pretty(
-            &toml::Value::try_from(zebrad::config::ZebradConfig::default())
+            &toml::Value::try_from(zebrad::config::ZakuradConfig::default())
                 .expect("zebra default should serialize"),
         )
         .expect("zebra default should re-serialize");
@@ -1204,6 +1523,7 @@ initial_mainnet_peers = []
         // target limit, checkpoints, activation heights) must round-trip
         // through apply_local_testnet_parameters intact.
         let params = LocalTestnetParameters {
+            latest_upgrade: "NU7".to_string(),
             network_name: "RequiredFieldsNet".to_string(),
             network_magic: [9, 8, 7, 6],
             target_difficulty_limit: "0x1f".to_string(),
@@ -1288,6 +1608,7 @@ initial_mainnet_peers = []
         lockbox: Vec<LockboxDisbursement>,
     ) -> LocalTestnetParameters {
         LocalTestnetParameters {
+            latest_upgrade: "NU7".to_string(),
             network_name: "CrossValTestNet".to_string(),
             network_magic: [4, 3, 2, 1],
             target_difficulty_limit: "0x0f".to_string(),
@@ -1404,6 +1725,84 @@ initial_mainnet_peers = []
     }
 
     #[test]
+    fn activation_table_stops_at_the_configured_upgrade() {
+        assert_eq!(
+            local_genesis_upgrade_names("NU6.1").last(),
+            Some(&"NU6.1"),
+            "nothing above the configured upgrade may be declared"
+        );
+        assert!(!local_genesis_upgrade_names("NU6.1").contains(&"NU6.2"));
+        assert!(!local_genesis_upgrade_names("NU6.1").contains(&"NU7"));
+    }
+
+    #[test]
+    fn nu6_3_activates_everything_below_it() {
+        // NU6.3 gates the Ironwood shielded pool, so a chain that stops short
+        // of it cannot exercise Ironwood at all.
+        let names = local_genesis_upgrade_names("NU6.3");
+        for expected in ["Overwinter", "NU5", "NU6", "NU6.1", "NU6.2", "NU6.3"] {
+            assert!(names.contains(&expected), "{expected} must be active");
+        }
+        assert!(!names.contains(&"NU7"));
+    }
+
+    #[test]
+    fn nu6_3_survives_the_writer_and_the_verifier() {
+        let mut params = local_testnet_params_with(
+            &"aa".repeat(32),
+            5,
+            vec![LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0).unwrap()],
+        );
+        params.latest_upgrade = "NU6.3".to_string();
+        let template = template_for(NetworkKind::LocalGenesis).expect("template");
+        let rendered =
+            apply_local_testnet_parameters(&template, &params).expect("apply parameters");
+        assert!(rendered.contains("NU6.3"));
+        assert!(!rendered.contains("NU7"));
+        verify_local_testnet_parameters(&rendered, &params)
+            .expect("an Ironwood-capable chain must pass cross-validation");
+    }
+
+    #[test]
+    fn writer_and_verifier_agree_when_the_chain_omits_nu7() {
+        // The writer and verifier each used to carry their own hardcoded
+        // upgrade list. When NU7 became optional only the writer was updated,
+        // so a chain without NU7 rendered a config the verifier then rejected
+        // with "missing activation height for NU7". Both now derive the list
+        // from local_genesis_upgrade_names().
+        let mut params = local_testnet_params_with(
+            &"aa".repeat(32),
+            5,
+            vec![LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0).unwrap()],
+        );
+        params.latest_upgrade = "NU6.1".to_string();
+        let template = template_for(NetworkKind::LocalGenesis).expect("template");
+        let rendered =
+            apply_local_testnet_parameters(&template, &params).expect("apply parameters");
+        assert!(
+            !rendered.contains("NU7"),
+            "a chain that does not activate NU7 must not declare it"
+        );
+        verify_local_testnet_parameters(&rendered, &params)
+            .expect("writer output must satisfy the verifier when NU7 is omitted");
+    }
+
+    #[test]
+    fn nu7_is_declared_when_the_chain_activates_it() {
+        let params = local_testnet_params_with(
+            &"aa".repeat(32),
+            5,
+            vec![LockboxDisbursement::new_p2sh(P2SH_TESTNET, 0).unwrap()],
+        );
+        assert_eq!(params.latest_upgrade, "NU7");
+        let template = template_for(NetworkKind::LocalGenesis).expect("template");
+        let rendered =
+            apply_local_testnet_parameters(&template, &params).expect("apply parameters");
+        assert!(rendered.contains("NU7"));
+        verify_local_testnet_parameters(&rendered, &params).expect("cross-validation");
+    }
+
+    #[test]
     fn verify_passes_when_chain_and_config_agree() {
         let params = local_testnet_params_with(
             &"aa".repeat(32),
@@ -1420,6 +1819,7 @@ initial_mainnet_peers = []
     #[test]
     fn injects_local_testnet_parameters() {
         let params = LocalTestnetParameters {
+            latest_upgrade: "NU7".to_string(),
             network_name: "LocalGenesisNet".to_string(),
             network_magic: [1, 2, 3, 4],
             target_difficulty_limit: "0x0f".to_string(),
@@ -1501,5 +1901,331 @@ initial_mainnet_peers = []
         );
         verify_local_testnet_parameters(&generated, &params)
             .expect("rendered config should preserve local testnet parameters");
+    }
+}
+
+#[cfg(test)]
+mod local_fleet_tests {
+    use super::{
+        LOCAL_FLEET_METRICS_PORT, LOCAL_FLEET_P2P_PORT, LOCAL_FLEET_RPC_PORT,
+        LOCAL_FLEET_ZAKURA_P2P_PORT, LocalFleetNode, localize_local_fleet_config, set_toml_arrays,
+        set_toml_values,
+    };
+    use std::path::PathBuf;
+
+    // A trimmed copy of what `kresko genesis` renders, keeping the structural
+    // features that broke a naive rewriter in the harness's first real run:
+    //   - `cache_dir` in both [network] (peer cache) and [state] (RocksDB)
+    //   - `listen_addr` in [network], [rpc], and [network.zakura]
+    //   - no internal_miner and no [metrics] section at all
+    //   - multi-line public seed-peer arrays
+    // Kept identical to the fixture in the harness's test_mempool_load.py so the
+    // ported Rust rewrite is checked against the same properties.
+    const GENERATED_CONFIG: &str = r#"[mempool]
+debug_enable_at_height = 0
+
+[mining]
+miner_address = "tmExampleAddress"
+
+[network]
+cache_dir = "/root/.cache/zebra-peers"
+identity_dir = "/root/.zakura"
+initial_mainnet_peers = [
+    "dnsseed.z.cash:8233",
+    "mainnet.seeder.zfnd.org:8233",
+]
+initial_testnet_peers = [
+    "127.0.0.1:18233",
+    "127.0.0.3:18233",
+]
+listen_addr = "0.0.0.0:18233"
+network = "Testnet"
+p2p_stack = "default"
+
+[network.testnet_parameters]
+checkpoints = "/root/payload/local_genesis/checkpoints.txt"
+disable_pow = true
+
+[network.zakura]
+bootstrap_peers = [
+    "abc@165.22.54.66:8234",
+    "def@104.131.184.123:8234",
+]
+listen_addr = "0.0.0.0:8234"
+
+[rpc]
+cookie_dir = "/root/.cache/zakura"
+enable_cookie_auth = false
+listen_addr = "0.0.0.0:18232"
+
+[state]
+cache_dir = "/root/.cache/zebra"
+ephemeral = false
+"#;
+
+    fn node_ip(index: usize) -> String {
+        format!("127.0.0.{}", 101 + index)
+    }
+
+    /// Body of `[name]`, up to the next section header.
+    fn section_of(text: &str, name: &str) -> String {
+        let body = text
+            .split_once(&format!("[{name}]\n"))
+            .unwrap_or_else(|| panic!("section [{name}] not found"))
+            .1;
+        let mut lines = Vec::new();
+        for line in body.lines() {
+            let t = line.trim();
+            if t.starts_with('[') && t.ends_with(']') {
+                break;
+            }
+            lines.push(line);
+        }
+        lines.join("\n")
+    }
+
+    fn values(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn localize_running(index: usize, miner: bool, peers: &[&str]) -> String {
+        let node = LocalFleetNode {
+            ip: node_ip(index),
+            node_dir: PathBuf::from(format!("/lab/miner-{index}")),
+            is_miner: miner,
+            peers: peers.iter().map(|p| p.to_string()).collect(),
+        };
+        localize_local_fleet_config(GENERATED_CONFIG, &node, "/lab/checkpoints.txt", false)
+            .expect("localize running config")
+    }
+
+    #[test]
+    fn same_key_in_two_sections_is_addressed_independently() {
+        // `cache_dir` exists in both [network] and [state]; a bare-key rewrite
+        // would hit only the first, leaving every node sharing one RocksDB.
+        let out = set_toml_values(
+            GENERATED_CONFIG,
+            &values(&[
+                ("network.cache_dir", "\"/lab/peers\""),
+                ("state.cache_dir", "\"/lab/state\""),
+            ]),
+            false,
+        )
+        .unwrap();
+        assert!(section_of(&out, "network").contains("cache_dir = \"/lab/peers\""));
+        assert!(section_of(&out, "state").contains("cache_dir = \"/lab/state\""));
+        assert!(!out.contains("/root/.cache/zebra"));
+    }
+
+    #[test]
+    fn listen_addr_is_set_per_section() {
+        let out = localize_running(1, false, &[]);
+        assert!(section_of(&out, "network").contains(&format!(
+            "listen_addr = \"{}:{LOCAL_FLEET_P2P_PORT}\"",
+            node_ip(1)
+        )));
+        assert!(section_of(&out, "rpc").contains(&format!(
+            "listen_addr = \"{}:{LOCAL_FLEET_RPC_PORT}\"",
+            node_ip(1)
+        )));
+        assert!(section_of(&out, "network.zakura").contains(&format!(
+            "listen_addr = \"{}:{LOCAL_FLEET_ZAKURA_P2P_PORT}\"",
+            node_ip(1)
+        )));
+    }
+
+    #[test]
+    fn missing_key_is_a_loud_failure() {
+        // Template drift must fail rather than silently leave a default binding.
+        let err = set_toml_values(
+            GENERATED_CONFIG,
+            &values(&[("state.nonexistent", "1")]),
+            false,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn wrong_section_is_also_a_loud_failure() {
+        // cache_dir exists, but not in [rpc]; this must not silently no-op.
+        let err = set_toml_values(
+            GENERATED_CONFIG,
+            &values(&[("rpc.cache_dir", "\"/x\"")]),
+            false,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn dotted_subsection_keys_are_addressable() {
+        let out = set_toml_values(
+            GENERATED_CONFIG,
+            &values(&[(
+                "network.testnet_parameters.checkpoints",
+                "\"/lab/checkpoints.txt\"",
+            )]),
+            false,
+        )
+        .unwrap();
+        assert!(out.contains("checkpoints = \"/lab/checkpoints.txt\""));
+        assert!(!out.contains("/root/payload"));
+    }
+
+    #[test]
+    fn internal_miner_is_inserted_into_the_mining_section() {
+        let out = localize_running(0, true, &[]);
+        assert!(section_of(&out, "mining").contains("internal_miner = true"));
+    }
+
+    #[test]
+    fn relay_nodes_do_not_mine() {
+        let out = localize_running(0, false, &[]);
+        assert!(section_of(&out, "mining").contains("internal_miner = false"));
+    }
+
+    #[test]
+    fn metrics_section_is_created_when_absent() {
+        // Kresko emits no [metrics] section, but the backpressure counters the
+        // harness grades are Prometheus-only.
+        assert!(!GENERATED_CONFIG.contains("[metrics]"));
+        let out = localize_running(1, false, &[]);
+        assert!(out.contains("[metrics]"));
+        assert!(section_of(&out, "metrics").contains(&format!(
+            "endpoint_addr = \"{}:{LOCAL_FLEET_METRICS_PORT}\"",
+            node_ip(1)
+        )));
+    }
+
+    #[test]
+    fn insertion_is_idempotent() {
+        let once = localize_running(1, false, &[]);
+        let twice =
+            set_toml_values(&once, &values(&[("mining.internal_miner", "false")]), true).unwrap();
+        assert_eq!(twice.matches("internal_miner").count(), 1);
+        assert_eq!(twice.matches("[metrics]").count(), 1);
+    }
+
+    #[test]
+    fn public_seed_peers_are_emptied() {
+        let out = localize_running(1, false, &["127.0.0.101:18233"]);
+        assert!(out.contains("initial_mainnet_peers = []"));
+        assert!(out.contains("bootstrap_peers = []"));
+        for host in [
+            "dnsseed.z.cash",
+            "zfnd.org",
+            "165.22.54.66",
+            "104.131.184.123",
+        ] {
+            assert!(!out.contains(host), "public host {host} survived");
+        }
+    }
+
+    #[test]
+    fn clearing_public_peers_preserves_the_loopback_list() {
+        // Emptying the public arrays must not disturb initial_testnet_peers.
+        let out = set_toml_arrays(
+            GENERATED_CONFIG,
+            &[
+                ("initial_mainnet_peers", Vec::new()),
+                ("bootstrap_peers", Vec::new()),
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(out.contains("127.0.0.1:18233"));
+        assert!(out.contains("127.0.0.3:18233"));
+    }
+
+    #[test]
+    fn peer_list_is_regenerated_from_live_addressing() {
+        // genesis baked 127.0.0.1/.3 into the list; the fleet moved to
+        // 127.0.0.101+, so the running config must carry the live peers and
+        // drop the stale ones (a stale list silently measures nothing).
+        let out = localize_running(0, true, &["127.0.0.102:18233", "127.0.0.103:18233"]);
+        assert!(out.contains("\"127.0.0.102:18233\""));
+        assert!(out.contains("\"127.0.0.103:18233\""));
+        assert!(!out.contains("127.0.0.3:18233"));
+    }
+
+    #[test]
+    fn peer_list_reflects_exactly_the_supplied_peers() {
+        // The command excludes self when building `peers`; localization writes
+        // that list verbatim into initial_testnet_peers. Scope the check to the
+        // array — the node's own bind (127.0.0.102) legitimately appears in its
+        // listen_addr lines, so a whole-file check would be meaningless here.
+        let out = localize_running(1, true, &["127.0.0.101:18233", "127.0.0.103:18233"]);
+        let array = out
+            .split_once("initial_testnet_peers = [")
+            .expect("peer list present")
+            .1
+            .split_once(']')
+            .expect("peer list closes")
+            .0;
+        assert!(array.contains("\"127.0.0.101:18233\""));
+        assert!(array.contains("\"127.0.0.103:18233\""));
+        assert!(
+            !array.contains("127.0.0.102"),
+            "self must not appear in the peer list"
+        );
+    }
+
+    #[test]
+    fn missing_peer_key_is_a_loud_failure() {
+        let err = set_toml_arrays(
+            "[network]\nlisten_addr = \"x\"\n",
+            &[("initial_testnet_peers", vec!["127.0.0.1:18233".to_string()])],
+            true,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn fully_rewritten_config_has_no_wildcard_binds_or_shared_paths() {
+        let out = localize_running(1, false, &["127.0.0.101:18233"]);
+        // A leftover 0.0.0.0 bind means two nodes collide on one port.
+        assert!(!out.contains("0.0.0.0"), "wildcard bind survived");
+        // A leftover /root path means nodes share state or read a droplet-only path.
+        assert!(!out.contains("/root/"), "shared /root path survived");
+    }
+
+    #[test]
+    fn bootstrap_config_keeps_kresko_listen_addr_and_no_peer_list() {
+        // The bootstrap variant runs P2P-disabled: it must not get a fleet peer
+        // list and keeps Kresko's own network.listen_addr handling.
+        let node = LocalFleetNode {
+            ip: node_ip(0),
+            node_dir: PathBuf::from("/lab/miner-0"),
+            is_miner: true,
+            peers: vec!["127.0.0.102:18233".to_string()],
+        };
+        let out =
+            localize_local_fleet_config(GENERATED_CONFIG, &node, "/lab/checkpoints.txt", true)
+                .unwrap();
+        // network.listen_addr is untouched by the bootstrap path.
+        assert!(section_of(&out, "network").contains("listen_addr = \"0.0.0.0:18233\""));
+        // No live fleet peer was injected.
+        assert!(!out.contains("127.0.0.102:18233"));
+        // But rpc/dirs/metrics are still localized.
+        assert!(section_of(&out, "rpc").contains(&format!(
+            "listen_addr = \"{}:{LOCAL_FLEET_RPC_PORT}\"",
+            node_ip(0)
+        )));
+        assert!(out.contains("[metrics]"));
+    }
+
+    #[test]
+    fn trailing_newline_is_preserved_exactly_once() {
+        // Byte-identity depends on not gaining or losing the final newline.
+        let out = set_toml_values(
+            GENERATED_CONFIG,
+            &values(&[("state.ephemeral", "true")]),
+            false,
+        )
+        .unwrap();
+        assert!(out.ends_with("\n"));
+        assert!(!out.ends_with("\n\n"));
     }
 }
