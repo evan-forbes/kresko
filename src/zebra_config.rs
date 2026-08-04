@@ -88,10 +88,15 @@ pub struct LocalTestnetParameters {
     /// default local-genesis path uses a zero-zat synthetic P2SH entry so
     /// Zebra has explicit NU6.1 disbursement config before NU7.
     pub lockbox_disbursements: Vec<LockboxDisbursement>,
-    /// Legacy knobs kept in metadata for old generated configs. Zebra's NU7
-    /// testnet config does not accept these fields, so rendering skips them.
+    /// Post-Blossom target block spacing, in seconds. Rendered when set.
     pub post_blossom_pow_target_spacing: Option<u32>,
+    /// Difficulty adjustment parameters. Zakura accepts the five DAA knobs;
+    /// the Zebra-only fields on this struct (`pre_blossom_pow_target_spacing`,
+    /// `testnet_min_difficulty_*`) are kept for old generated configs and are
+    /// skipped by rendering, because Zakura's testnet config section is
+    /// `deny_unknown_fields` and would refuse to start.
     pub daa: DaaConfig,
+    /// Zebra-only. Kept in metadata for old generated configs; not rendered.
     pub pow_start_height: Option<u32>,
 }
 
@@ -499,6 +504,50 @@ pub fn apply_local_testnet_parameters(
         params.target_difficulty_limit.clone().into(),
     );
     testnet_params.insert("disable_pow".to_string(), params.disable_pow.into());
+    // Zakura accepts these six proof-of-work keys; each is omitted when unset so
+    // the node keeps its consensus default. The remaining `DaaConfig` fields are
+    // Zebra-only and must stay unrendered — `[network.testnet_parameters]` is
+    // `deny_unknown_fields`, so one extra key is a startup failure.
+    if let Some(spacing) = params.post_blossom_pow_target_spacing {
+        testnet_params.insert(
+            "post_blossom_pow_target_spacing".to_string(),
+            i64::from(spacing).into(),
+        );
+    }
+    if let Some(window) = params.daa.pow_averaging_window {
+        testnet_params.insert(
+            "pow_averaging_window".to_string(),
+            i64::try_from(window)
+                .context("pow_averaging_window does not fit in i64")?
+                .into(),
+        );
+    }
+    if let Some(span) = params.daa.pow_median_block_span {
+        testnet_params.insert(
+            "pow_median_block_span".to_string(),
+            i64::try_from(span)
+                .context("pow_median_block_span does not fit in i64")?
+                .into(),
+        );
+    }
+    if let Some(damping) = params.daa.pow_damping_factor {
+        testnet_params.insert(
+            "pow_damping_factor".to_string(),
+            i64::from(damping).into(),
+        );
+    }
+    if let Some(percent) = params.daa.pow_max_adjust_up_percent {
+        testnet_params.insert(
+            "pow_max_adjust_up_percent".to_string(),
+            i64::from(percent).into(),
+        );
+    }
+    if let Some(percent) = params.daa.pow_max_adjust_down_percent {
+        testnet_params.insert(
+            "pow_max_adjust_down_percent".to_string(),
+            i64::from(percent).into(),
+        );
+    }
     testnet_params.insert(
         "genesis_hash".to_string(),
         params.genesis_hash.clone().into(),
@@ -1849,15 +1898,19 @@ initial_mainnet_peers = []
             apply_local_testnet_parameters(&template, &params).expect("set testnet parameters");
         assert!(generated.contains("[network.testnet_parameters]"));
         assert!(generated.contains("network_name = \"LocalGenesisNet\""));
+        // The six keys Zakura accepts are rendered...
+        assert!(generated.contains("post_blossom_pow_target_spacing = 25"));
+        assert!(generated.contains("pow_averaging_window = 8"));
+        assert!(generated.contains("pow_median_block_span = 6"));
+        assert!(generated.contains("pow_damping_factor = 3"));
+        assert!(generated.contains("pow_max_adjust_up_percent = 20"));
+        assert!(generated.contains("pow_max_adjust_down_percent = 40"));
+        // ...and the Zebra-only ones are not. `[network.testnet_parameters]` is
+        // `deny_unknown_fields` on Zakura, so any of these would stop the node
+        // from starting at all.
         assert!(!generated.contains("pow_start_height"));
-        assert!(!generated.contains("post_blossom_pow_target_spacing"));
         assert!(!generated.contains("equihash_params"));
-        assert!(!generated.contains("pow_averaging_window"));
-        assert!(!generated.contains("pow_median_block_span"));
         assert!(!generated.contains("pre_blossom_pow_target_spacing"));
-        assert!(!generated.contains("pow_damping_factor"));
-        assert!(!generated.contains("pow_max_adjust_up_percent"));
-        assert!(!generated.contains("pow_max_adjust_down_percent"));
         assert!(!generated.contains("testnet_min_difficulty_start_height"));
         assert!(!generated.contains("testnet_min_difficulty_gap_multiplier"));
         assert!(!generated.contains("genesis_block_path"));

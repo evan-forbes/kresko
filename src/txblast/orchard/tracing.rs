@@ -8,7 +8,7 @@ use std::{
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
-use zebra_jsonl_trace::{JsonlTraceSendError, JsonlTracer, JsonlWriteEvent};
+use zebra_jsonl_trace::{JsonlTraceSendError, JsonlTracer, JsonlWriteEvent, TraceFormat};
 
 use crate::txblast::{OrchardBlastRuntimeConfig, TxblastTraceConfig};
 
@@ -409,9 +409,13 @@ impl OrchardTxblastTracer {
             return;
         };
 
+        // Zakura's trace writer can also emit CSV, which needs a declared column
+        // header. The txblast tables stay JSONL, so there is no header to give.
         let event = JsonlWriteEvent {
             table,
             file_name,
+            format: TraceFormat::Jsonl,
+            header: &[],
             line,
         };
 
@@ -466,6 +470,8 @@ impl OrchardTxblastTracer {
         let event = JsonlWriteEvent {
             table: TXBLAST_TRACE_DROPPED_TABLE,
             file_name: TXBLAST_TRACE_DROPPED_FILE,
+            format: TraceFormat::Jsonl,
+            header: &[],
             line,
         };
 
