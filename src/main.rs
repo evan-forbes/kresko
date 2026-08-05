@@ -76,6 +76,12 @@ enum Commands {
         #[arg(long)]
         pow_fleet_discount: Option<f64>,
 
+        /// Per-miner solutions/second to calibrate against, skipping the local
+        /// benchmark. Measure it from a run as
+        /// `2^256 / pow_limit / observed_spacing / miners`.
+        #[arg(long)]
+        pow_sol_per_sec: Option<f64>,
+
         /// Experiment directory
         #[arg(short = 'd', long, default_value = ".")]
         directory: String,
@@ -1177,11 +1183,13 @@ async fn main() -> Result<()> {
             scripts_dir,
             pow_adjust,
             pow_fleet_discount,
+            pow_sol_per_sec,
             directory,
         } => {
             let pow_calibration = commands::genesis::PowCalibrationCli {
                 adjust_fraction: pow_adjust,
                 fleet_discount: pow_fleet_discount,
+                sol_per_sec: pow_sol_per_sec,
             };
             commands::genesis::run(
                 &zebrad_binary,

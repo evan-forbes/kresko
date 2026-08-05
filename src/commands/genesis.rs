@@ -27,6 +27,17 @@ pub struct PowCalibrationCli {
     /// Optional divisor applied to the local benchmark before calibration.
     /// Higher values produce a looser initial pow_limit.
     pub fleet_discount: Option<f64>,
+    /// Per-miner solutions/second to calibrate against, skipping the local
+    /// benchmark entirely.
+    ///
+    /// The benchmark measures *this* machine and divides by a fixed constant to
+    /// guess at the fleet, so its answer moves with whatever else the machine
+    /// happens to be doing — which makes a calibrated chain unreproducible for
+    /// reasons that have nothing to do with the fleet. Once a fleet's real rate
+    /// has been measured from a run
+    /// (`2^256 / pow_limit / observed_spacing / miners`), stating it here is
+    /// both accurate and repeatable.
+    pub sol_per_sec: Option<f64>,
 }
 
 pub fn run(
@@ -605,6 +616,18 @@ fn run_pow_calibration(
     cli: &PowCalibrationCli,
     target_spacing_secs: u32,
 ) -> Result<PowCalibration> {
+    if let Some(sol_per_sec) = cli.sol_per_sec {
+        println!("Using stated fleet rate {sol_per_sec:.3} sol/s per miner (no local benchmark)");
+        return pow_tuning::calibrate(&PowTuningInputs {
+            num_miners: config.miners.len(),
+            target_spacing_secs,
+            target_adjust_fraction: cli.adjust_fraction,
+            sol_per_sec_override: Some(sol_per_sec),
+            ..Default::default()
+        })
+        .context("PoW calibration failed");
+    }
+
     println!(
         "Benchmarking local Equihash sol/s (params={}, min {:.1}s)...",
         config.equihash_params,
