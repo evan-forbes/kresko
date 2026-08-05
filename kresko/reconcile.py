@@ -118,6 +118,11 @@ def reconcile_instances(
         names = ", ".join(sorted({a["name"] for a in plan["duplicate"]}))
         raise ProviderError(f"duplicate cloud instances found for: {names}")
 
+    # Issue every create before waiting on any of them. Creating is one fast API
+    # call; becoming reachable takes a minute or so, and instances boot
+    # independently. Interleaving the two serialised that minute per instance,
+    # which is tolerable for a handful of nodes and is over an hour for eighty.
+    pending: list[tuple[Any, dict[str, Any]]] = []
     for target in creates:
         provider = providers[target.provider]
         try:
@@ -125,6 +130,13 @@ def reconcile_instances(
         except Exception as exc:
             plan["failed"].append(_failure_record(target, kind="create", message=str(exc)))
             continue
+        pending.append((target, created))
+
+    # The waits stay sequential: everything is booting concurrently by now, so
+    # the first one absorbs most of the wall clock and the rest return as they
+    # come up.
+    for target, created in pending:
+        provider = providers[target.provider]
         try:
             ready = provider.wait_ready(created["provider_id"])
         except Exception as exc:
@@ -177,6 +189,27 @@ def reconcile_instances(
             # fields and tags reflect the desired spec. This is what makes a
             # one-shot re-tag of a pre-existing node converge under `up`.
             target = target_by_name.get(asset.get("name", ""))
+            if not asset.get("public_ip"):
+                # Adopted while still booting -- an `up` that was interrupted
+                # between create and wait leaves instances in exactly this
+                # state. Recording one without an address would hand every
+                # later stage an unreachable node.
+                try:
+                    asset = providers[asset["provider"]].wait_ready(asset["provider_id"])
+                except Exception as exc:
+                    failed_asset = {**asset, "status": "failed"}
+                    failed_asset["failure_reason"] = {
+                        "kind": "timeout",
+                        "message": str(exc),
+                        "region": asset.get("region", ""),
+                        "size": asset.get("size", ""),
+                    }
+                    assets.write_asset(failed_asset)
+                    plan["failed"].append(
+                        _failure_record(target or asset, kind="timeout", message=str(exc))
+                    )
+                    refreshed_reuse.append(failed_asset)
+                    continue
             if target is not None:
                 asset = _target_asset(asset, target)
         assets.write_asset(asset)
