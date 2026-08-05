@@ -445,7 +445,11 @@ fn prepare_generated_local_genesis(
             pre_blossom_halving_interval: local_genesis.pre_blossom_halving_interval,
             activation_height: local_genesis.activation_heights.overwinter,
             lockbox_disbursements: zebra_config::default_nu6_1_lockbox_disbursements()?,
-            post_blossom_pow_target_spacing: None,
+            // The seeded block timestamps are already spaced by this value, so
+            // the running network has to target it too: otherwise the DAA aims
+            // at the node's compiled-in 75s default and every non-75s
+            // experiment silently measures a 75s chain.
+            post_blossom_pow_target_spacing: Some(target_spacing_secs),
             daa,
             pow_start_height: None,
         },
