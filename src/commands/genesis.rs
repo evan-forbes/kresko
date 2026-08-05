@@ -12,6 +12,7 @@ use crate::config::{
     Config, DaaConfig, LocalGenesisActivationHeights, LocalGenesisConfig, LocalGenesisFundedKey,
     MiningMode, OrchardTxblastConfig,
 };
+use crate::pow_tuning::{self, PowCalibration, PowTuningInputs};
 use crate::zebra_config::{self, LocalTestnetParameters};
 
 const DEFAULT_TARGET_SPACING_SECS: u32 = 25;
@@ -38,7 +39,7 @@ pub fn run(
     orchard_fanout_source_value_zats: u64,
     orchard_fanout_outputs: usize,
     scripts_dir: &str,
-    _pow_calibration: PowCalibrationCli,
+    pow_calibration: PowCalibrationCli,
     directory: &str,
 ) -> Result<()> {
     let dir = Path::new(directory);
@@ -88,21 +89,31 @@ pub fn run(
     let daa = toml_network.daa.with_missing_from(config.daa);
 
     let prepared = match config.mining_mode {
-        MiningMode::Pow => prepare_generated_local_genesis(
-            &config,
-            &miner_names,
-            0,
-            target_spacing_secs,
-            daa,
-            false,
-        )?,
+        MiningMode::Pow => {
+            // Calibrate the difficulty the fleet can actually sustain, then seed
+            // the chain at that difficulty with unsolved blocks. Live nodes start
+            // enforcing proof-of-work one past the seeded tip, so the chain opens
+            // at its equilibrium difficulty with no adjustment warm-up.
+            let calibration = run_pow_calibration(&config, &pow_calibration, target_spacing_secs)?;
+            report_calibration(&calibration);
+            prepare_generated_local_genesis(
+                &config,
+                &miner_names,
+                0,
+                target_spacing_secs,
+                daa,
+                SeedingMode::EnforcePowAfterSeededTip {
+                    target_difficulty_limit: calibration_target_bytes(&calibration)?,
+                },
+            )?
+        }
         _ => prepare_generated_local_genesis(
             &config,
             &miner_names,
             maturity_padding_blocks,
             target_spacing_secs,
             daa,
-            true,
+            SeedingMode::PowDisabled,
         )?,
     };
 
@@ -318,7 +329,10 @@ struct PreparedLocalGenesis {
 /// is rejected as WrongTransactionConsensusBranchId. Override with
 /// KRESKO_LATEST_NETWORK_UPGRADE=nu7 against a build that carries it.
 fn local_genesis_upgrade() -> NetworkUpgrade {
-    match std::env::var("KRESKO_LATEST_NETWORK_UPGRADE").ok().as_deref() {
+    match std::env::var("KRESKO_LATEST_NETWORK_UPGRADE")
+        .ok()
+        .as_deref()
+    {
         Some("nu5") | Some("Nu5") => NetworkUpgrade::Nu5,
         Some("nu6") | Some("Nu6") => NetworkUpgrade::Nu6,
         Some("nu6_1") | Some("Nu6_1") => NetworkUpgrade::Nu6_1,
@@ -343,21 +357,47 @@ fn latest_upgrade_name() -> &'static str {
     }
 }
 
+/// How the seeded chain relates to proof-of-work on the live network.
+///
+/// Seed blocks are never solved in either mode — that is what keeps seeding
+/// instant. The difference is whether the live network then enforces
+/// proof-of-work at all.
+#[derive(Debug, Clone, Copy)]
+enum SeedingMode {
+    /// Proof-of-work stays off for the whole chain. Blocks are produced with the
+    /// `generate` RPC rather than by mining.
+    PowDisabled,
+    /// Proof-of-work is enforced from one past the seeded tip, at the calibrated
+    /// limit the seed blocks were written with.
+    EnforcePowAfterSeededTip { target_difficulty_limit: [u8; 32] },
+}
+
 fn prepare_generated_local_genesis(
     config: &Config,
     miner_names: &[String],
     maturity_padding_blocks: u32,
     target_spacing_secs: u32,
     daa: DaaConfig,
-    disable_pow: bool,
+    seeding: SeedingMode,
 ) -> Result<PreparedLocalGenesis> {
-    // Non-PoW path: zebra-chain disables Equihash solving so we can seed blocks
-    // cheaply, but contextual difficulty still needs a target limit that is safe
-    // for the configured DAA averaging window.
+    // Seed blocks are always generated with Equihash solving off, so this is
+    // cheap regardless of mode. Contextual difficulty still needs a target limit
+    // that is safe for the configured DAA averaging window.
+    let target_difficulty_limit = match seeding {
+        SeedingMode::PowDisabled => LocalTestnetGenesisOptions::default().target_difficulty_limit,
+        SeedingMode::EnforcePowAfterSeededTip {
+            target_difficulty_limit,
+        } => target_difficulty_limit,
+    };
     let options = LocalTestnetGenesisOptions {
         network_name: local_network_name(&config.chain_id),
         latest_network_upgrade: local_genesis_upgrade(),
-        disable_pow,
+        disable_pow: true,
+        enforce_pow_after_seeded_tip: matches!(
+            seeding,
+            SeedingMode::EnforcePowAfterSeededTip { .. }
+        ),
+        target_difficulty_limit,
         target_spacing_secs,
         seeded_tip_time: None,
         maturity_padding_blocks,
@@ -451,7 +491,7 @@ fn prepare_generated_local_genesis(
             // experiment silently measures a 75s chain.
             post_blossom_pow_target_spacing: Some(target_spacing_secs),
             daa,
-            pow_start_height: None,
+            pow_start_height: network_params.pow_start_height().map(|height| height.0),
         },
         runtime_funded_keys: runtime_funded_keys.clone(),
         payload_local_genesis_files: vec![
@@ -552,6 +592,79 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Benchmark this machine's Equihash solver, discount it to a conservative
+/// fleet estimate, and turn that into the `pow_limit` the network should run at.
+///
+/// The benchmark is the slow step in the whole genesis pipeline; everything it
+/// feeds is cheap. Underestimating the fleet's rate is the safe direction: it
+/// produces a looser target that the adjustment can tighten into steady state,
+/// whereas overestimating produces one the adjustment cannot loosen past, and
+/// the chain stalls.
+fn run_pow_calibration(
+    config: &Config,
+    cli: &PowCalibrationCli,
+    target_spacing_secs: u32,
+) -> Result<PowCalibration> {
+    println!(
+        "Benchmarking local Equihash sol/s (params={}, min {:.1}s)...",
+        config.equihash_params,
+        pow_tuning::DEFAULT_BENCH_MIN_SECONDS
+    );
+    let measured = pow_tuning::measure_local_sol_per_sec(
+        config.equihash_params,
+        pow_tuning::DEFAULT_BENCH_MIN_SECONDS,
+        cli.fleet_discount,
+    )
+    .context("local sol/s benchmark failed")?;
+    println!(
+        "  params={} local={:.3} sol/s ({} solutions in {:.1}s) -> assumed fleet={:.3} sol/s (/{:.1})",
+        measured.equihash_params,
+        measured.local_sol_per_sec,
+        measured.total_solves,
+        measured.elapsed_secs,
+        measured.assumed_fleet_sol_per_sec,
+        measured.fleet_discount,
+    );
+
+    // `kresko mine` runs one single-threaded Equihash solver per node, so the
+    // fleet's mining CPU count is its miner count.
+    pow_tuning::calibrate(&PowTuningInputs {
+        num_miners: config.miners.len(),
+        target_spacing_secs,
+        target_adjust_fraction: cli.adjust_fraction,
+        sol_per_sec_override: Some(measured.assumed_fleet_sol_per_sec),
+        ..Default::default()
+    })
+    .context("PoW calibration failed")
+}
+
+fn report_calibration(calibration: &PowCalibration) {
+    println!(
+        "calibrated pow_limit={} miners={} sol/s={:.3} ({}) spacing={}s adjust={:+.3} \
+         natural_bits={}",
+        calibration.target_difficulty_limit_hex,
+        calibration.num_miners,
+        calibration.sol_per_sec_per_thread,
+        calibration.sol_rate_source,
+        calibration.target_spacing_secs,
+        calibration.target_adjust_fraction,
+        calibration.natural_target_bits,
+    );
+}
+
+fn calibration_target_bytes(calibration: &PowCalibration) -> Result<[u8; 32]> {
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(&calibration.target_difficulty_limit_hex, &mut bytes).with_context(
+        || {
+            format!(
+                "calibration produced a malformed target difficulty limit: {}",
+                calibration.target_difficulty_limit_hex
+            )
+        },
+    )?;
+    Ok(bytes)
+}
+
 fn local_network_name(chain_id: &str) -> String {
     let cleaned: String = chain_id
         .chars()
@@ -607,4 +720,101 @@ fn to_hex(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The PoW path must produce a chain the node will actually accept: seed
+    /// blocks written at the calibrated limit, proof-of-work enabled on the live
+    /// network, and a start height one past the seeded tip.
+    ///
+    /// Getting any one of these wrong only surfaces at `zakurad start` on the
+    /// fleet, after the payload has already shipped.
+    #[test]
+    fn pow_seeding_renders_a_config_matching_the_generated_chain() {
+        let miner_names: Vec<String> = (0..4).map(|i| format!("miner-{i}")).collect();
+        let config = Config {
+            chain_id: "calibration-test".to_string(),
+            ..Config::default()
+        };
+
+        // A plausible calibrated limit: far harder than the default private
+        // network limit, and safely below the averaging-window overflow ceiling.
+        let mut target_difficulty_limit = [0u8; 32];
+        target_difficulty_limit[0] = 0x04;
+        target_difficulty_limit[1] = 0xec;
+
+        let prepared = prepare_generated_local_genesis(
+            &config,
+            &miner_names,
+            0,
+            25,
+            DaaConfig::default(),
+            SeedingMode::EnforcePowAfterSeededTip {
+                target_difficulty_limit,
+            },
+        )
+        .expect("PoW seeding should prepare a local genesis");
+
+        // genesis + one premine block per miner.
+        let seeded_block_count = miner_names.len() as u32 + 1;
+        assert_eq!(
+            prepared.local_testnet.pow_start_height,
+            Some(seeded_block_count)
+        );
+        assert!(
+            !prepared.local_testnet.disable_pow,
+            "the live network must enforce proof-of-work"
+        );
+        assert_eq!(
+            prepared.local_testnet.post_blossom_pow_target_spacing,
+            Some(25)
+        );
+
+        let template = zebra_config::template_for(crate::config::NetworkKind::LocalGenesis)
+            .expect("template generation");
+        let rendered =
+            zebra_config::apply_local_testnet_parameters(&template, &prepared.local_testnet)
+                .expect("rendering the node config");
+        zebra_config::verify_local_testnet_parameters(&rendered, &prepared.local_testnet)
+            .expect("the rendered config must match the generated chain");
+
+        assert!(rendered.contains(&format!("pow_start_height = {seeded_block_count}")));
+        assert!(rendered.contains("disable_pow = false"));
+        assert!(
+            rendered.contains(&prepared.local_testnet.target_difficulty_limit),
+            "the rendered limit must be the calibrated one the seed blocks used"
+        );
+    }
+
+    /// The non-PoW path is unchanged: no start height, proof-of-work off.
+    #[test]
+    fn pow_disabled_seeding_renders_no_start_height() {
+        let config = Config {
+            chain_id: "generate-mode".to_string(),
+            ..Config::default()
+        };
+
+        let prepared = prepare_generated_local_genesis(
+            &config,
+            &["miner-0".to_string()],
+            2,
+            25,
+            DaaConfig::default(),
+            SeedingMode::PowDisabled,
+        )
+        .expect("generate-mode seeding should prepare a local genesis");
+
+        assert_eq!(prepared.local_testnet.pow_start_height, None);
+        assert!(prepared.local_testnet.disable_pow);
+
+        let template = zebra_config::template_for(crate::config::NetworkKind::LocalGenesis)
+            .expect("template generation");
+        let rendered =
+            zebra_config::apply_local_testnet_parameters(&template, &prepared.local_testnet)
+                .expect("rendering the node config");
+        assert!(!rendered.contains("pow_start_height"));
+    }
 }

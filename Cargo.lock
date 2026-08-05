@@ -8668,7 +8668,7 @@ checksum = "2164e798d9e3d84ee2c91139ace54638059a3b23e361f5c11781c2c6459bde0f"
 [[package]]
 name = "zakura"
 version = "1.1.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#012897d83a800ba451c2fe7c69ccbe2600b60e3b"
+source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#9e952d157ab8bc70949b38ceca6180bf9d61e562"
 dependencies = [
  "abscissa_core",
  "bytes",
@@ -8736,7 +8736,7 @@ dependencies = [
 [[package]]
 name = "zakura-chain"
 version = "4.0.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#012897d83a800ba451c2fe7c69ccbe2600b60e3b"
+source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#9e952d157ab8bc70949b38ceca6180bf9d61e562"
 dependencies = [
  "bech32",
  "bitflags",
@@ -8799,7 +8799,7 @@ dependencies = [
 [[package]]
 name = "zakura-consensus"
 version = "6.0.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#012897d83a800ba451c2fe7c69ccbe2600b60e3b"
+source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#9e952d157ab8bc70949b38ceca6180bf9d61e562"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -8842,7 +8842,7 @@ dependencies = [
 [[package]]
 name = "zakura-jsonl-trace"
 version = "1.1.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#012897d83a800ba451c2fe7c69ccbe2600b60e3b"
+source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#9e952d157ab8bc70949b38ceca6180bf9d61e562"
 dependencies = [
  "chrono",
  "serde",
@@ -8855,7 +8855,7 @@ dependencies = [
 [[package]]
 name = "zakura-network"
 version = "5.1.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#012897d83a800ba451c2fe7c69ccbe2600b60e3b"
+source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#9e952d157ab8bc70949b38ceca6180bf9d61e562"
 dependencies = [
  "bitflags",
  "blake2b_simd",
@@ -8896,7 +8896,7 @@ dependencies = [
 [[package]]
 name = "zakura-node-services"
 version = "3.1.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#012897d83a800ba451c2fe7c69ccbe2600b60e3b"
+source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#9e952d157ab8bc70949b38ceca6180bf9d61e562"
 dependencies = [
  "color-eyre",
  "jsonrpsee-types",
@@ -8911,7 +8911,7 @@ dependencies = [
 [[package]]
 name = "zakura-rpc"
 version = "6.0.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#012897d83a800ba451c2fe7c69ccbe2600b60e3b"
+source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#9e952d157ab8bc70949b38ceca6180bf9d61e562"
 dependencies = [
  "base64",
  "chrono",
@@ -8973,7 +8973,7 @@ dependencies = [
 [[package]]
 name = "zakura-script"
 version = "3.1.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#012897d83a800ba451c2fe7c69ccbe2600b60e3b"
+source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#9e952d157ab8bc70949b38ceca6180bf9d61e562"
 dependencies = [
  "libzcash_script",
  "rand 0.8.5",
@@ -8986,7 +8986,7 @@ dependencies = [
 [[package]]
 name = "zakura-state"
 version = "6.0.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#012897d83a800ba451c2fe7c69ccbe2600b60e3b"
+source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#9e952d157ab8bc70949b38ceca6180bf9d61e562"
 dependencies = [
  "bincode",
  "chrono",
@@ -9027,7 +9027,7 @@ dependencies = [
 [[package]]
 name = "zakura-tower-batch-control"
 version = "1.2.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#012897d83a800ba451c2fe7c69ccbe2600b60e3b"
+source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#9e952d157ab8bc70949b38ceca6180bf9d61e562"
 dependencies = [
  "futures",
  "futures-core",
@@ -9043,7 +9043,7 @@ dependencies = [
 [[package]]
 name = "zakura-tower-fallback"
 version = "1.2.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#012897d83a800ba451c2fe7c69ccbe2600b60e3b"
+source = "git+https://github.com/zakura-core/zakura?branch=evan%2Fblock-prop-2#9e952d157ab8bc70949b38ceca6180bf9d61e562"
 dependencies = [
  "futures-core",
  "pin-project",

@@ -96,7 +96,9 @@ pub struct LocalTestnetParameters {
     /// skipped by rendering, because Zakura's testnet config section is
     /// `deny_unknown_fields` and would refuse to start.
     pub daa: DaaConfig,
-    /// Zebra-only. Kept in metadata for old generated configs; not rendered.
+    /// Height at which the node starts enforcing proof-of-work, rendered when
+    /// set. Only meaningful on a chain seeded with unsolved blocks, where it
+    /// must equal the total seeded block count.
     pub pow_start_height: Option<u32>,
 }
 
@@ -531,10 +533,7 @@ pub fn apply_local_testnet_parameters(
         );
     }
     if let Some(damping) = params.daa.pow_damping_factor {
-        testnet_params.insert(
-            "pow_damping_factor".to_string(),
-            i64::from(damping).into(),
-        );
+        testnet_params.insert("pow_damping_factor".to_string(), i64::from(damping).into());
     }
     if let Some(percent) = params.daa.pow_max_adjust_up_percent {
         testnet_params.insert(
@@ -546,6 +545,16 @@ pub fn apply_local_testnet_parameters(
         testnet_params.insert(
             "pow_max_adjust_down_percent".to_string(),
             i64::from(percent).into(),
+        );
+    }
+    // Written only when the chain is seeded with unsolved blocks. It tells the
+    // node to skip proof-of-work below the seeded tip and enforce the full
+    // calibrated `target_difficulty_limit` from there on, so the live chain
+    // starts at its equilibrium difficulty instead of climbing to it.
+    if let Some(pow_start_height) = params.pow_start_height {
+        testnet_params.insert(
+            "pow_start_height".to_string(),
+            i64::from(pow_start_height).into(),
         );
     }
     testnet_params.insert(
@@ -681,6 +690,21 @@ pub fn verify_local_testnet_parameters(
             params.genesis_hash,
             actual_genesis,
         );
+    }
+
+    // A seeded chain whose config forgets `pow_start_height` rejects its own
+    // unsolved seed blocks at replay, and one that renders the wrong height
+    // either exempts live blocks from proof-of-work or demands it of seed
+    // blocks. Both fail at startup, long after the payload has shipped.
+    let actual_pow_start = testnet_params
+        .get("pow_start_height")
+        .and_then(toml::Value::as_integer);
+    match (params.pow_start_height, actual_pow_start) {
+        (Some(expected), Some(actual)) if actual == i64::from(expected) => {}
+        (None, None) => {}
+        (expected, actual) => anyhow::bail!(
+            "rendered pow_start_height mismatch: expected {expected:?}, got {actual:?}",
+        ),
     }
 
     let activation = testnet_params
@@ -1898,17 +1922,17 @@ initial_mainnet_peers = []
             apply_local_testnet_parameters(&template, &params).expect("set testnet parameters");
         assert!(generated.contains("[network.testnet_parameters]"));
         assert!(generated.contains("network_name = \"LocalGenesisNet\""));
-        // The six keys Zakura accepts are rendered...
+        // The seven keys Zakura accepts are rendered...
         assert!(generated.contains("post_blossom_pow_target_spacing = 25"));
         assert!(generated.contains("pow_averaging_window = 8"));
         assert!(generated.contains("pow_median_block_span = 6"));
         assert!(generated.contains("pow_damping_factor = 3"));
         assert!(generated.contains("pow_max_adjust_up_percent = 20"));
         assert!(generated.contains("pow_max_adjust_down_percent = 40"));
+        assert!(generated.contains("pow_start_height = 257"));
         // ...and the Zebra-only ones are not. `[network.testnet_parameters]` is
         // `deny_unknown_fields` on Zakura, so any of these would stop the node
         // from starting at all.
-        assert!(!generated.contains("pow_start_height"));
         assert!(!generated.contains("equihash_params"));
         assert!(!generated.contains("pre_blossom_pow_target_spacing"));
         assert!(!generated.contains("testnet_min_difficulty_start_height"));
