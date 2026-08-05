@@ -10,8 +10,11 @@
 #
 # Prerequisites:
 #   - Docker with BuildKit support
-#   - NU7 Zebra repo at ../nu7-testnet, or set NU7_ZEBRA_ROOT
-#   - Zebra repo at ../zebra for zebra-jsonl-trace, or set ZEBRA_ROOT
+#   - For --zebrad-only: NU7 Zebra repo at ../nu7-testnet, or set NU7_ZEBRA_ROOT.
+#     The kresko build needs neither worktree: it takes zakura-chain and
+#     zakura-jsonl-trace from git (see Cargo.toml), so the container only needs
+#     network access. The Zakura node binary is built by `cargo xtask package
+#     ubuntu` in the Zakura repo, not here.
 #
 # Output:
 #   target/ubuntu/zebra     - Ubuntu 22.04-compatible zebra binary
@@ -41,23 +44,6 @@ USAGE
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KRESKO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-NU7_ZEBRA_ROOT="$(cd "${NU7_ZEBRA_ROOT:-$KRESKO_ROOT/../nu7-testnet}" && pwd)"
-ZEBRA_ROOT="$(cd "${ZEBRA_ROOT:-$KRESKO_ROOT/../zebra}" && pwd)"
-
-if [ -L "$ZEBRA_ROOT/zebra-jsonl-trace" ]; then
-    resolved_trace="$(readlink -f "$ZEBRA_ROOT/zebra-jsonl-trace")"
-    resolved_zebra_root="$(cd "$(dirname "$resolved_trace")" && pwd)"
-    if [ "$resolved_zebra_root" != "$ZEBRA_ROOT" ] && [ -f "$resolved_zebra_root/Cargo.toml" ]; then
-        echo "Note: zebra-jsonl-trace is a symlink outside ZEBRA_ROOT; using $resolved_zebra_root for Docker."
-        ZEBRA_ROOT="$resolved_zebra_root"
-    fi
-fi
-
-if [ ! -f "$ZEBRA_ROOT/zebra-jsonl-trace/Cargo.toml" ]; then
-    echo "Error: missing zebra-jsonl-trace at $ZEBRA_ROOT/zebra-jsonl-trace" >&2
-    echo "Set ZEBRA_ROOT to a Zebra worktree containing zebra-jsonl-trace." >&2
-    exit 1
-fi
 
 BUILD_ZEBRAD=true
 BUILD_KRESKO=true
@@ -114,6 +100,7 @@ FULL_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
 mkdir -p "$OUTPUT_DIR"
 
 if [ "$BUILD_ZEBRAD" = true ]; then
+    NU7_ZEBRA_ROOT="$(cd "${NU7_ZEBRA_ROOT:-$KRESKO_ROOT/../nu7-testnet}" && pwd)"
     echo "=== Building zebra with NU7 Zebra Dockerfile ==="
     tmp_output="$(mktemp -d)"
     DOCKER_BUILDKIT=1 docker build \
@@ -134,15 +121,16 @@ if [ "$BUILD_KRESKO" = true ]; then
         "$KRESKO_ROOT"
 
     echo "=== Building kresko ==="
+    # No RUSTFLAGS: the zcash_unstable cfgs belonged to the NU7 Zebra worktree.
+    # kresko now takes zakura-chain from git and must be built with the same
+    # cfgs as the node binary it generates chains for — `cargo xtask package
+    # ubuntu` in the Zakura repo sets none, so neither does this.
     docker run --rm \
         -e CARGO_TARGET_DIR=/tmp/kresko-target \
         -e CXXFLAGS="-include cstdint" \
-        -e RUSTFLAGS='--cfg zcash_unstable="nu7" --cfg zcash_unstable="zip235"' \
         -e HOST_UID="$(id -u)" \
         -e HOST_GID="$(id -g)" \
         -v "$KRESKO_ROOT:/workspace/kresko:ro" \
-        -v "$NU7_ZEBRA_ROOT:/workspace/nu7-testnet:ro" \
-        -v "$ZEBRA_ROOT:/workspace/zebra:ro" \
         -v "$OUTPUT_DIR:/output" \
         -v "kresko-cargo-registry:/root/.cargo/registry" \
         -v "kresko-cargo-git:/root/.cargo/git" \
