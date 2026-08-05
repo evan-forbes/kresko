@@ -107,9 +107,8 @@ pub struct PowTuningInputs {
     pub target_spacing_secs: u32,
     /// Fractional adjustment to the natural target. `+0.10` makes the
     /// target ~10% looser (≈10% faster initial blocks); `-0.10` makes it
-    /// ~10% tighter. Applied before flooring to a power of two, so small
-    /// values may not shift `target_bits`; use ±0.5 or larger to move by
-    /// a full bit.
+    /// ~10% tighter. The emitted target keeps its mantissa, so an adjustment
+    /// this small does move it.
     pub target_adjust_fraction: f64,
     /// How many bits looser than the natural target to start. Kept for
     /// the pow-simulate path; the experiment-build path leaves this at 0
@@ -221,31 +220,38 @@ pub fn calibrate(inputs: &PowTuningInputs) -> Result<PowCalibration> {
     }
 
     // target = 2^256 / expected_sols  =>  log2(target) = 256 - log2(expected_sols).
-    // Floor so that the resulting target is <= natural target (i.e. slightly
-    // tighter than ideal before headroom — headroom makes it looser again).
     let log2_ratio = expected_sols.log2();
-    let natural_target_bits = (256.0 - log2_ratio).floor();
-    if natural_target_bits < 1.0 {
+    let natural_target_log2 = 256.0 - log2_ratio;
+    if natural_target_log2 < 1.0 {
         anyhow::bail!(
-            "calibrated natural_target_bits = {natural_target_bits} is too small; \
+            "calibrated natural_target_bits = {} is too small; \
              too much hashpower (S × N × T = {expected_sols}) for target_spacing_secs = {}",
+            natural_target_log2.floor(),
             inputs.target_spacing_secs,
         );
     }
-    let natural_target_bits = natural_target_bits as u32;
+    // Reported, and consumed by the simulator, as a whole number of bits.
+    let natural_target_bits = natural_target_log2.floor() as u32;
 
-    let raw_target_bits = natural_target_bits.saturating_add(u32::from(inputs.headroom_bits));
-    let target_bits = raw_target_bits.min(MAX_SAFE_TARGET_BITS);
-    if raw_target_bits > MAX_SAFE_TARGET_BITS {
+    let raw_target_log2 = natural_target_log2 + f64::from(inputs.headroom_bits);
+    let target_log2 = raw_target_log2.min(f64::from(MAX_SAFE_TARGET_BITS));
+    if raw_target_log2 > f64::from(MAX_SAFE_TARGET_BITS) {
         eprintln!(
-            "warning: calibrated target_bits={} exceeds Zebra's max safe pow_limit \
+            "warning: calibrated target_bits={:.2} exceeds Zebra's max safe pow_limit \
              (~2^{}); clamping to {}. The fleet is too small for the requested \
              spacing to actually constrain block production — the chain will run \
              at the loosest allowed pow_limit and the DAA will tighten from there.",
-            raw_target_bits, MAX_SAFE_TARGET_BITS, MAX_SAFE_TARGET_BITS,
+            raw_target_log2, MAX_SAFE_TARGET_BITS, MAX_SAFE_TARGET_BITS,
         );
     }
-    let target_difficulty_limit_hex = bits_to_hex_target(target_bits);
+    // Not `1 << target_log2.floor()`. Rounding the target down to a power of two
+    // costs up to a full factor of two, always in the tighter direction, so a
+    // chain seeded at 25s spacing could open mining at 50s and spend its first
+    // ~20 blocks letting the difficulty adjustment walk back what the rounding
+    // introduced. The whole point of calibrating is to start at equilibrium, so
+    // the mantissa is kept. The node stores this as a `CompactDifficulty`, whose
+    // 24-bit mantissa is far more precision than the underlying benchmark has.
+    let target_difficulty_limit_hex = hex_target_from_log2(target_log2);
 
     Ok(PowCalibration {
         target_difficulty_limit_hex,
@@ -481,8 +487,47 @@ pub fn measure_local_sol_per_sec(
     })
 }
 
+/// Convert a fractional `log2(target)` into a 32-byte hex string representing
+/// `2^log2_target`, in big-endian display order.
+///
+/// [`bits_to_hex_target`] can only express exact powers of two, which throws
+/// away up to a factor of two of the calibration. This keeps a 64-bit mantissa,
+/// which is more precision than any of the inputs carry.
+///
+/// The input is clamped to [`MAX_SAFE_TARGET_BITS`], which is what bounds the
+/// byte placement below: the mantissa occupies at most nine bytes and the
+/// largest permitted exponent leaves exactly that much room.
+fn hex_target_from_log2(log2_target: f64) -> String {
+    let log2_target = log2_target.clamp(0.0, f64::from(MAX_SAFE_TARGET_BITS));
+    let exponent = log2_target.floor();
+    // 2^fraction ∈ [1, 2), scaled into the top bit of a u64 mantissa.
+    let mantissa = ((log2_target - exponent).exp2() * (1u128 << 63) as f64) as u128;
+    // value = mantissa · 2^(exponent - 63)
+    let shift = exponent as i32 - 63;
+
+    let mut bytes = [0u8; 32];
+    let (shifted, byte_shift) = if shift >= 0 {
+        // Splitting the shift into whole bytes and a sub-byte remainder keeps
+        // the intermediate inside a u128: 64 bits of mantissa plus at most 7.
+        (mantissa << (shift % 8) as u32, (shift / 8) as usize)
+    } else {
+        (mantissa >> shift.unsigned_abs(), 0)
+    };
+    let shifted = shifted.to_be_bytes();
+    for (k, byte) in shifted.iter().rev().enumerate() {
+        match (31 - byte_shift).checked_sub(k) {
+            Some(index) => bytes[index] = *byte,
+            // Only reachable for bytes above the clamped exponent, which are
+            // zero; a non-zero one would mean the target exceeded 2^256.
+            None => debug_assert_eq!(*byte, 0, "target overflowed 256 bits"),
+        }
+    }
+    hex::encode(bytes)
+}
+
 /// Convert a bit position `b ∈ [0, 255]` into a 32-byte hex string
 /// representing `1u256 << b` in big-endian display order.
+#[cfg(test)]
 fn bits_to_hex_target(b: u32) -> String {
     let b = b.min(255);
     // byte 0 holds bits 248..=255 (big-endian), byte 31 holds bits 0..=7.
@@ -519,10 +564,31 @@ mod tests {
         }
     }
 
+    /// `log2` of a rendered 32-byte hex target, for comparing against the ideal.
+    fn log2_of_hex_target(hex: &str) -> f64 {
+        let bytes = hex::decode(hex).expect("a rendered target decodes as hex");
+        let value = bytes
+            .iter()
+            .fold(0.0f64, |acc, byte| acc * 256.0 + f64::from(*byte));
+        value.log2()
+    }
+
+    /// The emitted target is the ideal one, not the power of two below it.
+    ///
+    /// `expected_sols` is `S x N x T`; the ideal target is `2^256 / that`.
+    fn assert_target_matches_ideal(hex: &str, expected_sols: f64, headroom_bits: u32) {
+        let ideal = 256.0 - expected_sols.log2() + f64::from(headroom_bits);
+        let actual = log2_of_hex_target(hex);
+        assert!(
+            (actual - ideal).abs() < 1e-6,
+            "target 2^{actual} is not the ideal 2^{ideal} (hex {hex})",
+        );
+    }
+
     #[test]
     fn calibrate_matches_plan_worked_example_25s_fast_cpu() {
         // 80 miners, 25s target, S = 2.0  ->  expected_sols = 4000,
-        // natural_target_bits = 244, with headroom_bits = 2 -> 246 ("0040...").
+        // natural_target_bits = 244, with headroom_bits = 2 -> 2^246.03.
         let c = calibrate(&PowTuningInputs {
             num_miners: 80,
             target_spacing_secs: 25,
@@ -532,14 +598,14 @@ mod tests {
         })
         .expect("calibration should succeed");
         assert_eq!(c.natural_target_bits, 244);
-        assert_eq!(&c.target_difficulty_limit_hex[..4], "0040");
+        assert_target_matches_ideal(&c.target_difficulty_limit_hex, 4000.0, 2);
         assert_eq!(c.sol_rate_source, SolRateSource::Override);
     }
 
     #[test]
     fn calibrate_matches_plan_worked_example_75s_slow_cpu() {
         // 80 miners, 75s target, S = 0.5  ->  expected_sols = 3000,
-        // natural_target_bits = 244, with headroom_bits = 2 -> 246 ("0040...").
+        // natural_target_bits = 244, with headroom_bits = 2 -> 2^246.45.
         let c = calibrate(&PowTuningInputs {
             num_miners: 80,
             target_spacing_secs: 75,
@@ -549,13 +615,13 @@ mod tests {
         })
         .expect("calibration should succeed");
         assert_eq!(c.natural_target_bits, 244);
-        assert_eq!(&c.target_difficulty_limit_hex[..4], "0040");
+        assert_target_matches_ideal(&c.target_difficulty_limit_hex, 3000.0, 2);
     }
 
     #[test]
     fn calibrate_matches_plan_worked_example_75s_fast_cpu() {
         // 80 miners, 75s target, S = 2.0  ->  expected_sols = 12000,
-        // natural_target_bits = 242, with headroom_bits = 2 -> 244 ("0010...").
+        // natural_target_bits = 242, with headroom_bits = 2 -> 2^244.45.
         let c = calibrate(&PowTuningInputs {
             num_miners: 80,
             target_spacing_secs: 75,
@@ -565,7 +631,64 @@ mod tests {
         })
         .expect("calibration should succeed");
         assert_eq!(c.natural_target_bits, 242);
-        assert_eq!(&c.target_difficulty_limit_hex[..4], "0010");
+        assert_target_matches_ideal(&c.target_difficulty_limit_hex, 12000.0, 2);
+    }
+
+    #[test]
+    fn calibrated_targets_scale_with_the_requested_spacing() {
+        // The defect this pins: flooring `log2(target)` to a whole bit rounded
+        // every target down to a power of two, so a 3x change in spacing moved
+        // the target by 2x and the chain opened up to a factor of two away from
+        // the spacing it was calibrated for. Only the difficulty adjustment
+        // recovered that, over the first blocks of the run -- exactly the blocks
+        // an experiment wants at the target spacing.
+        let target_for = |spacing| {
+            log2_of_hex_target(
+                &calibrate(&PowTuningInputs {
+                    num_miners: 80,
+                    target_spacing_secs: spacing,
+                    sol_per_sec_override: Some(0.17),
+                    ..Default::default()
+                })
+                .expect("calibration should succeed")
+                .target_difficulty_limit_hex,
+            )
+        };
+
+        // Three times the spacing is three times the work, so the target is a
+        // third: log2 differs by exactly log2(3), not by a whole bit.
+        let ratio = target_for(25) - target_for(75);
+        assert!(
+            (ratio - 3.0f64.log2()).abs() < 1e-6,
+            "75s -> 25s moved the target by 2^{ratio}, want 2^{}",
+            3.0f64.log2(),
+        );
+    }
+
+    #[test]
+    fn hex_target_from_log2_agrees_with_powers_of_two() {
+        // Whole-bit inputs must still land exactly where the old power-of-two
+        // renderer put them.
+        for bits in [1u32, 64, 128, 200, 244, 246, 248, 251] {
+            assert_eq!(
+                hex_target_from_log2(f64::from(bits)),
+                bits_to_hex_target(bits),
+                "2^{bits} should render identically",
+            );
+        }
+    }
+
+    #[test]
+    fn hex_target_from_log2_is_monotonic_and_bounded() {
+        let mut previous = String::new();
+        let mut log2 = 240.0;
+        while log2 <= f64::from(MAX_SAFE_TARGET_BITS) {
+            let hex = hex_target_from_log2(log2);
+            assert_eq!(hex.len(), 64, "target must be 32 bytes");
+            assert!(hex > previous, "target must increase with log2 ({log2})");
+            previous = hex;
+            log2 += 0.05;
+        }
     }
 
     #[test]
@@ -624,7 +747,7 @@ mod tests {
         .expect("calibration should clamp, not fail");
         // 4 × 60 × 0.029 = 6.96; floor(256 - log2(6.96)) = 253; clamped to 251.
         assert!(c.natural_target_bits >= MAX_SAFE_TARGET_BITS + 1);
-        // Resulting hex is `1 << 251` = "0800...".
+        // Clamping lands on the ceiling exactly, so it is still `1 << 251`.
         assert_eq!(&c.target_difficulty_limit_hex[..4], "0800");
     }
 
