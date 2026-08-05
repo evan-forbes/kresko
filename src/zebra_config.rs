@@ -181,7 +181,6 @@ pub fn template_for(network_kind: NetworkKind) -> Result<String> {
                 true.into(),
             );
             set_path(&mut config, &["rpc", "parallel_cpu_threads"], 1.into());
-            set_path(&mut config, &["sync", "parallel_cpu_threads"], 1.into());
         }
         NetworkKind::PublicTestnet => {
             set_path(&mut config, &["network", "network"], "Testnet".into());
@@ -965,6 +964,16 @@ pub fn localize_local_fleet_config(
                 "mining.internal_miner".into(),
                 (if node.is_miner { "true" } else { "false" }).to_string(),
             ),
+            // Set here rather than in the local-genesis template, because it is
+            // a property of sharing one host, not of the chain. It sizes
+            // zakurad's global Rayon pool, which is where every proof
+            // verification and every note-commitment tree update runs, so on a
+            // one-node-per-droplet fleet it silently caps verification at a
+            // single core. Block-prop campaign 2 measured its fleet against a
+            // Zebra baseline that had no such cap and read the difference as a
+            // Zakura regression; see
+            // art/inbox/experiments/block-prop-2/results/FINDING-block-verify-18x.md.
+            ("sync.parallel_cpu_threads".into(), "1".to_string()),
         ],
         true,
     )?;
