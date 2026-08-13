@@ -64,6 +64,12 @@ struct PendingTemplate {
     is_provisional: bool,
 }
 
+#[derive(Clone, Copy)]
+struct TemplateRefreshPolicy {
+    interval: Option<Duration>,
+    mine_provisional_empty_templates: bool,
+}
+
 struct RawTemplateBlock {
     header: Header,
     transactions: Vec<Vec<u8>>,
@@ -295,16 +301,17 @@ pub async fn run_with(
         let poll_client = client.clone();
         let poll_endpoint = rpc_endpoint.to_string();
         let poll_summary = template_summary.clone();
-        let refresh_interval = options.template_refresh_interval;
-        let mine_provisional_empty_templates = options.mine_provisional_empty_templates;
+        let refresh_policy = TemplateRefreshPolicy {
+            interval: options.template_refresh_interval,
+            mine_provisional_empty_templates: options.mine_provisional_empty_templates,
+        };
         let template_update = Arc::new(Mutex::new(None));
         let mut poll_handle = Some(tokio::spawn(supervise_template_updates(
             poll_client,
             poll_endpoint,
             poll_summary,
             action_tx,
-            refresh_interval,
-            mine_provisional_empty_templates,
+            refresh_policy,
             current_is_provisional,
             template_update.clone(),
         )));
@@ -417,7 +424,7 @@ pub async fn run_with(
                             || result_str.as_deref() == Some("")
                             || result_str
                                 .as_deref()
-                                .map_or(false, |s| s.starts_with("duplicate"));
+                                .is_some_and(|s| s.starts_with("duplicate"));
 
                         if accepted {
                             blocks_submitted += 1;
@@ -591,8 +598,7 @@ async fn supervise_template_updates(
     endpoint: String,
     current: TemplateSummary,
     action_tx: tokio::sync::watch::Sender<SolverAction>,
-    refresh_interval: Option<Duration>,
-    mine_provisional_empty_templates: bool,
+    refresh_policy: TemplateRefreshPolicy,
     mut current_is_provisional: bool,
     update: Arc<Mutex<Option<TemplateUpdate>>>,
 ) {
@@ -614,8 +620,9 @@ async fn supervise_template_updates(
         match summary.submit_old {
             Some(true) => {
                 let replaces_provisional = current_is_provisional && summary.transactions > 0;
-                let refresh_due =
-                    refresh_interval.is_some_and(|interval| started.elapsed() >= interval);
+                let refresh_due = refresh_policy
+                    .interval
+                    .is_some_and(|interval| started.elapsed() >= interval);
                 let cannot_rearm = summary.longpollid.is_none();
 
                 if cannot_rearm {
@@ -660,7 +667,7 @@ async fn supervise_template_updates(
                 action_tx.send_replace(SolverAction::StopNow);
                 let reason = classify_cancellation(&current, &summary);
 
-                let update_value = if mine_provisional_empty_templates {
+                let update_value = if refresh_policy.mine_provisional_empty_templates {
                     let is_provisional =
                         !same_work(&current, &summary) && summary.transactions == 0;
                     TemplateUpdate {
@@ -1008,10 +1015,8 @@ mod tests {
                 "coinbasetxn": { "data": "00".repeat(16) },
                 "transactions": transactions,
             });
-            if include_submit_old {
-                if let Some(submit_old) = self.submit_old {
-                    template["submitold"] = serde_json::Value::Bool(submit_old);
-                }
+            if include_submit_old && let Some(submit_old) = self.submit_old {
+                template["submitold"] = serde_json::Value::Bool(submit_old);
             }
             template
         }
@@ -1295,8 +1300,10 @@ mod tests {
             endpoint,
             summarize_template(&initial.to_json(false)),
             action_tx,
-            None,
-            false,
+            TemplateRefreshPolicy {
+                interval: None,
+                mine_provisional_empty_templates: false,
+            },
             false,
             update.clone(),
         ));
@@ -1336,8 +1343,10 @@ mod tests {
             endpoint,
             summarize_template(&initial.to_json(false)),
             action_tx,
-            None,
-            false,
+            TemplateRefreshPolicy {
+                interval: None,
+                mine_provisional_empty_templates: false,
+            },
             false,
             update.clone(),
         ));
@@ -1366,8 +1375,10 @@ mod tests {
             endpoint,
             summarize_template(&initial.to_json(false)),
             action_tx,
-            None,
-            true,
+            TemplateRefreshPolicy {
+                interval: None,
+                mine_provisional_empty_templates: true,
+            },
             false,
             update.clone(),
         ));
@@ -1396,8 +1407,10 @@ mod tests {
             endpoint,
             summarize_template(&initial.to_json(false)),
             action_tx,
-            None,
-            true,
+            TemplateRefreshPolicy {
+                interval: None,
+                mine_provisional_empty_templates: true,
+            },
             false,
             update.clone(),
         ));
@@ -1427,8 +1440,10 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
             summarize_template(&initial.to_json(false)),
             action_tx,
-            None,
-            false,
+            TemplateRefreshPolicy {
+                interval: None,
+                mine_provisional_empty_templates: false,
+            },
             false,
             update,
         ));
@@ -1450,8 +1465,10 @@ mod tests {
             endpoint,
             summarize_template(&initial.to_json(false)),
             action_tx,
-            Some(Duration::from_millis(50)),
-            false,
+            TemplateRefreshPolicy {
+                interval: Some(Duration::from_millis(50)),
+                mine_provisional_empty_templates: false,
+            },
             false,
             update.clone(),
         ));
@@ -1481,8 +1498,10 @@ mod tests {
             endpoint,
             summarize_template(&initial.to_json(false)),
             action_tx,
-            None,
-            true,
+            TemplateRefreshPolicy {
+                interval: None,
+                mine_provisional_empty_templates: true,
+            },
             true,
             update.clone(),
         ));
@@ -1513,8 +1532,10 @@ mod tests {
             endpoint,
             summarize_template(&initial.to_json(false)),
             action_tx,
-            None,
-            true,
+            TemplateRefreshPolicy {
+                interval: None,
+                mine_provisional_empty_templates: true,
+            },
             true,
             update.clone(),
         ));
