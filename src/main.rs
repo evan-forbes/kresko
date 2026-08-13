@@ -225,6 +225,26 @@ enum Commands {
         /// Path to the zebrad.toml whose network parameters should be used for mining
         #[arg(long, default_value = "/root/.config/zebrad.toml")]
         zebrad_config: String,
+
+        /// Submit a solution even after the node has committed a block at the
+        /// same height.
+        ///
+        /// A solver pass cannot be interrupted, so a solution can arrive after
+        /// the tip has already moved past it. Submitting it forks the chain and
+        /// wins nothing, so the miner drops it by default. This flag restores
+        /// the older behaviour for orphan-rate comparisons.
+        #[arg(long)]
+        submit_stale_solutions: bool,
+
+        /// Keep a still-valid mining template for at least this many seconds.
+        /// Set to zero to keep it until the tip changes or it wins.
+        #[arg(long, default_value_t = 60)]
+        template_refresh_seconds: u64,
+
+        /// Mine the provisional empty template returned immediately after a
+        /// tip change instead of waiting for a full template.
+        #[arg(long)]
+        mine_provisional_empty_templates: bool,
     },
 
     /// Monte Carlo-simulate PoW block production for calibration validation
@@ -1268,8 +1288,22 @@ async fn main() -> Result<()> {
         Commands::Mine {
             rpc_endpoint,
             zebrad_config,
+            submit_stale_solutions,
+            template_refresh_seconds,
+            mine_provisional_empty_templates,
         } => {
-            commands::mine::run(&rpc_endpoint, std::path::Path::new(&zebrad_config)).await?;
+            commands::mine::run_with(
+                &rpc_endpoint,
+                std::path::Path::new(&zebrad_config),
+                commands::mine::MinerOptions {
+                    submit_stale_solutions,
+                    template_refresh_interval: (template_refresh_seconds > 0)
+                        .then(|| std::time::Duration::from_secs(template_refresh_seconds)),
+                    mine_provisional_empty_templates,
+                    ..Default::default()
+                },
+            )
+            .await?;
         }
         Commands::PowSimulate {
             miners,

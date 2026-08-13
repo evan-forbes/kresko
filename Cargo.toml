@@ -31,9 +31,9 @@ chrono = { version = "0.4", default-features = false }
 # Kept under the `zebra_*` extern names via `package =` so the existing
 # `zebra_chain::...` paths throughout this crate keep compiling; Zakura is the
 # continuation of these crates under a new name.
-zebra-chain = { package = "zakura-chain", git = "https://github.com/zakura-core/zakura", branch = "evan/block-prop-2", features = ["internal-miner"] }
-zebrad = { package = "zakura", git = "https://github.com/zakura-core/zakura", branch = "evan/block-prop-2" }
-zebra-jsonl-trace = { package = "zakura-jsonl-trace", git = "https://github.com/zakura-core/zakura", branch = "evan/block-prop-2" }
+zebra-chain = { package = "zakura-chain", git = "https://github.com/zakura-core/zakura", branch = "experiment/miner-cancellation-block-prop-2", features = ["internal-miner"] }
+zebrad = { package = "zakura", git = "https://github.com/zakura-core/zakura", branch = "experiment/miner-cancellation-block-prop-2" }
+zebra-jsonl-trace = { package = "zakura-jsonl-trace", git = "https://github.com/zakura-core/zakura", branch = "experiment/miner-cancellation-block-prop-2" }
 zcash_primitives = { version = "0.29", features = ["transparent-inputs"] }
 zcash_protocol = "0.10"
 zcash_address = "0.13"
