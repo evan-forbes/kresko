@@ -362,9 +362,8 @@ pub async fn run_with(
 
                 // Check immediately before submission. A tip change can race
                 // with the solver's final digit-boundary callback.
-                if *submission_action_rx.borrow_and_update() == SolverAction::StopNow
-                    && !options.submit_stale_solutions
-                {
+                let submission_action = *submission_action_rx.borrow_and_update();
+                if submission_action == SolverAction::StopNow && !options.submit_stale_solutions {
                     let cancellation_observed_at = Instant::now();
                     let update = wait_for_template_update(
                         &mut poll_handle,
@@ -467,7 +466,7 @@ pub async fn run_with(
                                 template_longpollid: template_summary.longpollid.clone(),
                                 mempool_transactions,
                                 mempool_bytes,
-                                cancel_action: None,
+                                cancel_action: Some(solver_action_label(submission_action)),
                                 cancel_reason: None,
                                 cancel_latency_ms: None,
                                 next_height: None,
@@ -497,7 +496,7 @@ pub async fn run_with(
                                 template_longpollid: template_summary.longpollid.clone(),
                                 mempool_transactions,
                                 mempool_bytes,
-                                cancel_action: None,
+                                cancel_action: Some(solver_action_label(submission_action)),
                                 cancel_reason: None,
                                 cancel_latency_ms: None,
                                 next_height: None,
@@ -1673,6 +1672,10 @@ mod tests {
     /// already committed, which is exactly the observed orphan.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn without_the_guard_the_miner_publishes_an_orphan() {
+        let log_path = std::env::temp_dir().join("kresko-stale-submitted.jsonl");
+        if log_path.exists() {
+            std::fs::remove_file(&log_path).expect("old test log can be removed");
+        }
         let submitted = mine_through_template_change(
             "stale-submitted",
             Template {
@@ -1692,6 +1695,14 @@ mod tests {
             TIP0,
             "the submitted block extends the superseded tip"
         );
+
+        let submitted_row = std::fs::read_to_string(log_path)
+            .expect("miner wrote its structured log")
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|row| row["event"] == "solution_found")
+            .expect("miner recorded the stale submitted solution");
+        assert_eq!(submitted_row["cancel_action"], "stop_now");
     }
 
     /// A mempool change cancels the solver too, but it does not invalidate the
