@@ -99,7 +99,7 @@ pub fn run(
         .unwrap_or(DEFAULT_TARGET_SPACING_SECS);
     let daa = toml_network.daa.with_missing_from(config.daa);
 
-    let prepared = match config.mining_mode {
+    let seeding = match config.mining_mode {
         MiningMode::Pow => {
             // Calibrate the difficulty the fleet can actually sustain, then seed
             // the chain at that difficulty with unsolved blocks. Live nodes start
@@ -107,26 +107,20 @@ pub fn run(
             // at its equilibrium difficulty with no adjustment warm-up.
             let calibration = run_pow_calibration(&config, &pow_calibration, target_spacing_secs)?;
             report_calibration(&calibration);
-            prepare_generated_local_genesis(
-                &config,
-                &miner_names,
-                0,
-                target_spacing_secs,
-                daa,
-                SeedingMode::EnforcePowAfterSeededTip {
-                    target_difficulty_limit: calibration_target_bytes(&calibration)?,
-                },
-            )?
+            SeedingMode::EnforcePowAfterSeededTip {
+                target_difficulty_limit: calibration_target_bytes(&calibration)?,
+            }
         }
-        _ => prepare_generated_local_genesis(
-            &config,
-            &miner_names,
-            maturity_padding_blocks,
-            target_spacing_secs,
-            daa,
-            SeedingMode::PowDisabled,
-        )?,
+        _ => SeedingMode::PowDisabled,
     };
+    let prepared = prepare_generated_local_genesis(
+        &config,
+        &miner_names,
+        maturity_padding_blocks,
+        target_spacing_secs,
+        daa,
+        seeding,
+    )?;
 
     config.local_genesis = Some(prepared.local_genesis.clone());
     config.save(dir)?;
@@ -769,10 +763,11 @@ mod tests {
         target_difficulty_limit[0] = 0x04;
         target_difficulty_limit[1] = 0xec;
 
+        let maturity_padding_blocks = 125;
         let prepared = prepare_generated_local_genesis(
             &config,
             &miner_names,
-            0,
+            maturity_padding_blocks,
             25,
             DaaConfig::default(),
             SeedingMode::EnforcePowAfterSeededTip {
@@ -781,8 +776,12 @@ mod tests {
         )
         .expect("PoW seeding should prepare a local genesis");
 
-        // genesis + one premine block per miner.
-        let seeded_block_count = miner_names.len() as u32 + 1;
+        // One premine block per miner, plus the requested maturity padding.
+        let seeded_block_count = miner_names.len() as u32 + 1 + maturity_padding_blocks;
+        assert_eq!(
+            prepared.local_genesis.maturity_padding_block_count,
+            maturity_padding_blocks
+        );
         assert_eq!(
             prepared.local_testnet.pow_start_height,
             Some(seeded_block_count)

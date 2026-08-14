@@ -39,7 +39,7 @@ enum Commands {
         build_dir: String,
 
         /// Extra empty local-genesis blocks to seed after funding blocks so generated outputs mature.
-        /// The PoW path uses real solved seed blocks and currently keeps this at zero.
+        /// PoW starts after the seeded tip, so these blocks do not require solutions.
         #[arg(long, default_value_t = 125)]
         maturity_padding_blocks: u32,
 
