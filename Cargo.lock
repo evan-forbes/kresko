@@ -1404,6 +1404,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4df6f98652d30167eaeea34d77b730e07c8caba6df17bd4551842b9b8da01deb"
 
 [[package]]
+name = "cpu-equihash-solver"
+version = "0.3.0"
+source = "git+https://github.com/valargroup/librustzcash?rev=658533c4c604818610657d9699e82102e7379c76#658533c4c604818610657d9699e82102e7379c76"
+dependencies = [
+ "blake2b_simd",
+ "cc",
+ "corez",
+ "document-features",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2104,17 +2115,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "306286e8dcc39ab3dfceb74c792ce8baffdab90591321d3ffaae64829734c37f"
 dependencies = [
  "blake2b_simd",
- "corez",
- "document-features",
-]
-
-[[package]]
-name = "equihash"
-version = "0.3.0"
-source = "git+https://github.com/valargroup/librustzcash?rev=f02666ca85119be817a336313cd28d3c3a9bc9c4#f02666ca85119be817a336313cd28d3c3a9bc9c4"
-dependencies = [
- "blake2b_simd",
- "cc",
  "corez",
  "document-features",
 ]
@@ -7374,6 +7374,7 @@ dependencies = [
  "socket2 0.6.2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tokio-stream",
  "tower 0.5.3",
  "tower-layer",
@@ -8677,8 +8678,8 @@ checksum = "2164e798d9e3d84ee2c91139ace54638059a3b23e361f5c11781c2c6459bde0f"
 
 [[package]]
 name = "zakura"
-version = "1.1.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=experiment%2Fminer-cancellation-block-prop-2#57d600b3bffb8dd2328c543410e1866d7b1799cc"
+version = "1.1.1"
+source = "git+https://github.com/zakura-core/zakura?rev=4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6#4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6"
 dependencies = [
  "abscissa_core",
  "bytes",
@@ -8745,8 +8746,8 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "4.0.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=experiment%2Fminer-cancellation-block-prop-2#57d600b3bffb8dd2328c543410e1866d7b1799cc"
+version = "5.0.0"
+source = "git+https://github.com/zakura-core/zakura?rev=4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6#4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6"
 dependencies = [
  "bech32",
  "bitflags",
@@ -8758,11 +8759,11 @@ dependencies = [
  "bs58",
  "byteorder",
  "chrono",
+ "cpu-equihash-solver",
  "derive-getters",
  "dirs",
  "ed25519-zebra",
- "equihash 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "equihash 0.3.0 (git+https://github.com/valargroup/librustzcash?rev=f02666ca85119be817a336313cd28d3c3a9bc9c4)",
+ "equihash",
  "futures",
  "group 0.13.0",
  "halo2_proofs",
@@ -8809,8 +8810,8 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "6.0.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=experiment%2Fminer-cancellation-block-prop-2#57d600b3bffb8dd2328c543410e1866d7b1799cc"
+version = "6.0.0"
+source = "git+https://github.com/zakura-core/zakura?rev=4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6#4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -8852,8 +8853,8 @@ dependencies = [
 
 [[package]]
 name = "zakura-jsonl-trace"
-version = "1.1.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=experiment%2Fminer-cancellation-block-prop-2#57d600b3bffb8dd2328c543410e1866d7b1799cc"
+version = "1.1.0"
+source = "git+https://github.com/zakura-core/zakura?rev=4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6#4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6"
 dependencies = [
  "chrono",
  "serde",
@@ -8865,8 +8866,8 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "5.1.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=experiment%2Fminer-cancellation-block-prop-2#57d600b3bffb8dd2328c543410e1866d7b1799cc"
+version = "6.0.0"
+source = "git+https://github.com/zakura-core/zakura?rev=4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6#4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6"
 dependencies = [
  "bitflags",
  "blake2b_simd",
@@ -8906,8 +8907,8 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "3.1.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=experiment%2Fminer-cancellation-block-prop-2#57d600b3bffb8dd2328c543410e1866d7b1799cc"
+version = "3.1.0"
+source = "git+https://github.com/zakura-core/zakura?rev=4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6#4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6"
 dependencies = [
  "color-eyre",
  "jsonrpsee-types",
@@ -8921,8 +8922,8 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "6.0.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=experiment%2Fminer-cancellation-block-prop-2#57d600b3bffb8dd2328c543410e1866d7b1799cc"
+version = "7.0.0"
+source = "git+https://github.com/zakura-core/zakura?rev=4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6#4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6"
 dependencies = [
  "base64",
  "chrono",
@@ -8983,8 +8984,8 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "3.1.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=experiment%2Fminer-cancellation-block-prop-2#57d600b3bffb8dd2328c543410e1866d7b1799cc"
+version = "3.1.0"
+source = "git+https://github.com/zakura-core/zakura?rev=4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6#4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6"
 dependencies = [
  "libzcash_script",
  "rand 0.8.5",
@@ -8996,8 +8997,8 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "6.0.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=experiment%2Fminer-cancellation-block-prop-2#57d600b3bffb8dd2328c543410e1866d7b1799cc"
+version = "6.1.0"
+source = "git+https://github.com/zakura-core/zakura?rev=4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6#4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6"
 dependencies = [
  "bincode",
  "chrono",
@@ -9037,8 +9038,8 @@ dependencies = [
 
 [[package]]
 name = "zakura-tower-batch-control"
-version = "1.2.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=experiment%2Fminer-cancellation-block-prop-2#57d600b3bffb8dd2328c543410e1866d7b1799cc"
+version = "1.2.0"
+source = "git+https://github.com/zakura-core/zakura?rev=4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6#4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6"
 dependencies = [
  "futures",
  "futures-core",
@@ -9053,8 +9054,8 @@ dependencies = [
 
 [[package]]
 name = "zakura-tower-fallback"
-version = "1.2.0-rc1"
-source = "git+https://github.com/zakura-core/zakura?branch=experiment%2Fminer-cancellation-block-prop-2#57d600b3bffb8dd2328c543410e1866d7b1799cc"
+version = "1.2.0"
+source = "git+https://github.com/zakura-core/zakura?rev=4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6#4f3dbaf38f5518a2c8599b24374c0b73ba9f3ae6"
 dependencies = [
  "futures-core",
  "pin-project",
@@ -9149,7 +9150,7 @@ dependencies = [
  "corez",
  "crypto-common 0.2.0-rc.1",
  "document-features",
- "equihash 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "equihash",
  "ff 0.13.1",
  "hex",
  "incrementalmerkletree",
@@ -9180,7 +9181,7 @@ dependencies = [
  "corez",
  "crypto-common 0.2.0-rc.1",
  "document-features",
- "equihash 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "equihash",
  "ff 0.13.1",
  "hex",
  "incrementalmerkletree",
