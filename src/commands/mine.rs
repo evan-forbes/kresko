@@ -33,7 +33,9 @@ struct MineLogEntry {
     template_longpollid: Option<String>,
     mempool_transactions: Option<usize>,
     mempool_bytes: Option<u64>,
+    cancel_action: Option<&'static str>,
     cancel_reason: Option<&'static str>,
+    cancel_latency_ms: Option<u128>,
     next_height: Option<u64>,
     next_transactions: Option<usize>,
     next_transaction_bytes: Option<usize>,
@@ -57,6 +59,7 @@ struct TemplateUpdate {
     summary: TemplateSummary,
     is_provisional: bool,
     reason: &'static str,
+    cancel_requested_at: Instant,
 }
 
 struct PendingTemplate {
@@ -272,7 +275,9 @@ pub async fn run_with(
                 template_longpollid: template_summary.longpollid.clone(),
                 mempool_transactions: None,
                 mempool_bytes: None,
+                cancel_action: None,
                 cancel_reason: None,
+                cancel_latency_ms: None,
                 next_height: None,
                 next_transactions: None,
                 next_transaction_bytes: None,
@@ -360,6 +365,7 @@ pub async fn run_with(
                 if *submission_action_rx.borrow_and_update() == SolverAction::StopNow
                     && !options.submit_stale_solutions
                 {
+                    let cancellation_observed_at = Instant::now();
                     let update = wait_for_template_update(
                         &mut poll_handle,
                         &template_update,
@@ -371,6 +377,11 @@ pub async fn run_with(
                         .as_ref()
                         .map(|update| update.reason)
                         .or(Some("work_invalidated"));
+                    let cancel_latency_ms = update.as_ref().map(|update| {
+                        cancellation_observed_at
+                            .saturating_duration_since(update.cancel_requested_at)
+                            .as_millis()
+                    });
                     stale_solutions += 1;
                     println!(
                         "Discarding solution for height {template_height}: its work became invalid \
@@ -393,7 +404,9 @@ pub async fn run_with(
                             template_longpollid: template_summary.longpollid.clone(),
                             mempool_transactions,
                             mempool_bytes,
+                            cancel_action: Some("stop_now"),
                             cancel_reason,
+                            cancel_latency_ms,
                             next_height: next_summary.map(|summary| summary.height),
                             next_transactions: next_summary.map(|summary| summary.transactions),
                             next_transaction_bytes: next_summary
@@ -454,7 +467,9 @@ pub async fn run_with(
                                 template_longpollid: template_summary.longpollid.clone(),
                                 mempool_transactions,
                                 mempool_bytes,
+                                cancel_action: None,
                                 cancel_reason: None,
+                                cancel_latency_ms: None,
                                 next_height: None,
                                 next_transactions: None,
                                 next_transaction_bytes: None,
@@ -482,7 +497,9 @@ pub async fn run_with(
                                 template_longpollid: template_summary.longpollid.clone(),
                                 mempool_transactions,
                                 mempool_bytes,
+                                cancel_action: None,
                                 cancel_reason: None,
+                                cancel_latency_ms: None,
                                 next_height: None,
                                 next_transactions: None,
                                 next_transaction_bytes: None,
@@ -502,11 +519,17 @@ pub async fn run_with(
                 );
             }
             Err(SolverCancelled) => {
+                let cancellation_observed_at = Instant::now();
                 let action = *submission_action_rx.borrow_and_update();
                 let update =
                     wait_for_template_update(&mut poll_handle, &template_update, action).await;
                 let next_summary = update.as_ref().map(|update| &update.summary);
                 let cancel_reason = update.as_ref().map(|update| update.reason);
+                let cancel_latency_ms = update.as_ref().map(|update| {
+                    cancellation_observed_at
+                        .saturating_duration_since(update.cancel_requested_at)
+                        .as_millis()
+                });
                 stale_cancellations += 1;
                 println!(
                     "Template changed after {:.1}s, restarting solver... action={:?} reason={}",
@@ -530,7 +553,9 @@ pub async fn run_with(
                         template_longpollid: template_summary.longpollid.clone(),
                         mempool_transactions,
                         mempool_bytes,
+                        cancel_action: Some(solver_action_label(action)),
                         cancel_reason,
+                        cancel_latency_ms,
                         next_height: next_summary.map(|summary| summary.height),
                         next_transactions: next_summary.map(|summary| summary.transactions),
                         next_transaction_bytes: next_summary
@@ -626,6 +651,7 @@ async fn supervise_template_updates(
                 let cannot_rearm = summary.longpollid.is_none();
 
                 if cannot_rearm {
+                    let cancel_requested_at = Instant::now();
                     action_tx.send_replace(SolverAction::StopNow);
                     store_template_update(
                         &update,
@@ -634,6 +660,7 @@ async fn supervise_template_updates(
                             summary,
                             is_provisional: false,
                             reason: "template_monitor_unavailable",
+                            cancel_requested_at,
                         },
                     );
                     return;
@@ -650,6 +677,7 @@ async fn supervise_template_updates(
                 }
 
                 if let Some(reason) = replacement_reason {
+                    let cancel_requested_at = Instant::now();
                     store_template_update(
                         &update,
                         TemplateUpdate {
@@ -657,6 +685,7 @@ async fn supervise_template_updates(
                             summary,
                             is_provisional: false,
                             reason,
+                            cancel_requested_at,
                         },
                     );
                     action_tx.send_replace(SolverAction::StopAtNonceBoundary);
@@ -664,6 +693,7 @@ async fn supervise_template_updates(
                 }
             }
             Some(false) | None => {
+                let cancel_requested_at = Instant::now();
                 action_tx.send_replace(SolverAction::StopNow);
                 let reason = classify_cancellation(&current, &summary);
 
@@ -675,6 +705,7 @@ async fn supervise_template_updates(
                         summary,
                         is_provisional,
                         reason,
+                        cancel_requested_at,
                     }
                 } else {
                     loop {
@@ -686,6 +717,7 @@ async fn supervise_template_updates(
                                     summary,
                                     is_provisional: false,
                                     reason,
+                                    cancel_requested_at,
                                 };
                             }
                             Err(error) => {
@@ -752,6 +784,14 @@ fn classify_cancellation(current: &TemplateSummary, next: &TemplateSummary) -> &
         "mempool_changed"
     } else {
         "template_changed"
+    }
+}
+
+fn solver_action_label(action: SolverAction) -> &'static str {
+    match action {
+        SolverAction::Continue => "continue",
+        SolverAction::StopAtNonceBoundary => "stop_at_nonce_boundary",
+        SolverAction::StopNow => "stop_now",
     }
 }
 
@@ -1592,6 +1632,10 @@ mod tests {
     /// has already filled, so the miner must not publish it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_solution_found_after_the_tip_moved_is_discarded() {
+        let log_path = std::env::temp_dir().join("kresko-stale-discarded.jsonl");
+        if log_path.exists() {
+            std::fs::remove_file(&log_path).expect("old test log can be removed");
+        }
         let submitted = mine_through_template_change(
             "stale-discarded",
             Template {
@@ -1609,6 +1653,18 @@ mod tests {
             submitted.is_empty(),
             "the miner published {} block(s) for a height the node had already filled",
             submitted.len()
+        );
+
+        let stale_row = std::fs::read_to_string(log_path)
+            .expect("miner wrote its structured log")
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|row| row["event"] == "solution_discarded_stale")
+            .expect("miner recorded the discarded stale solution");
+        assert_eq!(stale_row["cancel_action"], "stop_now");
+        assert!(
+            stale_row["cancel_latency_ms"].as_u64().is_some(),
+            "the stale row records request-to-observation latency"
         );
     }
 
